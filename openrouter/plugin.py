@@ -783,13 +783,21 @@ def _pkce() -> tuple[str, str]:
     return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _code_from(landed: str) -> str:
-    """The `code` in a pasted redirect URL, or the paste itself when it is bare."""
+def _code_from(landed: str, state: str) -> str:
+    """The `code` in a pasted redirect URL whose `state` is this flow's, or the
+    paste itself when it is a bare code. A URL carrying somebody else's `state`
+    is refused: it is not the redirect this sign-in is waiting for."""
     text = landed.strip()
-    query = urllib.parse.urlsplit(text).query if "://" in text else ""
-    if query:
-        return (urllib.parse.parse_qs(query).get("code") or [""])[0]
-    return text
+    if "://" not in text:
+        return text
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(text).query)
+    if not _same(state, (query.get("state") or [""])[0]):
+        raise CredentialError("that URL is not from this sign-in (state mismatch) - run it again")
+    return (query.get("code") or [""])[0]
+
+
+def _same(expected: str, got: str) -> bool:
+    return secrets.compare_digest(expected.encode(), got.encode())
 
 
 class _Callback:
@@ -797,14 +805,18 @@ class _Callback:
     first request, and the request line - which carries the code - is never
     logged, as the core's own loopback never logs it."""
 
-    def __init__(self) -> None:
+    def __init__(self, state: str) -> None:
+        self.state = state
         self.code = ""
         self._server = _CallbackServer(("127.0.0.1", 0), self)
         self.port = int(self._server.server_address[1])
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self.port}{CALLBACK_PATH}"
+        """Where OpenRouter sends the browser. `state` rides inside it, because
+        OpenRouter echoes `callback_url` verbatim and has no `state` of its own;
+        the redirect that comes back carries it, and one without it is ignored."""
+        return f"http://127.0.0.1:{self.port}{CALLBACK_PATH}?state={self.state}"
 
     def wait(self, timeout: float, clock: Callable[[], float] = time.monotonic) -> str:
         deadline = clock() + timeout
@@ -839,7 +851,13 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         if parts.path != CALLBACK_PATH:
             self._answer(404, "Not found.")
             return
-        code = (urllib.parse.parse_qs(parts.query).get("code") or [""])[0]
+        query = urllib.parse.parse_qs(parts.query)
+        if not _same(self.server.owner.state, (query.get("state") or [""])[0]):
+            # A stray request on this port is not the user's redirect. Answered
+            # and ignored; the listener keeps waiting for the right one.
+            self._answer(400, "This request does not belong to the sign-in in progress.")
+            return
+        code = (query.get("code") or [""])[0]
         if not code:
             self._answer(400, "No code on this request.")
             return
@@ -861,22 +879,26 @@ def login(ctx: LoginContext) -> Tokens:
 
 
 def _run_login(
-    ctx: LoginContext, *, post: PostJson, listen: Callable[[], _Callback] | None
+    ctx: LoginContext, *, post: PostJson, listen: Callable[[str], _Callback] | None
 ) -> Tokens:
     """The flow, with its two round trips handed in so a test can drive it.
 
     The code and the verifier are locals here: generated, spent on one POST,
     and gone. Neither is said, and the key that comes back goes into the
-    return value and nowhere else.
+    return value and nowhere else. `state` is checked before anything else is
+    read, on the redirect and on a paste alike, in constant time.
     """
     verifier, challenge = _pkce()
+    state = secrets.token_urlsafe(32)
     callback: _Callback | None = None
     if listen is not None:
         try:
-            callback = listen()
+            callback = listen(state)
         except OSError:
             callback = None
-    landing = callback.url if callback is not None else f"http://127.0.0.1{CALLBACK_PATH}"
+    landing = (
+        callback.url if callback is not None else f"http://127.0.0.1{CALLBACK_PATH}?state={state}"
+    )
     url = (
         AUTH_URL
         + "?"
@@ -892,7 +914,9 @@ def _run_login(
         ctx.say("waiting for the sign-in to finish (Ctrl-C cancels)...")
         code = callback.wait(LOGIN_TIMEOUT)
     if not code:
-        code = _code_from(ctx.ask_secret("paste the URL the browser landed on (or the code): "))
+        code = _code_from(
+            ctx.ask_secret("paste the URL the browser landed on (or the code): "), state
+        )
     if not code:
         raise CredentialError("no code was received - run the login again")
     status, body = post(

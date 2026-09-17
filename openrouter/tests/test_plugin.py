@@ -462,13 +462,14 @@ def test_the_callback_lands_the_code_and_the_exchange_mints_a_key() -> None:
     posts, post = exchange("abc123")
     listeners: list[Any] = []
 
-    def listen() -> Any:
-        listener = plugin._Callback()
+    def listen(state: str) -> Any:
+        listener = plugin._Callback(state)
         listeners.append(listener)
 
         def redirect() -> None:
-            # The browser lands on the callback with the code, as OpenRouter sends it.
-            with urllib.request.urlopen(listener.url + "?code=abc123", timeout=5) as response:
+            # The browser lands on the callback with the code, as OpenRouter sends
+            # it: `callback_url` echoed verbatim - `state` inside - plus `code`.
+            with urllib.request.urlopen(listener.url + "&code=abc123", timeout=5) as response:
                 assert response.status == 200
 
         threading.Timer(0.2, redirect).start()
@@ -482,6 +483,7 @@ def test_the_callback_lands_the_code_and_the_exchange_mints_a_key() -> None:
     query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
     assert url.startswith(plugin.AUTH_URL + "?")
     assert query["callback_url"] == listeners[0].url
+    assert "state=" + listeners[0].state in query["callback_url"]
     assert query["code_challenge_method"] == "S256"
     # The exchange carries the code and the verifier the challenge was made from.
     [sent] = posts
@@ -494,14 +496,44 @@ def test_the_callback_lands_the_code_and_the_exchange_mints_a_key() -> None:
             assert secret_word not in line
 
 
+def test_a_pasted_url_with_another_state_is_refused() -> None:
+    from ultron.sdk.runtime import CredentialError
+
+    person = Person(opens=False, pastes="http://127.0.0.1:1/callback?state=theirs&code=x")
+    _, post = exchange("x")
+    with pytest.raises(CredentialError, match="state mismatch"):
+        plugin._run_login(person.ctx, post=post, listen=None)
+
+
+def test_the_listener_ignores_a_redirect_with_the_wrong_state_and_keeps_waiting() -> None:
+    import threading
+    import urllib.error
+    import urllib.request
+
+    listener = plugin._Callback("ours")
+    root = listener.url.split("?", 1)[0]
+
+    def redirects() -> None:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(root + "?state=theirs&code=stray", timeout=5)
+        assert caught.value.code == 400
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(root + "?code=stray", timeout=5)
+        assert caught.value.code == 400
+        urllib.request.urlopen(listener.url + "&code=real", timeout=5).close()
+
+    threading.Timer(0.2, redirects).start()
+    assert listener.wait(10) == "real"
+
+
 def test_without_a_browser_the_landed_url_is_pasted_back() -> None:
-    person = Person(opens=False, pastes="http://127.0.0.1:1/callback?code=pasted9")
-    posts, post = exchange("pasted9")
+    person = Person(opens=False, pastes="bare-code-pasted9")
+    posts, post = exchange("bare-code-pasted9")
 
     tokens = plugin._run_login(person.ctx, post=post, listen=None)
 
     assert tokens.access == "sk-or-v1-minted"
-    assert posts[0]["code"] == "pasted9"
+    assert posts[0]["code"] == "bare-code-pasted9"
     assert any("open this in a browser" in line for line in person.said)
 
 
@@ -518,8 +550,8 @@ def test_the_listener_answers_only_its_path_and_only_once() -> None:
     import urllib.error
     import urllib.request
 
-    listener = plugin._Callback()
-    root = listener.url.rsplit("/", 1)[0]
+    listener = plugin._Callback("s")
+    root = listener.url.split("?", 1)[0].rsplit("/", 1)[0]
 
     def redirect() -> None:
         with pytest.raises(urllib.error.HTTPError) as caught:
@@ -528,16 +560,16 @@ def test_the_listener_answers_only_its_path_and_only_once() -> None:
         with pytest.raises(urllib.error.HTTPError) as caught:
             urllib.request.urlopen(listener.url, timeout=5)
         assert caught.value.code == 400
-        urllib.request.urlopen(listener.url + "?code=one", timeout=5).close()
+        urllib.request.urlopen(listener.url + "&code=one", timeout=5).close()
 
     import threading
 
     threading.Timer(0.2, redirect).start()
     assert listener.wait(10) == "one"
     with pytest.raises(urllib.error.URLError):
-        urllib.request.urlopen(listener.url + "?code=two", timeout=2)
+        urllib.request.urlopen(listener.url + "&code=two", timeout=2)
 
 
 def test_the_listener_gives_up_at_the_deadline() -> None:
-    listener = plugin._Callback()
+    listener = plugin._Callback("s")
     assert listener.wait(0.3) == ""

@@ -115,9 +115,12 @@ profile's.
 one-shot listener at `127.0.0.1` (or takes the landed URL pasted back when it cannot),
 and exchanges the code for a key OpenRouter mints for this install - stored as the
 `openrouter:oauth` profile, a key like any other, and never shown. It is not OAuth as
-Ultron's `OAuthClient` describes it - no client id, no `state`, a `callback_url`, an
-exchange that answers a key - so the plugin runs the flow itself (`oauth.md` §5.4) and
-`/auth` says `plugin-run flow`. The key does not expire; there is nothing to refresh.
+Ultron's `OAuthClient` describes it - no client id, a `callback_url` rather than a redirect
+URI, an exchange that answers a key - so the plugin runs the flow itself (`oauth.md` §5.4)
+and `/auth` says `plugin-run flow`. OpenRouter has no `state` of its own, but echoes
+`callback_url` verbatim, so the flow's `state` rides inside it and is checked, in constant
+time, on the redirect and on a pasted URL alike; a request that does not carry it is
+answered 400 and ignored, and the listener keeps waiting for the right one. The key does not expire; there is nothing to refresh.
 Revoke it at openrouter.ai/settings/keys.
 
 ## What is not here
