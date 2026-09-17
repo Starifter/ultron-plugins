@@ -7,6 +7,7 @@ categories: [provider, models]
 logo: logo.svg
 contracts:
   providers: [openrouter]
+  logins: [openrouter]
 providers:
   openrouter:
     api_key_env_vars: [OPENROUTER_API_KEY]
@@ -45,7 +46,8 @@ and the rest, by the ids OpenRouter lists them under - `anthropic/claude-sonnet-
 
 ```
 /plugins install openrouter
-ultron auth add openrouter            # or OPENROUTER_API_KEY in ~/.ultron/.env
+ultron auth login openrouter          # a browser sign-in that mints a key, or
+ultron auth add openrouter            # a key you made, or OPENROUTER_API_KEY in ~/.ultron/.env
 ```
 
 then `provider: openrouter` and a `model` in `config.json`, or `--provider openrouter
@@ -107,7 +109,18 @@ Under `plugins_settings.openrouter`:
 routing block, sent with every request. Nothing here is a credential; the key is the
 profile's.
 
+## Signing in with a browser
+
+`ultron auth login openrouter` opens `openrouter.ai/auth`, catches the redirect on a
+one-shot listener at `127.0.0.1` (or takes the landed URL pasted back when it cannot),
+and exchanges the code for a key OpenRouter mints for this install - stored as the
+`openrouter:oauth` profile, a key like any other, and never shown. It is not OAuth as
+Ultron's `OAuthClient` describes it - no client id, no `state`, a `callback_url`, an
+exchange that answers a key - so the plugin runs the flow itself (`oauth.md` §5.4) and
+`/auth` says `plugin-run flow`. The key does not expire; there is nothing to refresh.
+Revoke it at openrouter.ai/settings/keys.
+
 ## What is not here
 
-No embedder, no fast mode, no login: OpenRouter sells none of those. A `Sampling` is
+No embedder and no fast mode: OpenRouter sells neither. A `Sampling` is
 forwarded whole - OpenRouter drops what the upstream does not take.

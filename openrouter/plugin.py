@@ -14,11 +14,19 @@ Requires the `openai` package (`pip install openai`, or `pip install "ultron[ope
 from __future__ import annotations
 
 import base64
+import hashlib
+import http.server
 import json
-from collections.abc import Mapping, Sequence
+import secrets
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
+from ultron.sdk.oauth import LoginContext, Tokens
 from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.provider import (
     CACHE_TTLS,
@@ -50,7 +58,7 @@ from ultron.sdk.provider import (
     split_cache_boundary,
     strip_cache_boundary,
 )
-from ultron.sdk.runtime import ConfigError, ProviderError
+from ultron.sdk.runtime import ConfigError, CredentialError, ProviderError
 from ultron.sdk.tool_plugin import ToolSpec
 
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -724,6 +732,185 @@ class _Assembly:
         )
 
 
+# -- the browser sign-in -------------------------------------------------------------
+
+AUTH_URL = "https://openrouter.ai/auth"
+KEYS_URL = "https://openrouter.ai/api/v1/auth/keys"
+LOGIN_TIMEOUT = 5 * 60.0
+EXCHANGE_TIMEOUT = 30.0
+CALLBACK_PATH = "/callback"
+"""OpenRouter's PKCE sign-in, which mints an API key rather than a token.
+
+Not OAuth as `OAuthClient` describes it - there is no client id, no `state`, the
+authorize page takes `callback_url` rather than `redirect_uri`, and the exchange
+is a JSON POST answering `{"key": ...}` - so this is the `oauth.md` §5.4 case: a
+plugin-run flow that hands the core `Tokens` and keeps the store, the redaction,
+the audit and `/auth` for itself. The key it mints never expires, so there is no
+refresh and `token_url` is left empty on purpose.
+"""
+
+PostJson = Callable[[str, Mapping[str, Any]], tuple[int, Mapping[str, Any]]]
+
+
+def _post_json(url: str, body: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(dict(body)).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=EXCHANGE_TIMEOUT) as response:
+            return int(response.status), _decode_json(response.read())
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), _decode_json(exc.read())
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise CredentialError(f"openrouter.ai could not be reached: {exc}") from exc
+
+
+def _decode_json(raw: bytes) -> Mapping[str, Any]:
+    try:
+        decoded = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {}
+    return decoded if isinstance(decoded, Mapping) else {}
+
+
+def _pkce() -> tuple[str, str]:
+    """(verifier, S256 challenge). The verifier is a local of the flow."""
+    verifier = secrets.token_urlsafe(64)
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return verifier, base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def _code_from(landed: str) -> str:
+    """The `code` in a pasted redirect URL, or the paste itself when it is bare."""
+    text = landed.strip()
+    query = urllib.parse.urlsplit(text).query if "://" in text else ""
+    if query:
+        return (urllib.parse.parse_qs(query).get("code") or [""])[0]
+    return text
+
+
+class _Callback:
+    """One redirect on `127.0.0.1`, then nothing: the listener closes after the
+    first request, and the request line - which carries the code - is never
+    logged, as the core's own loopback never logs it."""
+
+    def __init__(self) -> None:
+        self.code = ""
+        self._server = _CallbackServer(("127.0.0.1", 0), self)
+        self.port = int(self._server.server_address[1])
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}{CALLBACK_PATH}"
+
+    def wait(self, timeout: float, clock: Callable[[], float] = time.monotonic) -> str:
+        deadline = clock() + timeout
+        try:
+            while not self.code:
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    return ""
+                self._server.timeout = min(remaining, 1.0)
+                self._server.handle_request()
+        finally:
+            self._server.server_close()
+        return self.code
+
+
+class _CallbackServer(http.server.HTTPServer):
+    allow_reuse_address = False
+
+    def __init__(self, address: tuple[str, int], owner: _Callback) -> None:
+        self.owner = owner
+        super().__init__(address, _CallbackHandler)
+
+
+class _CallbackHandler(http.server.BaseHTTPRequestHandler):
+    server: _CallbackServer
+
+    def log_message(self, format: str, *args: Any) -> None:
+        """Nothing. The request line carries the code."""
+
+    def do_GET(self) -> None:
+        parts = urllib.parse.urlsplit(self.path)
+        if parts.path != CALLBACK_PATH:
+            self._answer(404, "Not found.")
+            return
+        code = (urllib.parse.parse_qs(parts.query).get("code") or [""])[0]
+        if not code:
+            self._answer(400, "No code on this request.")
+            return
+        self.server.owner.code = code
+        self._answer(200, "Signed in to OpenRouter. You can close this window.")
+
+    def _answer(self, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def login(ctx: LoginContext) -> Tokens:
+    """`ultron auth login openrouter`: the browser, the callback, the exchange."""
+    return _run_login(ctx, post=_post_json, listen=_Callback)
+
+
+def _run_login(
+    ctx: LoginContext, *, post: PostJson, listen: Callable[[], _Callback] | None
+) -> Tokens:
+    """The flow, with its two round trips handed in so a test can drive it.
+
+    The code and the verifier are locals here: generated, spent on one POST,
+    and gone. Neither is said, and the key that comes back goes into the
+    return value and nowhere else.
+    """
+    verifier, challenge = _pkce()
+    callback: _Callback | None = None
+    if listen is not None:
+        try:
+            callback = listen()
+        except OSError:
+            callback = None
+    landing = callback.url if callback is not None else f"http://127.0.0.1{CALLBACK_PATH}"
+    url = (
+        AUTH_URL
+        + "?"
+        + urllib.parse.urlencode(
+            {"callback_url": landing, "code_challenge": challenge, "code_challenge_method": "S256"}
+        )
+    )
+    opened = ctx.open_browser(url)
+    ctx.say(("opened a browser" if opened else "open this in a browser") + " to sign in:")
+    ctx.say(f"\n    {url}\n")
+    code = ""
+    if callback is not None and opened:
+        ctx.say("waiting for the sign-in to finish (Ctrl-C cancels)...")
+        code = callback.wait(LOGIN_TIMEOUT)
+    if not code:
+        code = _code_from(ctx.ask_secret("paste the URL the browser landed on (or the code): "))
+    if not code:
+        raise CredentialError("no code was received - run the login again")
+    status, body = post(
+        KEYS_URL, {"code": code, "code_verifier": verifier, "code_challenge_method": "S256"}
+    )
+    key = str(body.get("key", "") or "")
+    if status != 200 or not key:
+        raise CredentialError(f"OpenRouter refused the exchange: {_vendor_error(body, status)}")
+    return Tokens(access=key, label="OpenRouter (browser sign-in)")
+
+
+def _vendor_error(body: Mapping[str, Any], status: int) -> str:
+    """The vendor's `error` (a string, or `{message}`), and nothing else."""
+    error = body.get("error")
+    said = str(error.get("message", "") or "") if isinstance(error, Mapping) else str(error or "")
+    return f"HTTP {status}" + (f" {said}" if said else "")
+
+
 # -- helpers: the listing --------------------------------------------------------------
 
 
@@ -872,3 +1059,6 @@ class OpenRouterPlugin(Plugin):
             )
         }
         ctx.register_provider("openrouter", OpenRouterProvider.configured(settings))
+        # The browser sign-in: a key minted by OpenRouter's PKCE page, stored as
+        # the `openrouter:oauth` profile beside any key added by hand.
+        ctx.register_login("openrouter", login)

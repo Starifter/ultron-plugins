@@ -7,15 +7,20 @@ supplies pytest-asyncio in auto mode and the `ultron.sdk` the plugin imports.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import importlib.util
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
 from ultron.prompting import CACHE_BOUNDARY  # the marker itself is not on the SDK surface
+from ultron.sdk.oauth import LoginContext
 from ultron.sdk.plugin_entry import PluginContext
 from ultron.sdk.provider import Message, Sampling, TextBlock, ToolResultBlock, ToolUseBlock
 from ultron.sdk.runtime import ConfigError, ProviderError
@@ -407,3 +412,132 @@ async def test_the_listing_keeps_numbers_prices_tiers_and_modalities() -> None:
     assert auto.cost is None  # `-1`: a price OpenRouter will not quote is unknown, never zero
 
     assert not any(entry.description for entry in entries.values())
+
+
+# -- the browser sign-in ------------------------------------------------------------
+
+
+class Person:
+    """A `LoginContext` with a scripted person behind it."""
+
+    def __init__(self, *, opens: bool, pastes: str = "") -> None:
+        self.opens = opens
+        self.pastes = pastes
+        self.said: list[str] = []
+        self.opened: list[str] = []
+        self.ctx = LoginContext(say=self.said.append, ask_secret=self._ask, open_browser=self._open)
+
+    def _ask(self, prompt: str) -> str:
+        return self.pastes
+
+    def _open(self, url: str) -> bool:
+        self.opened.append(url)
+        return self.opens
+
+
+def exchange(expect_code: str) -> tuple[list[dict[str, Any]], Any]:
+    posts: list[dict[str, Any]] = []
+
+    def post(url: str, body: Mapping[str, Any]) -> tuple[int, Mapping[str, Any]]:
+        posts.append({"url": url, **body})
+        if body.get("code") != expect_code:
+            return 403, {"error": {"message": "bad code"}}
+        return 200, {"key": "sk-or-v1-minted"}
+
+    return posts, post
+
+
+def test_the_login_registers_beside_the_provider() -> None:
+    ctx = PluginContext(plugin="openrouter", providers=True)
+    plugin.OpenRouterPlugin().register(ctx)
+    assert ctx.providers == ["openrouter"]
+    assert ctx.logins == ["openrouter"]
+
+
+def test_the_callback_lands_the_code_and_the_exchange_mints_a_key() -> None:
+    import threading
+    import urllib.request
+
+    person = Person(opens=True)
+    posts, post = exchange("abc123")
+    listeners: list[Any] = []
+
+    def listen() -> Any:
+        listener = plugin._Callback()
+        listeners.append(listener)
+
+        def redirect() -> None:
+            # The browser lands on the callback with the code, as OpenRouter sends it.
+            with urllib.request.urlopen(listener.url + "?code=abc123", timeout=5) as response:
+                assert response.status == 200
+
+        threading.Timer(0.2, redirect).start()
+        return listener
+
+    tokens = plugin._run_login(person.ctx, post=post, listen=listen)
+
+    assert tokens.access == "sk-or-v1-minted"
+    assert tokens.refresh == "" and tokens.token_url == ""  # a key: nothing to refresh
+    url = person.opened[0]
+    query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    assert url.startswith(plugin.AUTH_URL + "?")
+    assert query["callback_url"] == listeners[0].url
+    assert query["code_challenge_method"] == "S256"
+    # The exchange carries the code and the verifier the challenge was made from.
+    [sent] = posts
+    assert sent["url"] == plugin.KEYS_URL and sent["code"] == "abc123"
+    digest = hashlib.sha256(sent["code_verifier"].encode()).digest()
+    assert base64.urlsafe_b64encode(digest).rstrip(b"=").decode() == query["code_challenge"]
+    # Nothing said carries the code, the verifier or the key.
+    for line in person.said:
+        for secret_word in ("abc123", sent["code_verifier"], "sk-or-v1-minted"):
+            assert secret_word not in line
+
+
+def test_without_a_browser_the_landed_url_is_pasted_back() -> None:
+    person = Person(opens=False, pastes="http://127.0.0.1:1/callback?code=pasted9")
+    posts, post = exchange("pasted9")
+
+    tokens = plugin._run_login(person.ctx, post=post, listen=None)
+
+    assert tokens.access == "sk-or-v1-minted"
+    assert posts[0]["code"] == "pasted9"
+    assert any("open this in a browser" in line for line in person.said)
+
+
+def test_a_refused_exchange_is_a_credential_error_with_the_vendors_words() -> None:
+    from ultron.sdk.runtime import CredentialError
+
+    person = Person(opens=False, pastes="wrong")
+    _, post = exchange("right")
+    with pytest.raises(CredentialError, match="HTTP 403 bad code"):
+        plugin._run_login(person.ctx, post=post, listen=None)
+
+
+def test_the_listener_answers_only_its_path_and_only_once() -> None:
+    import urllib.error
+    import urllib.request
+
+    listener = plugin._Callback()
+    root = listener.url.rsplit("/", 1)[0]
+
+    def redirect() -> None:
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(root + "/elsewhere", timeout=5)
+        assert caught.value.code == 404
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(listener.url, timeout=5)
+        assert caught.value.code == 400
+        urllib.request.urlopen(listener.url + "?code=one", timeout=5).close()
+
+    import threading
+
+    threading.Timer(0.2, redirect).start()
+    assert listener.wait(10) == "one"
+    with pytest.raises(urllib.error.URLError):
+        urllib.request.urlopen(listener.url + "?code=two", timeout=2)
+
+
+def test_the_listener_gives_up_at_the_deadline() -> None:
+    listener = plugin._Callback()
+    assert listener.wait(0.3) == ""
