@@ -59,7 +59,9 @@ def main(argv: list[str]) -> int:
         print(f"{root} is itself a plugin - a marketplace holds plugins one level down")
         return 1
     entries = sorted(
-        path for path in root.iterdir() if path.is_dir() and path.name not in SKIPPED
+        path
+        for path in root.iterdir()
+        if path.is_dir() and path.name not in SKIPPED and not path.name.startswith(".")
     )
     if not entries:
         print("no plugins found")
