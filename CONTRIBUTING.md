@@ -65,6 +65,9 @@ python scripts/validate.py
 ```
 
 The same script runs in CI on every change and is the whole of what this marketplace
-promises about an entry. Then try it: `/plugins market refresh official` on an install
+promises about an entry. Tests are yours to add and welcome: put them in
+`<name>/tests/`, driving the plugin with a fake client the way `openrouter/tests/` does,
+and CI runs them with `pytest` (asyncio in auto mode, from the `pyproject.toml` at the
+root). Then try it: `/plugins market refresh official` on an install
 whose `plugin_marketplace_official` points at your checkout, `/plugins install <name>`,
 restart, and `/plugins <name>` should show what it installed.

@@ -1,0 +1,8 @@
+# Not a package: this file exists so `pytest` run from the repository root finds
+# the plugins' tests with the same settings Ultron's own suite runs under.
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+addopts = "-q"
+testpaths = ["."]
+python_files = ["test_*.py"]
+norecursedirs = [".git", "scripts", "__pycache__"]

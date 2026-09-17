@@ -19,6 +19,13 @@ line in `plugins_enabled` - and the plugin loads on the next session. A marketpl
 where a plugin comes from and never where one runs from: forgetting this marketplace
 (`/plugins market remove official`) leaves every plugin installed from it in place.
 
+## What is here
+
+| plugin | what it adds |
+|---|---|
+| `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs. |
+| `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
+
 ## What "official" means
 
 Only that Ultron knows this repository's address. A plugin here goes through the same
