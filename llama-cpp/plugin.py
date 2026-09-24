@@ -115,6 +115,10 @@ class LlamaCppProvider(OpenAICompatProvider):
     placeholder_key = PLACEHOLDER_KEY
     overflow_markers = LLAMA_OVERFLOW_MARKERS
 
+    counts: bool = True
+    """Whether the server has `/apply-template` and `/tokenize`. An older build
+    answers 404, once, and is then estimated instead of asked every request."""
+
     server: ManagedServer | None = None
     """The `llama-server` this plugin runs, when `server_model` names one. Class
     state, one per process: every provider the core builds - per profile, per
@@ -214,6 +218,43 @@ class LlamaCppProvider(OpenAICompatProvider):
         entries = (_entry_of(row, n_ctx=n_ctx, modalities=modalities) for row in rows)
         return [entry for entry in entries if entry is not None]
 
+    async def count_tokens(self, request: Mapping[str, Any]) -> int:
+        """The request's exact size, as the server will see it.
+
+        `/apply-template` renders the request through the same parser a chat
+        completion goes through - the chat template, the tool schemas, the
+        thinking switch - and `/tokenize` counts what it rendered. Two loopback
+        round trips, and the fit check needs no estimate.
+
+        Zero, so the base estimates instead, for a request carrying a picture or
+        audio (the rendered prompt holds a marker, not the tokens the projector
+        will add) and for a server too old to have the endpoints - asked once,
+        then not again."""
+        if not self.counts or _carries_media(request):
+            return 0
+        body = {k: v for k, v in request.items() if k not in ("extra_body", "stream")}
+        body.update(request.get("extra_body") or {})
+        root = _root_of(self.base_url_in_use)
+        headers = self._bearer()
+        status, rendered = await post_json(root + "/apply-template", body, headers=headers)
+        prompt = rendered.get("prompt")
+        if status == 404:
+            self.counts = False
+        if status >= 400 or not isinstance(prompt, str):
+            return 0
+        status, counted = await post_json(
+            root + "/tokenize", {"content": prompt, "add_special": True}, headers=headers
+        )
+        tokens = counted.get("tokens")
+        if status == 404:
+            self.counts = False
+        return len(tokens) if status < 400 and isinstance(tokens, list) else 0
+
+    def _bearer(self) -> dict[str, str]:
+        """The server's `--api-key`, for the endpoints beside `/v1` that check it too."""
+        key = str(getattr(self._client, "api_key", "") or "")
+        return {"Authorization": f"Bearer {key}"} if key and key != PLACEHOLDER_KEY else {}
+
     async def loaded_window(self) -> int:
         """The context one slot of the server holds (`-c`, split across
         `--parallel`), from `/props`. The session's budget follows it and every
@@ -262,6 +303,41 @@ async def fetch_json(url: str) -> Mapping[str, Any]:
         raise ProviderError(f"HTTP {response.status} from {url}")
     decoded = json.loads(response.body.decode("utf-8"))
     return decoded if isinstance(decoded, Mapping) else {}
+
+
+async def post_json(
+    url: str, body: Mapping[str, Any], *, headers: Mapping[str, str] | None = None
+) -> tuple[int, Mapping[str, Any]]:
+    """One POST through the core's client: the status, and the body as JSON.
+    Never raises for a status or a network failure - a count that cannot be
+    had is an estimate, not a failed turn."""
+    from ultron.sdk.web import post
+
+    try:
+        response = await post(
+            url,
+            json=dict(body),
+            allow_private=True,
+            timeout=PROPS_TIMEOUT,
+            headers=dict(headers or {}),
+            user_agent="ultron-llama-cpp",
+            max_bytes=8_000_000,
+        )
+        decoded = json.loads(response.body.decode("utf-8") or "{}")
+    except Exception:  # unreachable, refused, not JSON: nothing counted
+        return 599, {}
+    return response.status, decoded if isinstance(decoded, Mapping) else {}
+
+
+def _carries_media(request: Mapping[str, Any]) -> bool:
+    """Whether any message carries a part that is not text."""
+    for message in request.get("messages") or ():
+        content = message.get("content") if isinstance(message, Mapping) else None
+        if isinstance(content, list) and any(
+            isinstance(part, Mapping) and part.get("type") != "text" for part in content
+        ):
+            return True
+    return False
 
 
 # -- helpers: the listing --------------------------------------------------------------

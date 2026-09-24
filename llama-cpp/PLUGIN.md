@@ -122,6 +122,13 @@ session compacts against the context the server was started with, whatever it be
 when it started. A request that would not fit is refused before it is sent, with how to
 start the server larger; Ultron compacts and tries once more first.
 
+The size checked is **exact**, not estimated: the request goes to `/apply-template`, which
+renders it through the same chat template, tool schemas and thinking switch a chat
+completion would, and `/tokenize` counts the result - two round trips to your own server.
+A request carrying a picture or audio is estimated instead, because the rendered prompt
+holds a marker rather than the tokens the projector adds; so is every request to a build
+too old to have the two endpoints, which is asked once and then left alone.
+
 Every model is priced at zero. That is a declaration and not a gap: the machine is yours,
 and `/status` says `$0.00` rather than *at least*. The server's prompt-cache reuse is not
 reported as a cache figure, because the OpenAI-shaped `usage` does not carry it and a zero
