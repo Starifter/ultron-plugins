@@ -1,8 +1,8 @@
 ---
 name: openrouter
 description: The OpenRouter model provider - one key, every model it routes to.
-version: "1.0.0"
-requires_ultron_sdk: ">=1.3,<2"
+version: "1.1.0"
+requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models]
 logo: logo.svg
 contracts:
