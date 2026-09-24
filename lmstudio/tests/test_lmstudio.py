@@ -40,13 +40,18 @@ LMStudioProvider = plugin.LMStudioProvider
 SPEC = ToolSpec(name="echo", description="Echo.", parameters={"type": "object", "properties": {}})
 
 
-def llm(key: str, *, loaded: int = 0, vision: bool = False) -> dict[str, Any]:
+def llm(
+    key: str, *, loaded: int = 0, vision: bool = False, reasoning: list[str] | None = None
+) -> dict[str, Any]:
+    capabilities: dict[str, Any] = {"vision": vision, "trained_for_tool_use": True}
+    if reasoning is not None:
+        capabilities["reasoning"] = {"allowed_options": reasoning, "default": reasoning[-1]}
     return {
         "type": "llm",
         "key": key,
         "loaded_instances": ([{"id": key, "config": {"context_length": loaded}}] if loaded else []),
         "max_context_length": 131072,
-        "capabilities": {"vision": vision, "trained_for_tool_use": True},
+        "capabilities": capabilities,
     }
 
 
@@ -97,6 +102,7 @@ def server(monkeypatch: pytest.MonkeyPatch) -> Server:
     monkeypatch.setattr(plugin, "post_json", fake.post)
     monkeypatch.setattr(plugin, "probe_json", fake.probe)
     plugin._WINDOWS.clear()
+    plugin._ROWS.clear()
     return fake
 
 
@@ -155,6 +161,7 @@ def test_the_window_is_loaded_then_configured_then_the_floor(server: Server) -> 
     server.models = [llm("qwen/qwen3-8b", loaded=16384)]
     assert LMStudioProvider.window_for("qwen/qwen3-8b") == 16384
     plugin._WINDOWS.clear()
+    plugin._ROWS.clear()
     server.models = [llm("qwen/qwen3-8b")]
     assert LMStudioProvider.bind(context_length=32768).window_for("qwen/qwen3-8b") == 32768
     assert LMStudioProvider.window_for("qwen/qwen3-8b") == plugin.FLOOR_CONTEXT
@@ -236,3 +243,46 @@ async def test_failures_say_what_to_do(server: Server) -> None:
         with pytest.raises(ProviderError, match=expected) as caught:
             await provider.complete(system="", messages=[Message.user("hi")])
         assert caught.value.__cause__ is raised
+
+
+# -- thinking (measured against a live LM Studio: only reasoning_effort counts) --
+
+
+def test_the_menu_comes_from_what_lm_studio_lists() -> None:
+    assert plugin.levels_of(llm("a", reasoning=["off", "on"])) == ("off", "high")
+    assert plugin.levels_of(llm("b", reasoning=["on"])) == ("high",)
+    assert plugin.levels_of(llm("c", reasoning=["low", "medium", "high"])) == (
+        "low",
+        "medium",
+        "high",
+    )
+    assert plugin.levels_of(llm("d")) == (), "no reasoning entry is no control"
+    assert plugin.levels_of({"key": "e"}) is None, "no capabilities says nothing"
+
+
+async def test_think_is_sent_as_reasoning_effort(server: Server) -> None:
+    server.models = [llm("qwen/qwen3-1.7b", loaded=16384, reasoning=["off", "on"])]
+    assert LMStudioProvider.levels_for("qwen/qwen3-1.7b") == ("off", "high")
+    client = FakeClient()
+    provider = LMStudioProvider("qwen/qwen3-1.7b", client=client)
+    assert provider.thinking == "high", "on, by default"
+    await provider.complete(system="", messages=[Message.user("hi")])
+    assert client.request["reasoning_effort"] == "high"
+    provider.set_thinking("off")
+    await provider.complete(system="", messages=[Message.user("hi")])
+    assert client.request["reasoning_effort"] == "none"
+
+
+async def test_a_model_without_reasoning_is_sent_nothing(server: Server) -> None:
+    server.models = [llm("plain", loaded=16384)]
+    client = FakeClient()
+    await LMStudioProvider("plain", client=client).complete(
+        system="", messages=[Message.user("hi")]
+    )
+    assert "reasoning_effort" not in client.request
+
+
+async def test_the_listing_carries_the_menu(server: Server) -> None:
+    server.models = [llm("qwen/qwen3-1.7b", reasoning=["off", "on"])]
+    entries = await LMStudioProvider(client=FakeClient()).list_models() or ()
+    assert [e.thinking_levels for e in entries] == [("off", "high")]

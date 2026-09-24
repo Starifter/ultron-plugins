@@ -30,6 +30,7 @@ from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.provider import (
     ModelEntry,
     Pricing,
+    ThinkingLevel,
 )
 from ultron.sdk.runtime import ConfigError, ProviderError
 
@@ -40,6 +41,8 @@ PLACEHOLDER_KEY = "lm-studio"
 """What the `openai` package is handed when there is no token: it requires a key,
 and LM Studio ignores it unless authentication is switched on. Never the user's
 `OPENAI_API_KEY`."""
+
+LEVELS: tuple[ThinkingLevel, ...] = ("off", "low", "medium", "high", "max")
 
 FREE = Pricing(input=0.0, output=0.0, cache_read=0.0, cache_write=0.0)
 """A declaration, not a guess (`model-catalog.md` C6): a model on this machine
@@ -172,7 +175,34 @@ def loaded_context(row: Mapping[str, Any], model: str = "") -> int:
 
 
 _WINDOWS: dict[tuple[str, str], tuple[float, int]] = {}
-"""What the REST API last said, per server and model, for the synchronous ask."""
+"""The loaded size last seen, per server and model, for the synchronous ask."""
+
+_ROWS: dict[tuple[str, str], tuple[float, Mapping[str, Any]]] = {}
+"""The listing's row last seen, per server and model, for the synchronous asks."""
+
+ON: ThinkingLevel = "high"
+"""What a model whose reasoning is a switch offers as its one level: on, at the
+level a session asks for by default."""
+
+
+def levels_of(row: Mapping[str, Any]) -> tuple[ThinkingLevel, ...] | None:
+    """A model's `/think` menu from its `capabilities.reasoning`, or `None` where
+    the row says nothing about capabilities at all.
+
+    Measured against a live LM Studio: `reasoning_effort: "none"` switches
+    thinking off and every other field is ignored, so `off` is offered where the
+    model allows it, `on` is offered as `high`, and named levels as named. A
+    model with no `reasoning` entry has no control."""
+    if "capabilities" not in row:
+        return None
+    reasoning = _mapping(_mapping(row.get("capabilities")).get("reasoning"))
+    allowed = reasoning.get("allowed_options")
+    if not isinstance(allowed, list):
+        return ()
+    offered = set(str(option) for option in allowed)
+    if "on" in offered:
+        offered.add(ON)
+    return tuple(level for level in LEVELS if level in offered)
 
 
 def _auth(key: str) -> dict[str, str]:
@@ -199,9 +229,9 @@ class LMStudioProvider(OpenAICompatProvider):
     sampling = True
     default_context_window = FLOOR_CONTEXT
     thinking_levels = ()
-    """No `/think`. LM Studio's OpenAI endpoint documents no thinking control for
-    most models; a switch this plugin cannot promise is one it does not offer.
-    What a model reasons is still shown - it arrives as `reasoning` or
+    """None before LM Studio has been asked about a model: the menu is per model,
+    from the listing's `capabilities.reasoning` (`levels_for`). What a model
+    reasons is shown either way - it arrives as `reasoning` or
     `reasoning_content`, and the base reads both."""
 
     context_length: int = 0
@@ -220,26 +250,52 @@ class LMStudioProvider(OpenAICompatProvider):
         return ("*",)
 
     @classmethod
+    def row_for(cls, model: str) -> Mapping[str, Any]:
+        """The listing's row for `model`: one short synchronous GET, remembered
+        for half a minute, because the core asks while building a session."""
+        root = native_root(check_base_url(cls.base_url, default=DEFAULT_BASE_URL))
+        key = (root, model)
+        seen = _ROWS.get(key)
+        if seen is not None and time.monotonic() - seen[0] <= PROBE_CACHE_SECONDS:
+            return seen[1]
+        listing = probe_json(root + "/api/v1/models", headers=_auth(cls.credential(None)))
+        row = find(listing, model)
+        if row:
+            _ROWS[key] = (time.monotonic(), row)
+        return row
+
+    @classmethod
     def window_for(cls, model: str) -> int:
         """The loaded size where LM Studio has one; else the size this plugin
-        will load it at; else the floor. One short synchronous GET, remembered
-        for half a minute, because the core asks while building a session."""
+        will load it at; else the floor."""
         if not model:
             return super().window_for(model)
         root = native_root(check_base_url(cls.base_url, default=DEFAULT_BASE_URL))
-        key = (root, model)
-        seen = _WINDOWS.get(key)
-        if seen is None or time.monotonic() - seen[0] > PROBE_CACHE_SECONDS:
-            listing = probe_json(root + "/api/v1/models", headers=_auth(cls.credential(None)))
-            size = loaded_context(find(listing, model), model)
-            if size:
-                _WINDOWS[key] = (time.monotonic(), size)
-                return size
-        elif seen[1]:
+        seen = _WINDOWS.get((root, model))
+        if seen is not None and time.monotonic() - seen[0] <= PROBE_CACHE_SECONDS:
             return seen[1]
+        size = loaded_context(cls.row_for(model), model)
+        if size:
+            _WINDOWS[(root, model)] = (time.monotonic(), size)
+            return size
         if cls.context_length:
             return cls.context_length
         return super().window_for(model)
+
+    @classmethod
+    def levels_for(cls, model: str) -> tuple[ThinkingLevel, ...]:
+        """The model's own menu, from what LM Studio lists about it; the
+        catalog's word where LM Studio does not answer."""
+        levels = levels_of(cls.row_for(model)) if model else None
+        return levels if levels is not None else super().levels_for(model)
+
+    def thinking_request(self, level: ThinkingLevel) -> dict[str, Any]:
+        """`reasoning_effort`, the one field LM Studio honours: `none` is off, a
+        named level is that level, and `high` is on for a switch. A model with
+        no control is sent nothing."""
+        if not self.thinking_levels:
+            return {}
+        return {"reasoning_effort": "none" if level == "off" else level}
 
     def native_headers(self) -> dict[str, str]:
         return _auth(str(getattr(self._client, "api_key", "") or ""))
@@ -298,6 +354,7 @@ class LMStudioProvider(OpenAICompatProvider):
                     id=key,
                     context_window=loaded_context(row) or self.context_length,
                     modalities=("text", "image") if capabilities.get("vision") else ("text",),
+                    thinking_levels=levels_of(row),
                     cost=FREE,
                 )
             )

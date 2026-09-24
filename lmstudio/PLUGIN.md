@@ -89,9 +89,20 @@ Embedding models are left out of the list, and a listing loads nothing.
 
 ## Thinking
 
-There is no `/think` control. LM Studio's OpenAI endpoint documents no thinking switch
-that works across models, and this plugin does not offer what it cannot promise. What a
-model reasons is still shown as it streams.
+`/think` offers each model's own menu, read from what LM Studio lists about it
+(`capabilities.reasoning`):
+
+- **A switch** (`off`/`on`, like Qwen3) is offered as `off` and `high`.
+- **Named levels** (`low`/`medium`/`high`, like gpt-oss) are offered as named.
+- **A model with no reasoning entry** has no `/think`, and is sent nothing.
+
+The level goes out as `reasoning_effort`, with `off` sent as `none`. That is the one field
+LM Studio's OpenAI endpoint honours, measured against a running server:
+`reasoning.effort`, `chat_template_kwargs` and the rest are ignored. The on/off case was
+measured against Qwen3; the named-level case follows LM Studio's own listing and has not
+been run.
+
+What a model reasons is shown as it streams.
 
 ## A token
 
