@@ -24,6 +24,7 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | plugin | what it adds |
 |---|---|
 | `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs. |
+| `llama-cpp` | A model provider for a `llama-server` on this machine: GGUF models, no key, no bill, with an embedder for memory search. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means
