@@ -2,7 +2,7 @@
 name: llama-cpp
 description: A model provider for a llama.cpp server on this machine - GGUF models, no key, no bill.
 version: "1.1.0"
-requires_ultron_sdk: ">=1.23,<2"
+requires_ultron_sdk: ">=1.24,<2"
 categories: [provider, models, local]
 logo: logo.svg
 contracts:
@@ -116,6 +116,11 @@ with** (`-c`, split across `--parallel`), which is the window a request actually
 is usually well under the model's own; whether a projector is loaded for pictures; and when
 the model file was made. `/props` is asked with `autoload=false`, so a router never loads
 a model to answer.
+
+The same `/props` answer is asked before every request. From the first reply on, the
+session compacts against the context the server was started with, whatever it believed
+when it started. A request that would not fit is refused before it is sent, with how to
+start the server larger; Ultron compacts and tries once more first.
 
 Every model is priced at zero. That is a declaration and not a gap: the machine is yours,
 and `/status` says `$0.00` rather than *at least*. The server's prompt-cache reuse is not

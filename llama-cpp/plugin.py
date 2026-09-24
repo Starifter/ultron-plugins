@@ -214,6 +214,20 @@ class LlamaCppProvider(OpenAICompatProvider):
         entries = (_entry_of(row, n_ctx=n_ctx, modalities=modalities) for row in rows)
         return [entry for entry in entries if entry is not None]
 
+    async def loaded_window(self) -> int:
+        """The context one slot of the server holds (`-c`, split across
+        `--parallel`), from `/props`. The session's budget follows it and every
+        request is checked against it before it is sent (`plugin-sdk.md` §6.7);
+        a server that does not answer `/props` checks nothing."""
+        return _n_ctx(await self._props())
+
+    def does_not_fit(self, needed: int, model: str) -> str:
+        return (
+            f"this turn is about {needed:,} tokens and the llama.cpp server holds "
+            f"{self.served_window:,} per slot - start it with a larger -c (or set "
+            f"server_context under plugins_settings.llama-cpp), or fewer --parallel slots"
+        )
+
     async def _props(self) -> Mapping[str, Any]:
         try:
             return await fetch_json(_root_of(self.base_url_in_use) + "/props?autoload=false")
