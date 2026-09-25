@@ -27,6 +27,11 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `llama-cpp` | A model provider for a `llama-server` on this machine: GGUF models, no key, no bill, with an embedder for memory search. |
 | `ollama` | Two model providers: `ollama` for a local Ollama (no key, no bill, context checked against what Ollama loaded) and `ollama-cloud` for ollama.com with `OLLAMA_API_KEY`, plus an embedder. |
 | `lmstudio` | A model provider for LM Studio on this machine: loads the model at the context you choose, no key, no bill, with an embedder. |
+| `groq` | A model provider for Groq (`GROQ_API_KEY`): open models served fast, with `/think` per model family. |
+| `deepseek` | A model provider for DeepSeek (`DEEPSEEK_API_KEY`), its thinking carried through tool loops the way DeepSeek requires. Needs SDK 1.25. |
+| `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included. |
+| `together` | A model provider for Together AI (`TOGETHER_API_KEY`): its hosted open models, priced from its listing. |
+| `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops. Needs SDK 1.25. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means
