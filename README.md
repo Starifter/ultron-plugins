@@ -34,10 +34,15 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 Only that Ultron knows this repository's address. A plugin here goes through the same
 refresh, the same copy and the same consent line as one from any other marketplace, and
 nothing is allowed or refused because it came from here. What the marketplace promises is
-the check in [`scripts/validate.py`](scripts/validate.py), run on every change: each entry
+the check in [`scripts/validate.py`](scripts/validate.py), run before every merge: each entry
 has a manifest that parses, a name that matches its directory, a version, an SDK range that
 the current SDK satisfies, and no `autoload` - which Ultron refuses from anything it did
 not ship, so a plugin here that said it would be a plugin lying about itself.
+
+CI runs the same check, but cannot yet: it installs Ultron from its repository, which is
+private for now, so the `validate` job fails before it reaches a plugin. Until that changes,
+the check is run against a local Ultron checkout, and a red `validate` says nothing about
+the change it is on.
 
 ## Pointing an install elsewhere
 
