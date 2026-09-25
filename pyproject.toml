@@ -6,3 +6,20 @@ addopts = "-q"
 testpaths = ["."]
 python_files = ["test_*.py"]
 norecursedirs = [".git", "scripts", "__pycache__"]
+
+# Ultron's own lint settings, so a plugin here reads like the code it plugs into.
+# `ultron` is first-party: it is the package every plugin is written against.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+# A tool declares its JSON Schema as a class attribute, as Ultron's built-ins do.
+ignore = ["RUF012"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ultron"]
+
+[tool.ruff.lint.per-file-ignores]
+"*/tests/*" = ["B018"]

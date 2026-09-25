@@ -68,6 +68,7 @@ The same script runs in CI on every change and is the whole of what this marketp
 promises about an entry. Tests are yours to add and welcome: put them in
 `<name>/tests/`, driving the plugin with a fake client the way `openrouter/tests/` does,
 and CI runs them with `pytest` (asyncio in auto mode, from the `pyproject.toml` at the
-root). Then try it: `/plugins market refresh official` on an install
+root). `ruff check .` and `ruff format .` read Ultron's own settings from the same file,
+so a plugin reads like the code it plugs into; CI does not run them. Then try it: `/plugins market refresh official` on an install
 whose `plugin_marketplace_official` points at your checkout, `/plugins install <name>`,
 restart, and `/plugins <name>` should show what it installed.
