@@ -59,16 +59,24 @@ manifest's prose, as `brave` does.
 
 ## Before opening a pull request
 
+From a checkout of Ultron beside this one:
+
 ```
-pip install git+https://github.com/Starifter/ultron.git
-python scripts/validate.py
+uv run --project ../Ultron python scripts/validate.py
+uv run --project ../Ultron pytest <name>/tests
 ```
 
-The same script runs in CI on every change and is the whole of what this marketplace
-promises about an entry. Tests are yours to add and welcome: put them in
-`<name>/tests/`, driving the plugin with a fake client the way `openrouter/tests/` does,
-and CI runs them with `pytest` (asyncio in auto mode, from the `pyproject.toml` at the
-root). `ruff check .` and `ruff format .` read Ultron's own settings from the same file,
-so a plugin reads like the code it plugs into; CI does not run them. Then try it: `/plugins market refresh official` on an install
-whose `plugin_marketplace_official` points at your checkout, `/plugins install <name>`,
-restart, and `/plugins <name>` should show what it installed.
+The script is the whole of what this marketplace promises about an entry. Tests are yours
+to add and welcome: put them in `<name>/tests/`, driving the plugin with a fake client the
+way `openrouter/tests/` does (asyncio in auto mode, from the `pyproject.toml` at the root).
+`ruff check .` and `ruff format .` read Ultron's own settings from the same file, so a
+plugin reads like the code it plugs into.
+
+CI runs the script and the tests too, but it installs Ultron from its repository, which is
+private for now, so the `validate` job fails before it reaches your plugin; `pip install
+git+https://github.com/Starifter/ultron.git` works only for someone with access to it. Run
+both locally, and say in the pull request that you did.
+
+Then try it: `/plugins market refresh official` on an install whose
+`plugin_marketplace_official` points at your checkout, `/plugins install <name>`, restart,
+and `/plugins <name>` should show what it installed.
