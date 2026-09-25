@@ -16,8 +16,12 @@ import sys
 from pathlib import Path
 
 from ultron.errors import IncompatibleSDKError
-from ultron.plugins.discovery import MANIFEST_FILENAME, MODULE_FILENAME, check_compatibility
-from ultron.plugins.discovery import read_manifest
+from ultron.plugins.discovery import (
+    MANIFEST_FILENAME,
+    MODULE_FILENAME,
+    check_compatibility,
+    read_manifest,
+)
 from ultron.sdk import SDK_VERSION
 
 SKIPPED = {".git", ".github", "scripts"}

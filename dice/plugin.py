@@ -30,7 +30,7 @@ class RollDice(Tool):
         if count > self.max_dice:
             # A failure the model can read and recover from, not an exception.
             return ToolResult.error(f"{count} dice is more than max_dice ({self.max_dice})")
-        rolls = [random.randint(1, sides) for _ in range(count)]  # noqa: S311 - a game
+        rolls = [random.randint(1, sides) for _ in range(count)]  # a game, not a secret
         return ToolResult.ok(f"{count}d{sides}: {' '.join(map(str, rolls))} = {sum(rolls)}")
 
 
