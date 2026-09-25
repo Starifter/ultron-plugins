@@ -11,6 +11,8 @@ Requires the `openai` package (`pip install openai`).
 
 from __future__ import annotations
 
+import json
+import uuid
 from collections.abc import Mapping
 from typing import Any
 
@@ -19,6 +21,19 @@ from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.provider import ModelEntry, ThinkingLevel
 
 BASE_URL = "https://api.groq.com/openai/v1"
+TRANSCRIPTIONS_URL = f"{BASE_URL}/audio/transcriptions"
+DEFAULT_TRANSCRIPTION_MODEL = "whisper-large-v3-turbo"
+"""Groq's fastest Whisper, and its cheapest; `whisper-large-v3` is the accurate one."""
+
+AUDIO_EXTENSIONS: dict[str, str] = {
+    "audio/ogg": "ogg",
+    "audio/mpeg": "mp3",
+    "audio/mp4": "m4a",
+    "audio/wav": "wav",
+    "audio/webm": "webm",
+    "audio/flac": "flac",
+}
+"""Every audio type Ultron stores, each of which Groq documents taking."""
 
 EFFORT_ONLY: tuple[ThinkingLevel, ...] = ("low", "medium", "high")
 """GPT-OSS: `reasoning_effort` low to high, and no off - `include_reasoning: false`
@@ -96,6 +111,99 @@ class GroqProvider(OpenAICompatProvider):
         )
 
 
+class GroqWhisper:
+    """Groq's transcriptions endpoint as a media reader (`media.md` §8.3).
+
+    Named `groq/whisper`, so the core hands it the key the `groq` provider would
+    use - a profile, or `GROQ_API_KEY` in `~/.ultron/.env` - and never reads it on
+    the reader's behalf. It sees the bytes and a language hint, never the
+    conversation. Priority 40: ahead of `openai/whisper` at 50, because the same
+    model costs a tenth as much here; `audio_reader` pins either.
+    """
+
+    name = "groq/whisper"
+    kinds: tuple[str, ...] = ("audio",)
+    accepts: tuple[str, ...] = tuple(AUDIO_EXTENSIONS)
+    priority = 40
+
+    def __init__(
+        self,
+        *,
+        model: str = "",
+        api_key: str | None = None,
+        auth_token: str | None = None,
+        base_url: str | None = None,
+    ) -> None:
+        self.model = (model or DEFAULT_TRANSCRIPTION_MODEL).strip()
+        self._key = api_key or auth_token or ""
+        self._url = (
+            f"{base_url.rstrip('/')}/audio/transcriptions" if base_url else TRANSCRIPTIONS_URL
+        )
+
+    def ready(self) -> str:
+        if not self._key:
+            return "no groq key (ultron auth add groq, or GROQ_API_KEY in ~/.ultron/.env)"
+        return ""
+
+    async def read(self, reading: Any) -> Any:
+        from ultron.sdk.media import Understood
+        from ultron.sdk.web import post
+
+        fields = [("model", self.model), ("response_format", "json")]
+        if reading.language:
+            fields.append(("language", reading.language))
+        ext = AUDIO_EXTENSIONS.get(reading.media_type, "bin")
+        body, content_type = multipart(fields, f"audio.{ext}", reading.media_type, reading.data)
+        response = await post(
+            self._url,
+            data=body,
+            content_type=content_type,
+            headers={"Authorization": f"Bearer {self._key}"},
+            timeout=reading.timeout,
+            max_bytes=4 * 1024 * 1024,
+            user_agent="ultron-groq",
+        )
+        if response.status >= 400:
+            raise RuntimeError(f"HTTP {response.status} from Groq: {_why(response.body)}")
+        try:
+            parsed = json.loads(response.body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"unreadable reply from Groq: {exc}") from None
+        text = str(parsed.get("text", "") or "") if isinstance(parsed, dict) else ""
+        return Understood(text)
+
+
+def multipart(
+    fields: list[tuple[str, str]], filename: str, media_type: str, data: bytes
+) -> tuple[bytes, str]:
+    """A `multipart/form-data` body with the file last, and its content type."""
+    boundary = f"----ultron{uuid.uuid4().hex}"
+    body = bytearray()
+    for name, value in fields:
+        body += (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+        ).encode()
+    body += (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+        f'filename="{filename}"\r\nContent-Type: {media_type}\r\n\r\n'
+    ).encode()
+    body += data
+    body += f"\r\n--{boundary}--\r\n".encode()
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def _why(body: bytes) -> str:
+    """The vendor's own error message, if it sent one, without printing a page."""
+    try:
+        data = json.loads(body)
+        error = data.get("error") if isinstance(data, dict) else None
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])[:200]
+    except ValueError:
+        pass
+    return body[:200].decode("utf-8", "replace").strip()
+
+
 class GroqPlugin(Plugin):
     """The Groq provider."""
 
@@ -104,3 +212,10 @@ class GroqPlugin(Plugin):
 
     def register(self, ctx: PluginContext) -> None:
         ctx.register_provider("groq", GroqProvider)
+        # The transcriber: Groq's Whisper under the key the provider uses, which
+        # the core hands in because the reader is named for the vendor.
+        transcription_model = str(ctx.setting("transcription_model", "") or "")
+        ctx.register_media_reader(
+            "groq/whisper",
+            lambda **kwargs: GroqWhisper(model=transcription_model, **kwargs),
+        )

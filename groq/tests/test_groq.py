@@ -134,11 +134,93 @@ async def test_groqs_overflow_is_a_context_overflow() -> None:
         raise AssertionError("an overflow was not recognised")
 
 
-def test_the_plugin_registers_the_provider() -> None:
+def test_the_plugin_registers_the_provider_and_the_transcriber() -> None:
     registered: dict[str, Any] = {}
+    readers: dict[str, Any] = {}
     ctx = SimpleNamespace(
         register_provider=lambda name, cls: registered.__setitem__(name, cls),
-        setting=lambda key, default=None: default,
+        register_media_reader=lambda name, factory: readers.__setitem__(name, factory),
+        setting=lambda key, default=None: (
+            "whisper-large-v3" if key == "transcription_model" else default
+        ),
     )
     plugin.GroqPlugin().register(ctx)  # type: ignore[arg-type]
     assert registered == {"groq": GroqProvider}
+    # Named for the vendor, so the core hands the factory the groq profile's key.
+    reader = readers["groq/whisper"](api_key="gsk-test")
+    assert reader.name == "groq/whisper" and reader.model == "whisper-large-v3"
+    assert reader.ready() == ""
+
+
+# -- the transcriber (`media.md` §8.3) ------------------------------------------------
+
+
+def _reading(**kw: Any) -> Any:
+    from ultron.sdk.media import Reading
+
+    fields: dict[str, Any] = {
+        "kind": "audio",
+        "data": b"OggS" + b"\x00" * 64,
+        "media_type": "audio/ogg",
+        "name": "",
+        "max_chars": 1000,
+    }
+    fields.update(kw)
+    return Reading(**fields)
+
+
+def _fake_post(
+    monkeypatch: Any, status: int = 200, body: bytes = b'{"text": "hi"}'
+) -> dict[str, Any]:
+    from ultron.sdk import web as sdk_web
+
+    seen: dict[str, Any] = {}
+
+    async def post(url: str, **kwargs: Any) -> Any:
+        seen["url"] = url
+        seen.update(kwargs)
+        return SimpleNamespace(status=status, body=body)
+
+    monkeypatch.setattr(sdk_web, "post", post)
+    return seen
+
+
+def test_the_transcriber_is_not_ready_without_a_key() -> None:
+    reader = plugin.GroqWhisper()
+    assert "GROQ_API_KEY" in reader.ready()
+    assert reader.priority < 50, "ahead of openai/whisper, which is 50"
+    assert "audio/webm" in reader.accepts and reader.kinds == ("audio",)
+
+
+async def test_the_transcriber_posts_the_audio_to_groq(monkeypatch: Any) -> None:
+    seen = _fake_post(monkeypatch, body=b'{"text": "turn the lights off", "language": "en"}')
+    reader = plugin.GroqWhisper(api_key="gsk-test")
+    out = await reader.read(_reading(language="en"))
+    assert out.text == "turn the lights off"
+    assert seen["url"] == "https://api.groq.com/openai/v1/audio/transcriptions"
+    assert seen["headers"] == {"Authorization": "Bearer gsk-test"}
+    assert seen["content_type"].startswith("multipart/form-data; boundary=")
+    body = seen["data"]
+    assert b'name="model"\r\n\r\nwhisper-large-v3-turbo\r\n' in body
+    assert b'name="language"\r\n\r\nen\r\n' in body
+    assert b'filename="audio.ogg"\r\nContent-Type: audio/ogg\r\n\r\nOggS' in body
+    # The file is the last part of the form.
+    assert body.rstrip().endswith(b"--") and body.index(b'name="file"') > body.index(
+        b'name="model"'
+    )
+
+
+async def test_no_language_hint_sends_none(monkeypatch: Any) -> None:
+    seen = _fake_post(monkeypatch)
+    await plugin.GroqWhisper(api_key="gsk-test").read(_reading())
+    assert b'name="language"' not in seen["data"]
+
+
+async def test_a_refusal_raises_with_groqs_words(monkeypatch: Any) -> None:
+    _fake_post(monkeypatch, status=401, body=b'{"error": {"message": "Invalid API Key"}}')
+    try:
+        await plugin.GroqWhisper(api_key="gsk-bad").read(_reading())
+    except RuntimeError as exc:
+        assert "HTTP 401" in str(exc) and "Invalid API Key" in str(exc)
+    else:
+        raise AssertionError("a 401 did not raise")

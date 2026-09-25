@@ -1,11 +1,17 @@
 ---
 name: xai
-description: The xAI model provider - Grok, at xAI.
-version: "1.0.0"
+description: The xAI model provider - Grok, at xAI - and Grok speech-to-text for voice notes.
+version: "1.1.0"
 requires_ultron_sdk: ">=1.23,<2"
-categories: [provider, models]
+categories: [provider, models, audio]
 contracts:
   providers: [xai]
+  media_readers: [xai/stt]
+config_schema:
+  transcription_model:
+    type: str
+    default: ""
+    description: The model xai/stt transcribes with. Empty is grok-voice-transcribe-2.0.
 providers:
   xai:
     api_key_env_vars: [XAI_API_KEY]
@@ -46,10 +52,22 @@ field. The reasoning comes back as `reasoning_content` and is shown as thinking.
 Sampling (`temperature`, the penalties, `stop`) is not forwarded: xAI's reasoning models
 refuse some of it outright.
 
+## Voice notes
+
+The plugin also registers `xai/stt`, a media reader that transcribes a voice note or a
+recording with xAI's speech-to-text (`grok-voice-transcribe-2.0` unless
+`transcription_model` says otherwise). It uses the same key as the provider, so once
+`ultron auth add xai` is done a voice note is transcribed whether or not you chat through
+Grok. Its priority is 45: after `groq/whisper` (40), before `openai/whisper` (50).
+`audio_reader: xai/stt` pins it. xAI does not take WebM audio, so a WebM voice note goes
+to the next reader.
+
 ## What reaches xAI
 
 The conversation, the tool definitions, pictures, and your key. A PDF is not sent over
-this API, and the row says so.
+this API, and the row says so. A voice note reaches xAI only when `xai/stt` is the reader
+that transcribes it, and then only the audio and the `audio_language` hint - never the
+conversation.
 
 ## Not tested live
 
