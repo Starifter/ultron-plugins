@@ -45,7 +45,7 @@ Folding two lines behind a click costs more than it saves."""
 MAX_INTRALINE_CHARS = 500
 FONT_FALLBACK = 'ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace'
 FONT_NAME = re.compile(r"^[A-Za-z0-9 _\-]{1,64}$")
-BIDI = re.compile("[؜‎‏‪-‮⁦-⁩]")
+BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
 CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f]")
 
 

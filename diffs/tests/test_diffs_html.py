@@ -86,8 +86,8 @@ def test_patch_paths_and_sections_are_escaped() -> None:
 
 
 def test_bidi_and_control_characters_are_made_visible() -> None:
-    out = escape("a‮b\x00c\x1bd\te")
-    assert "‮" not in out and "U+202E" in out
+    out = escape("a\u202eb\x00c\x1bd\te")
+    assert "\u202e" not in out and "U+202E" in out
     assert "\x00" not in out and "\x1b" not in out
     assert "\t" in out  # tabs are code
 
