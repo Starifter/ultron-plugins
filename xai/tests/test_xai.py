@@ -107,3 +107,81 @@ async def test_the_listing_prices_in_dollars_with_a_long_context_tier() -> None:
         (128000, None, 4.0, 30.0),
     ]
     assert other.cost is None, "a price nobody quoted is unknown, never zero"
+
+
+# -- the transcriber (`media.md` §8.3) ------------------------------------------------
+
+
+def _reading(**kw: Any) -> Any:
+    from ultron.sdk.media import Reading
+
+    fields: dict[str, Any] = {
+        "kind": "audio",
+        "data": b"ID3" + b"\x00" * 64,
+        "media_type": "audio/mpeg",
+        "name": "",
+        "max_chars": 1000,
+    }
+    fields.update(kw)
+    return Reading(**fields)
+
+
+def _fake_post(
+    monkeypatch: Any, status: int = 200, body: bytes = b'{"text": "hi"}'
+) -> dict[str, Any]:
+    from ultron.sdk import web as sdk_web
+
+    seen: dict[str, Any] = {}
+
+    async def post(url: str, **kwargs: Any) -> Any:
+        seen["url"] = url
+        seen.update(kwargs)
+        return SimpleNamespace(status=status, body=body)
+
+    monkeypatch.setattr(sdk_web, "post", post)
+    return seen
+
+
+def test_the_plugin_registers_the_provider_and_the_transcriber() -> None:
+    registered: dict[str, Any] = {}
+    readers: dict[str, Any] = {}
+    ctx = SimpleNamespace(
+        register_provider=lambda name, cls: registered.__setitem__(name, cls),
+        register_media_reader=lambda name, factory: readers.__setitem__(name, factory),
+        setting=lambda key, default=None: default,
+    )
+    plugin.XAIPlugin().register(ctx)  # type: ignore[arg-type]
+    assert registered == {"xai": XAIProvider}
+    reader = readers["xai/stt"](api_key="xai-test")
+    assert reader.name == "xai/stt" and reader.model == "grok-voice-transcribe-2.0"
+    assert reader.ready() == ""
+
+
+def test_the_transcriber_is_not_ready_without_a_key_and_takes_no_webm() -> None:
+    reader = plugin.XAITranscriber()
+    assert "XAI_API_KEY" in reader.ready()
+    assert "audio/webm" not in reader.accepts and "audio/ogg" in reader.accepts
+
+
+async def test_the_transcriber_posts_the_audio_to_xai(monkeypatch: Any) -> None:
+    seen = _fake_post(monkeypatch, body=b'{"text": "hello there", "duration": 4.2, "words": []}')
+    out = await plugin.XAITranscriber(api_key="xai-test").read(_reading(language="fr"))
+    assert out.text == "hello there" and out.cost == "4s"
+    assert seen["url"] == "https://api.x.ai/v1/stt"
+    assert seen["headers"] == {"Authorization": "Bearer xai-test"}
+    body = seen["data"]
+    assert b'name="model"\r\n\r\ngrok-voice-transcribe-2.0\r\n' in body
+    assert b'name="language"\r\n\r\nfr\r\n' in body
+    # xAI requires the file to be the last field of the form.
+    assert body.index(b'name="file"') > body.index(b'name="language"')
+    assert b'filename="audio.mp3"\r\nContent-Type: audio/mpeg\r\n\r\nID3' in body
+
+
+async def test_a_refusal_raises_with_xais_words(monkeypatch: Any) -> None:
+    _fake_post(monkeypatch, status=400, body=b'{"error": "unsupported audio format"}')
+    try:
+        await plugin.XAITranscriber(api_key="xai-test").read(_reading())
+    except RuntimeError as exc:
+        assert "HTTP 400" in str(exc) and "unsupported audio format" in str(exc)
+    else:
+        raise AssertionError("a 400 did not raise")
