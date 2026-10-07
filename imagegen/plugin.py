@@ -1,15 +1,22 @@
-"""imagegen: make and edit pictures, on OpenAI or Google, saved in the workspace.
+"""imagegen: make and edit pictures, on any vendor a key is held for, saved in the workspace.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings one
-tool, `generate_image`, and two vendors behind it:
+tool, `generate_image`, and six vendors behind it:
 
 - `OpenAIImages` - the Images API: words to `/images/generations` as JSON,
   pictures and a mask to `/images/edits` as multipart.
 - `GoogleImages` - Gemini's `generateContent` with an `IMAGE` modality, pictures
   inline beside the prompt; an `imagen-*` model goes to Imagen's `:predict`.
+- `XAIImages` - Grok Imagine: `/images/generations`, and `/images/edits` as JSON
+  with the picture as a data URI, one at a time.
+- `OpenRouterImages` - OpenRouter's Images API, pictures as `input_references`.
+- `TogetherImages` - Together's `/images/generations`, words only.
+- `FireworksImages` - a FLUX `text_to_image` workflow, words only, bytes back.
 
-Keys come from `ctx.credential`, asked at each call so a key added mid-session
-is the one spent. The picture is written into the workspace, put in the media
+The last four are the vendors of the provider plugins of the same names, and
+spend the key that plugin's provider uses. Keys come from `ctx.credential`,
+asked when a vendor is reached, so a key added mid-session is the one spent and
+a vendor never reached is never read. The picture is written into the workspace, put in the media
 store with `ctx.media.put` so it survives a reload, and handed back as an
 `ImageResult` so the model sees it. Every vendor attempt is a `generate`
 record through `ctx.audit`, beside the tool call's own record.
@@ -23,7 +30,7 @@ import json
 import re
 import time
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -38,8 +45,16 @@ MAX_INPUT_BYTES = 50 * 1024 * 1024
 """OpenAI's per-image limit, and so the most one picture to edit may weigh."""
 REPLY_MAX_BYTES = 64 * 1024 * 1024
 """A picture comes back as base64, a third larger than its bytes."""
-VENDORS = ("openai", "google")
-HOSTS = {"openai": "api.openai.com", "google": "generativelanguage.googleapis.com"}
+VENDORS = ("openai", "google", "xai", "openrouter", "together", "fireworks")
+"""Every vendor, in the order they are tried when `provider` names none."""
+HOSTS = {
+    "openai": "api.openai.com",
+    "google": "generativelanguage.googleapis.com",
+    "xai": "api.x.ai",
+    "openrouter": "openrouter.ai",
+    "together": "api.together.ai",
+    "fireworks": "api.fireworks.ai",
+}
 """Where each vendor's bytes came from, for the envelope's source label."""
 
 EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
@@ -204,27 +219,62 @@ class OpenAIImages:
         parsed = _json(response.body)
         if response.status >= 400:
             raise RuntimeError(_openai_error(parsed, response.status))
-        rows = parsed.get("data")
-        first = rows[0] if isinstance(rows, list) and rows else None
-        encoded = first.get("b64_json") if isinstance(first, Mapping) else None
-        if not encoded:
-            raise RuntimeError("the images endpoint sent no picture")
         usage = parsed.get("usage")
         cost = ""
         if isinstance(usage, Mapping) and usage.get("total_tokens") is not None:
             cost = f"{usage['total_tokens']} tokens"
-        return Made(base64.b64decode(str(encoded)), model=self.model, cost=cost)
+        return Made(_first_b64(parsed, "the images endpoint"), model=self.model, cost=cost)
 
 
-def _openai_error(body: Mapping[str, Any], status: int) -> str:
-    """The status and OpenAI's error code and type - identifiers, never its
-    prose, which would reach the model as a tool result."""
+def _openai_error(body: Mapping[str, Any], status: int, where: str = "the images endpoint") -> str:
+    """The status and the vendor's error code and type - identifiers, never its
+    prose, which would reach the model as a tool result. OpenAI's shape, which
+    the OpenAI-compatible vendors share; one that sends `error` as a sentence
+    gets the status alone."""
     error = body.get("error")
     said = []
     if isinstance(error, Mapping):
         said = [str(error.get(key) or "") for key in ("code", "type")]
     named = ", ".join(dict.fromkeys(part for part in said if part))
-    return f"HTTP {status} from the images endpoint" + (f" ({named})" if named else "")
+    return f"HTTP {status} from {where}" + (f" ({named})" if named else "")
+
+
+def _first_b64(parsed: Mapping[str, Any], where: str) -> bytes:
+    """The first picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
+    rows = parsed.get("data")
+    first = rows[0] if isinstance(rows, list) and rows else None
+    encoded = first.get("b64_json") if isinstance(first, Mapping) else None
+    if not encoded:
+        raise RuntimeError(f"{where} sent no picture")
+    return base64.b64decode(str(encoded))
+
+
+def _data_uri(image: Source) -> str:
+    return f"data:{image.media_type};base64,{base64.b64encode(image.data).decode('ascii')}"
+
+
+def _bearer(credential: Mapping[str, str]) -> str:
+    """An API key or a token, either of which these vendors take as a bearer."""
+    return str(credential.get("api_key") or credential.get("auth_token") or "")
+
+
+async def _post_json(
+    url: str, body: Mapping[str, Any], key: str, timeout: float, where: str
+) -> Mapping[str, Any]:
+    from ultron.sdk.web import post
+
+    response = await post(
+        url,
+        json=body,
+        headers={"Authorization": f"Bearer {key}"},
+        timeout=timeout,
+        max_bytes=REPLY_MAX_BYTES,
+        user_agent="ultron-imagegen",
+    )
+    parsed = _json(response.body)
+    if response.status >= 400:
+        raise RuntimeError(_openai_error(parsed, response.status, where))
+    return parsed
 
 
 # -- Google ----------------------------------------------------------------------
@@ -348,6 +398,173 @@ def _gemini_parts(reply: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [p for p in parts if isinstance(p, Mapping)] if isinstance(parts, list) else []
 
 
+# -- xAI -------------------------------------------------------------------------
+
+XAI_URL = "https://api.x.ai/v1/images"
+XAI_ASPECTS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
+"""Grok Imagine's ratios run wide; 16:9 and 9:16 are the pair it lists."""
+
+
+class XAIImages:
+    name = "xai"
+    edits = True
+    masks = False
+    max_images = 1
+    """`/images/edits` takes one `image`; nothing documents more."""
+
+    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
+        self.model = (model or "grok-imagine-image-2.0").strip()
+        self._key = _bearer({"api_key": api_key or "", **rest})
+
+    def ready(self) -> str:
+        return "" if self._key else "no xai key (ultron auth add xai)"
+
+    async def generate(self, request: Request) -> Made:
+        if not request.prompt.strip():
+            raise ValueError("nothing to make: the prompt is empty")
+        body: dict[str, Any] = {
+            "model": self.model,
+            "prompt": request.prompt,
+            "response_format": "b64_json",
+        }
+        if request.images:
+            # JSON, not multipart: xAI refuses the form OpenAI's edits take.
+            body["image"] = {"url": _data_uri(request.images[0]), "type": "image_url"}
+            url = f"{XAI_URL}/edits"
+        else:
+            body["n"] = 1
+            if request.aspect in XAI_ASPECTS:
+                body["aspect_ratio"] = XAI_ASPECTS[request.aspect]
+            url = f"{XAI_URL}/generations"
+        parsed = await _post_json(url, body, self._key, request.timeout, "xAI")
+        return Made(_first_b64(parsed, "xAI"), model=self.model)
+
+
+# -- OpenRouter ------------------------------------------------------------------
+
+OPENROUTER_URL = "https://openrouter.ai/api/v1/images"
+OPENROUTER_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
+
+
+class OpenRouterImages:
+    name = "openrouter"
+    edits = True
+    masks = False
+
+    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
+        self.model = (model or "openai/gpt-image-2").strip()
+        self._key = _bearer({"api_key": api_key or "", **rest})
+
+    def ready(self) -> str:
+        return "" if self._key else "no openrouter key (ultron auth add openrouter)"
+
+    async def generate(self, request: Request) -> Made:
+        if not request.prompt.strip():
+            raise ValueError("nothing to make: the prompt is empty")
+        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt, "n": 1}
+        if request.aspect in OPENROUTER_ASPECTS:
+            body["aspect_ratio"] = OPENROUTER_ASPECTS[request.aspect]
+        if request.images:
+            body["input_references"] = [
+                {"type": "image_url", "image_url": {"url": _data_uri(image)}}
+                for image in request.images
+            ]
+        parsed = await _post_json(OPENROUTER_URL, body, self._key, request.timeout, "OpenRouter")
+        usage = parsed.get("usage")
+        cost = ""
+        if isinstance(usage, Mapping) and isinstance(usage.get("cost"), int | float):
+            cost = f"${usage['cost']:g}"
+        return Made(_first_b64(parsed, "OpenRouter"), model=self.model, cost=cost)
+
+
+# -- Together --------------------------------------------------------------------
+
+TOGETHER_URL = "https://api.together.ai/v1/images/generations"
+TOGETHER_SIZES = {"square": (1024, 1024), "landscape": (1216, 832), "portrait": (832, 1216)}
+"""Pixels, not a ratio: Together takes `width` and `height`. Near 3:2, in 64s."""
+
+
+class TogetherImages:
+    name = "together"
+    edits = False
+    """`image_url` exists for some models, but nothing says it takes a data
+    URI, and a workspace picture is not at a public URL."""
+    masks = False
+
+    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
+        self.model = (model or "black-forest-labs/FLUX.1-schnell").strip()
+        self._key = _bearer({"api_key": api_key or "", **rest})
+
+    def ready(self) -> str:
+        return "" if self._key else "no together key (ultron auth add together)"
+
+    async def generate(self, request: Request) -> Made:
+        if not request.prompt.strip():
+            raise ValueError("nothing to make: the prompt is empty")
+        if request.images:
+            raise ValueError(f"{self.model} at Together makes pictures from words only")
+        body: dict[str, Any] = {
+            "model": self.model,
+            "prompt": request.prompt,
+            "n": 1,
+            "response_format": "base64",
+            "output_format": "png",
+        }
+        if request.aspect in TOGETHER_SIZES:
+            body["width"], body["height"] = TOGETHER_SIZES[request.aspect]
+        parsed = await _post_json(TOGETHER_URL, body, self._key, request.timeout, "Together")
+        return Made(_first_b64(parsed, "Together"), model=self.model)
+
+
+# -- Fireworks -------------------------------------------------------------------
+
+FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/workflows"
+FIREWORKS_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
+
+
+class FireworksImages:
+    name = "fireworks"
+    edits = False
+    """Kontext edits at Fireworks are a submit-and-poll API; not built."""
+    masks = False
+
+    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
+        model = (model or "flux-1-schnell-fp8").strip()
+        # Fireworks writes ids in full; a bare name is one of its own models.
+        self.model = (
+            model if model.startswith("accounts/") else f"accounts/fireworks/models/{model}"
+        )
+        self._key = _bearer({"api_key": api_key or "", **rest})
+
+    def ready(self) -> str:
+        return "" if self._key else "no fireworks key (ultron auth add fireworks)"
+
+    async def generate(self, request: Request) -> Made:
+        from ultron.sdk.web import post
+
+        if not request.prompt.strip():
+            raise ValueError("nothing to make: the prompt is empty")
+        if request.images:
+            raise ValueError("Fireworks makes pictures from words only here")
+        body: dict[str, Any] = {"prompt": request.prompt}
+        if request.aspect in FIREWORKS_ASPECTS:
+            body["aspect_ratio"] = FIREWORKS_ASPECTS[request.aspect]
+        response = await post(
+            f"{FIREWORKS_URL}/{self.model}/text_to_image",
+            json=body,
+            # The picture itself as the body, rather than base64 inside JSON.
+            headers={"Authorization": f"Bearer {self._key}", "Accept": "image/png"},
+            timeout=request.timeout,
+            max_bytes=REPLY_MAX_BYTES,
+            user_agent="ultron-imagegen",
+        )
+        if response.status >= 400:
+            raise RuntimeError(_openai_error(_json(response.body), response.status, "Fireworks"))
+        if not response.body:
+            raise RuntimeError("Fireworks sent no picture")
+        return Made(response.body, model=self.model.rsplit("/", 1)[-1])
+
+
 def _json(raw: bytes) -> Mapping[str, Any]:
     try:
         decoded = json.loads(raw.decode("utf-8"))
@@ -378,19 +595,20 @@ class GenerateImage(Tool):
     def __init__(self, ctx: PluginContext) -> None:
         self.ctx = ctx
         self.workspace = Path(ctx.workspace).resolve()
-        self.vendors: Callable[[], list[Any]] = self._vendors
+        self.vendors: Callable[[], Iterable[Any]] = self._vendors
 
     @property
     def description(self) -> str:  # type: ignore[override]
         return (
-            "Make a picture with OpenAI or Google and save it in the workspace. Use it when "
-            "the person asks for an image, an illustration, a logo, or a change to a picture "
-            "they have. Describe the picture in the prompt - subject, style, composition, any "
-            "text it must show. To edit or work from existing pictures, name workspace files "
-            "in `images`; with a `mask` (OpenAI only), only its transparent area of the first "
-            "image is repainted. Each call is one picture and costs money: do not make "
-            "variations nobody asked for. You are shown the picture you made - look before "
-            "saying it is right - and the result names the file; give the person that path."
+            "Make a picture and save it in the workspace. Use it when the person asks for an "
+            "image, an illustration, a logo, or a change to a picture they have. Describe the "
+            "picture in the prompt - subject, style, composition, any text it must show. To "
+            "edit or work from existing pictures, name workspace files in `images`; with a "
+            "`mask` (OpenAI only), only its transparent area of the first image is repainted. "
+            "Not every vendor edits; one that cannot is passed over. Each call is one picture "
+            "and costs money: do not make variations nobody asked for. You are shown the "
+            "picture you made - look before saying it is right - and the result names the "
+            "file; give the person that path."
         )
 
     @property
@@ -483,25 +701,37 @@ class GenerateImage(Tool):
 
     # -- the parts -------------------------------------------------------------
 
-    def _vendors(self) -> list[Any]:
-        """Both vendors, built fresh with the key each holds now, the preferred
-        one first."""
+    def _vendors(self) -> Iterator[Any]:
+        """Every vendor, the preferred one first, each built with the key it
+        holds now only when it is reached - a vendor after the one that
+        answered is never built, so its key is never read."""
+        first = str(self.ctx.setting("provider", "") or "").strip().lower()
+        order = [first] if first in VENDORS else []
+        order += [name for name in VENDORS if name not in order]
+        for name in order:
+            yield self._build(name)
+
+    def _build(self, name: str) -> Any:
         ctx = self.ctx
-        built = {
-            "openai": OpenAIImages(
-                model=str(ctx.setting("openai_model", "") or ""),
+
+        def model() -> str:
+            return str(ctx.setting(f"{name}_model", "") or "")
+
+        if name == "openai":
+            return OpenAIImages(
+                model=model(),
                 quality=str(ctx.setting("openai_quality", "") or ""),
                 **ctx.credential("openai"),
-            ),
-            "google": GoogleImages(
-                model=str(ctx.setting("google_model", "") or ""),
-                **_key_only(ctx.credential("google")),
-            ),
-        }
-        first = str(ctx.setting("provider", "") or "").strip().lower()
-        order = [first] if first in built else []
-        order += [name for name in VENDORS if name not in order]
-        return [built[name] for name in order]
+            )
+        if name == "google":
+            return GoogleImages(model=model(), **_key_only(ctx.credential("google")))
+        built = {
+            "xai": XAIImages,
+            "openrouter": OpenRouterImages,
+            "together": TogetherImages,
+            "fireworks": FireworksImages,
+        }[name]
+        return built(model=model(), **_key_only(ctx.credential(name)))
 
     def _timeout(self) -> float:
         try:
@@ -641,13 +871,16 @@ class GenerateImage(Tool):
 def _cannot(vendor: Any, request: Request) -> str:
     if request.images and not getattr(vendor, "edits", False):
         return "does not edit pictures"
+    most = getattr(vendor, "max_images", MAX_INPUTS)
+    if len(request.images) > most:
+        return f"edits {most} picture{'s' if most != 1 else ''} at a time"
     if request.mask is not None and not getattr(vendor, "masks", False):
         return "does not take a mask"
     return ""
 
 
 def _key_only(credential: Mapping[str, str]) -> dict[str, str]:
-    """Google's constructor takes `api_key` and `auth_token`, nothing else."""
+    """Every constructor but OpenAI's takes `api_key` and `auth_token`, nothing else."""
     return {k: v for k, v in credential.items() if k in ("api_key", "auth_token")}
 
 
@@ -661,7 +894,7 @@ def _human(size: int) -> str:
 
 class ImagegenPlugin(Plugin):
     name = "imagegen"
-    description = "Make and edit pictures with OpenAI or Google, saved in the workspace."
+    description = "Make and edit pictures with any image vendor a key is held for."
 
     def register(self, ctx: PluginContext) -> None:
         ctx.register_tool(GenerateImage(ctx))

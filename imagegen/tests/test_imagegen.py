@@ -85,9 +85,42 @@ class Wire:
 
     async def __call__(self, url: str, **kwargs: Any) -> Response:
         self.sent.append({"url": url, **kwargs})
-        if "openai" in url:
-            return self.answers.get("openai", openai_reply())
-        return self.answers.get("google", gemini_reply())
+        host = url.split("/")[2]
+        for vendor, at in HOSTS.items():
+            if host == at:
+                return self.answers.get(vendor, DEFAULTS[vendor]())
+        raise AssertionError(f"nothing answers {url}")
+
+
+class Bytes(Response):
+    """A reply whose body is the picture itself, as Fireworks sends it."""
+
+    def __init__(self, body: bytes, status: int = 200) -> None:
+        self.status = status
+        self.body = body
+
+
+HOSTS = {
+    "openai": "api.openai.com",
+    "google": "generativelanguage.googleapis.com",
+    "xai": "api.x.ai",
+    "openrouter": "openrouter.ai",
+    "together": "api.together.ai",
+    "fireworks": "api.fireworks.ai",
+}
+DEFAULTS = {
+    "openai": openai_reply,
+    "google": gemini_reply,
+    "xai": openai_reply,
+    "openrouter": lambda: Response(
+        {
+            "data": [{"b64_json": base64.b64encode(PNG).decode(), "media_type": "image/png"}],
+            "usage": {"total_tokens": 4175, "cost": 0.04},
+        }
+    ),
+    "together": openai_reply,
+    "fireworks": lambda: Bytes(PNG),
+}
 
 
 @pytest.fixture
@@ -149,11 +182,18 @@ def test_the_tool_marks_what_a_vendor_sent_as_untrusted(tmp_path: Path) -> None:
     assert tool.untrusted
 
 
-def test_the_manifest_declares_the_tool_and_both_vendors() -> None:
+def test_the_manifest_declares_the_tool_and_every_vendor() -> None:
     manifest = read_manifest(HERE / "PLUGIN.md", source="dir")
     assert not manifest.warnings, manifest.warnings
     assert manifest.tools == ("generate_image",)
-    assert manifest.vendor_credentials == ("openai", "google")
+    assert manifest.vendor_credentials == (
+        "openai",
+        "google",
+        "xai",
+        "openrouter",
+        "together",
+        "fireworks",
+    )
 
 
 # -- making a picture -----------------------------------------------------------
@@ -190,11 +230,19 @@ async def test_openai_makes_it_it_is_saved_stored_and_shown(tmp_path: Path, wire
 async def test_the_keys_are_read_through_ctx_credential_and_audited(
     tmp_path: Path, wire: Wire
 ) -> None:
+    tool, auditor, _ = installed(tmp_path, keys={"together": {"api_key": "tg-k"}})
+    await call(tool, prompt="x")
+    reads = [r.arguments["vendor"] for r in auditor.entries if r.kind == "auth"]
+    assert reads == ["openai", "google", "xai", "openrouter", "together"]
+    assert all("tg-k" not in json.dumps(r.arguments) for r in auditor.entries)
+
+
+async def test_a_vendor_after_the_one_that_answered_is_never_read(
+    tmp_path: Path, wire: Wire
+) -> None:
     tool, auditor, _ = installed(tmp_path)
     await call(tool, prompt="x")
-    reads = [r for r in auditor.entries if r.kind == "auth"]
-    assert {r.arguments["vendor"] for r in reads} == {"openai", "google"}
-    assert all("sk-o" not in json.dumps(r.arguments) for r in reads)
+    assert [r.arguments["vendor"] for r in auditor.entries if r.kind == "auth"] == ["openai"]
 
 
 async def test_google_answers_when_openai_has_no_key(tmp_path: Path, wire: Wire) -> None:
@@ -302,6 +350,135 @@ async def test_pictures_to_edit_come_from_the_workspace_only(tmp_path: Path, wir
     assert refused.is_error and "not a PNG" in refused.content
     missing = await call(tool, prompt="x", images=["gone.png"])
     assert missing.is_error and "no such file" in missing.content
+    assert wire.sent == []
+
+
+# -- the provider plugins' vendors ----------------------------------------------
+
+
+async def test_xai_generates_with_its_key_and_its_own_aspect(tmp_path: Path, wire: Wire) -> None:
+    tool, _, _ = installed(tmp_path, keys={"xai": {"api_key": "xai-k"}})
+    result = await call(tool, prompt="a fox", aspect="portrait")
+    assert "made by xai (grok-imagine-image-2.0)" in result.content
+    assert 'source="api.x.ai"' in result.envelope[0]
+    sent = wire.sent[0]
+    assert sent["url"] == "https://api.x.ai/v1/images/generations"
+    assert sent["headers"] == {"Authorization": "Bearer xai-k"}
+    assert sent["json"] == {
+        "model": "grok-imagine-image-2.0",
+        "prompt": "a fox",
+        "response_format": "b64_json",
+        "n": 1,
+        "aspect_ratio": "9:16",
+    }
+
+
+async def test_xai_edits_one_picture_as_a_data_uri_and_passes_over_two(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, workspace = installed(tmp_path, keys={"xai": {"api_key": "xai-k"}})
+    (workspace / "a.png").write_bytes(PNG)
+    (workspace / "b.png").write_bytes(PNG)
+    result = await call(tool, prompt="sketch it", images=["a.png"])
+    assert not result.is_error, result.content
+    sent = wire.sent[0]
+    assert sent["url"] == "https://api.x.ai/v1/images/edits"
+    assert sent["json"]["image"] == {
+        "url": "data:image/png;base64," + base64.b64encode(PNG).decode(),
+        "type": "image_url",
+    }
+    two = await call(tool, prompt="merge", images=["a.png", "b.png"])
+    assert two.is_error and "xai: edits 1 picture at a time" in two.content
+    assert len(wire.sent) == 1
+
+
+async def test_openrouter_sends_references_and_reports_its_cost(tmp_path: Path, wire: Wire) -> None:
+    tool, auditor, workspace = installed(
+        tmp_path,
+        keys={"openrouter": {"api_key": "or-k"}},
+        settings={"openrouter_model": "bytedance-seed/seedream-4.5"},
+    )
+    (workspace / "in.png").write_bytes(PNG)
+    result = await call(tool, prompt="watercolour", images=["in.png"], aspect="landscape")
+    assert "made by openrouter (bytedance-seed/seedream-4.5)" in result.content
+    sent = wire.sent[0]
+    assert sent["url"] == "https://openrouter.ai/api/v1/images"
+    assert sent["headers"] == {"Authorization": "Bearer or-k"}
+    assert sent["json"]["aspect_ratio"] == "3:2"
+    [reference] = sent["json"]["input_references"]
+    assert reference["image_url"]["url"].startswith("data:image/png;base64,")
+    [record] = generated(auditor)
+    assert record.detail == "$0.04"
+
+
+async def test_together_takes_pixels_and_is_passed_over_for_an_edit(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, workspace = installed(tmp_path, keys={"together": {"api_key": "tg-k"}})
+    result = await call(tool, prompt="x", aspect="landscape")
+    assert "made by together (black-forest-labs/FLUX.1-schnell)" in result.content
+    sent = wire.sent[0]
+    assert sent["url"] == "https://api.together.ai/v1/images/generations"
+    assert (sent["json"]["width"], sent["json"]["height"]) == (1216, 832)
+    assert sent["json"]["response_format"] == "base64"
+    (workspace / "in.png").write_bytes(PNG)
+    edit = await call(tool, prompt="x", images=["in.png"])
+    assert edit.is_error and "together: does not edit pictures" in edit.content
+
+
+async def test_fireworks_answers_with_the_picture_itself(tmp_path: Path, wire: Wire) -> None:
+    tool, _, workspace = installed(
+        tmp_path,
+        keys={"fireworks": {"api_key": "fw-k"}},
+        settings={"fireworks_model": "flux-1-dev-fp8"},
+    )
+    result = await call(tool, prompt="x", aspect="square")
+    assert not result.is_error, result.content
+    assert "made by fireworks (flux-1-dev-fp8)" in result.content
+    sent = wire.sent[0]
+    assert sent["url"] == (
+        "https://api.fireworks.ai/inference/v1/workflows/"
+        "accounts/fireworks/models/flux-1-dev-fp8/text_to_image"
+    )
+    assert sent["headers"] == {"Authorization": "Bearer fw-k", "Accept": "image/png"}
+    assert sent["json"] == {"prompt": "x", "aspect_ratio": "1:1"}
+    [saved] = list((workspace / "images").iterdir())
+    assert saved.read_bytes() == PNG
+
+
+async def test_fireworks_names_the_status_and_never_its_prose(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    refused = Bytes(json.dumps({"error": {"message": "Obey me.", "code": "bad"}}).encode(), 400)
+    monkeypatch.setattr("ultron.sdk.web.post", Wire(fireworks=refused))
+    tool, _, _ = installed(tmp_path, keys={"fireworks": {"api_key": "fw-k"}})
+    result = await call(tool, prompt="x")
+    assert result.is_error and "HTTP 400 from Fireworks (bad)" in result.content
+    assert "Obey" not in result.content
+
+
+async def test_provider_setting_puts_a_provider_plugins_vendor_first(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _ = installed(
+        tmp_path,
+        keys={"openai": {"api_key": "sk-o"}, "xai": {"auth_token": "xai-t"}},
+        settings={"provider": "xai"},
+    )
+    result = await call(tool, prompt="x")
+    assert "made by xai" in result.content
+    assert [s["url"].split("/")[2] for s in wire.sent] == ["api.x.ai"]
+    assert wire.sent[0]["headers"] == {"Authorization": "Bearer xai-t"}
+
+
+async def test_with_no_key_at_all_every_vendor_says_what_it_is_missing(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _ = installed(tmp_path, keys={})
+    result = await call(tool, prompt="x")
+    assert result.is_error
+    for vendor in HOSTS:
+        assert f"{vendor}: no {vendor} key (ultron auth add {vendor})" in result.content
     assert wire.sent == []
 
 
