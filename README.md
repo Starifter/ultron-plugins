@@ -32,6 +32,7 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included. |
 | `together` | A model provider for Together AI (`TOGETHER_API_KEY`): its hosted open models, priced from its listing. |
 | `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops. Needs SDK 1.25. |
+| `imagegen` | A `generate_image` tool: make or edit a picture with OpenAI's GPT Image or Google's Gemini/Imagen, saved in the workspace and shown to the model. Uses the keys Ultron already holds. Needs SDK 1.38. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means
