@@ -55,7 +55,10 @@ error is something the model can see and recover from, not an exception.
 
 A credential is never a setting: `config.json` refuses a credential-shaped key. Read a key
 from the environment (`~/.ultron/.env` is loaded into it) and name the variable in your
-manifest's prose, as `brave` does.
+manifest's prose, as `brave` does. A plugin that calls a **model vendor** Ultron already
+has a key for - OpenAI, Google - asks for it with `ctx.credential("openai")` instead (SDK
+1.38), and lists the vendor under `vendor_credentials` in its manifest; any vendor it did
+not list is refused. Ask when the request is made, not in `register`, as `imagegen` does.
 
 ## Before opening a pull request
 
