@@ -64,9 +64,11 @@ def sniff(data: bytes) -> str:
 class Source:
     """A workspace picture handed to a vendor to work from.
 
-    Plain classes rather than dataclasses throughout: Ultron imports a
-    directory plugin without putting it in `sys.modules`, and `@dataclass`
-    looks its module up there."""
+    Plain classes rather than dataclasses throughout. Ultron registers a
+    directory plugin in `sys.modules` before running it only since
+    Starifter/ultron#6, and that came without an SDK bump: an install at SDK
+    1.38 from before it imports this file unregistered, where `@dataclass`
+    under `from __future__ import annotations` fails to load."""
 
     __slots__ = ("data", "media_type", "name")
 
