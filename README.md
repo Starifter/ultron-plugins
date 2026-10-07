@@ -35,6 +35,7 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops. Needs SDK 1.25. |
 | `diffs` | A `diffs` tool, OpenClaw's: a diff rendered for a person - a viewer opened from the call's card in the web UI, a PNG or a PDF for a channel. Needs SDK 1.33; files need Playwright. |
 | `imagegen` | A `generate_image` tool: make or edit a picture with OpenAI, Google, xAI, OpenRouter, Together or Fireworks, saved in the workspace and shown to the model. Uses the keys Ultron already holds for those providers. Needs SDK 1.38. |
+| `videogen` | `generate_video` and `video_status`: start a video with Google Veo, xAI, OpenRouter or Together, made in the background and saved in the workspace; the model is told on its next turn. Uses the keys Ultron already holds for those providers. Needs SDK 1.38. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means
