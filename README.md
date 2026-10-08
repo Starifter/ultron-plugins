@@ -23,19 +23,19 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 
 | plugin | what it adds |
 |---|---|
-| `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs. |
+| `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs - and its image and video models as vendors for `imagegen` and `videogen`. |
 | `llama-cpp` | A model provider for a `llama-server` on this machine: GGUF models, no key, no bill, with an embedder for memory search. |
 | `ollama` | Two model providers: `ollama` for a local Ollama (no key, no bill, context checked against what Ollama loaded) and `ollama-cloud` for ollama.com with `OLLAMA_API_KEY`, plus an embedder. |
 | `lmstudio` | A model provider for LM Studio on this machine: loads the model at the context you choose, no key, no bill, with an embedder. |
 | `groq` | A model provider for Groq (`GROQ_API_KEY`): open models served fast, with `/think` per model family, and `groq/whisper` to transcribe voice notes on the same key. |
 | `deepseek` | A model provider for DeepSeek (`DEEPSEEK_API_KEY`), its thinking carried through tool loops the way DeepSeek requires. Needs SDK 1.25. |
-| `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included, and `xai/stt` to transcribe voice notes on the same key. |
+| `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included, `xai/stt` to transcribe voice notes on the same key, and Grok Imagine as a vendor for `imagegen` and `videogen`. |
 | `deepgram` | A media reader: voice notes and recordings transcribed by Deepgram Nova (`DEEPGRAM_API_KEY`). |
-| `together` | A model provider for Together AI (`TOGETHER_API_KEY`): its hosted open models, priced from its listing. |
-| `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops. Needs SDK 1.25. |
+| `together` | A model provider for Together AI (`TOGETHER_API_KEY`): its hosted open models, priced from its listing, and its image and video models as vendors for `imagegen` and `videogen`. |
+| `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops, and FLUX as a vendor for `imagegen`. Needs SDK 1.25. |
 | `diffs` | A `diffs` tool, OpenClaw's: a diff rendered for a person - a viewer opened from the call's card in the web UI, a PNG or a PDF for a channel. Needs SDK 1.33; files need Playwright. |
-| `imagegen` | A `generate_image` tool: make or edit a picture with OpenAI, Google, xAI, OpenRouter, Together or Fireworks, saved in the workspace and shown to the model. Uses the keys Ultron already holds for those providers. Needs SDK 1.38. |
-| `videogen` | `generate_video` and `video_status`: start a video with Google Veo, xAI, OpenRouter or Together, made in the background and saved in the workspace; the model is told on its next turn. Uses the keys Ultron already holds for those providers. Needs SDK 1.38. |
+| `imagegen` | A `generate_image` tool: make or edit a picture with OpenAI, Google, or any vendor another plugin adds - `xai`, `openrouter`, `together` and `fireworks` do - saved in the workspace and shown to the model. Needs SDK 1.39. |
+| `videogen` | `generate_video` and `video_status`: start a video with Google Veo, or any vendor another plugin adds - `xai`, `openrouter` and `together` do - made in the background and saved in the workspace; the model is told on its next turn. Needs SDK 1.39. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means

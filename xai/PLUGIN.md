@@ -1,10 +1,11 @@
 ---
 name: xai
-description: The xAI model provider - Grok, at xAI - and Grok speech-to-text for voice notes.
-version: "1.1.0"
+description: The xAI model provider - Grok, at xAI - with Grok speech-to-text for voice notes, and Grok Imagine for imagegen and videogen.
+version: "1.2.0"
 requires_ultron_sdk: ">=1.23,<2"
-categories: [provider, models, audio]
+categories: [provider, models, audio, media]
 logo: logo.svg
+vendor_credentials: [xai]
 contracts:
   providers: [xai]
   media_readers: [xai/stt]
@@ -13,6 +14,14 @@ config_schema:
     type: str
     default: ""
     description: The model xai/stt transcribes with. Empty is grok-voice-transcribe-2.0.
+  image_model:
+    type: str
+    default: grok-imagine-image-2.0
+    description: "The Grok Imagine image model imagegen makes pictures with."
+  video_model:
+    type: str
+    default: grok-imagine-video-1.5
+    description: "The Grok Imagine video model videogen makes videos with. The classic grok-imagine-video takes no last frame."
 providers:
   xai:
     api_key_env_vars: [XAI_API_KEY]
@@ -63,12 +72,30 @@ Grok. Its priority is 45: after `groq/whisper` (40), before `openai/whisper` (50
 `audio_reader: xai/stt` pins it. xAI does not take WebM audio, so a WebM voice note goes
 to the next reader.
 
+## Pictures and videos
+
+With [imagegen](../imagegen/PLUGIN.md) or [videogen](../videogen/PLUGIN.md) enabled, Grok
+Imagine is one of their vendors: the plugin registers itself into `imagegen.backend` and
+`videogen.backend` (SDK 1.39; an older Ultron gets the provider and the transcriber only).
+Neither plugin needs a setting for it, and this one does not depend on them.
+
+- **Pictures** (`image_model`, default `grok-imagine-image-2.0`): generates, and edits one
+  picture at a time, no mask.
+- **Videos** (`video_model`, default `grok-imagine-video-1.5`): 1 to 15 seconds, any shape,
+  480p to 1080p, a first and a last frame. The classic `grok-imagine-video` takes no last
+  frame.
+
+Both spend the provider's key, read with `ctx.credential` - which is why the manifest lists
+`xai` under `vendor_credentials` - and only when imagegen or videogen reaches xAI. Each read
+is an `auth` record in the trail with a fingerprint.
+
 ## What reaches xAI
 
 The conversation, the tool definitions, pictures, and your key. A PDF is not sent over
 this API, and the row says so. A voice note reaches xAI only when `xai/stt` is the reader
 that transcribes it, and then only the audio and the `audio_language` hint - never the
-conversation.
+conversation. A picture or a frame you hand imagegen or videogen reaches xAI when it is
+the vendor that makes it, with the prompt.
 
 ## Not tested live
 

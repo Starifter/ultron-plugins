@@ -11,7 +11,9 @@ Requires the `openai` package (`pip install openai`).
 
 from __future__ import annotations
 
+import base64
 import json
+import re
 import uuid
 from collections.abc import Mapping
 from typing import Any
@@ -252,6 +254,254 @@ def _why(body: bytes) -> str:
     return body[:200].decode("utf-8", "replace").strip()
 
 
+# -- pictures and videos, for imagegen and videogen ------------------------------
+#
+# Grok Imagine, registered into `imagegen.backend` and `videogen.backend` (SDK
+# 1.39) so those plugins reach it without knowing xAI exists. The interfaces are
+# theirs, written in their PLUGIN.md; nothing here imports either. Each builder
+# reads the key when imagegen or videogen reaches xAI, never before.
+
+IMAGES_URL = f"{BASE_URL}/images"
+IMAGE_ASPECTS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
+"""Grok Imagine's ratios run wide; 16:9 and 9:16 are the pair it lists."""
+VIDEOS_URL = f"{BASE_URL}/videos"
+VIDEO_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
+PICTURE_MAX_BYTES = 64 * 1024 * 1024
+"""A picture comes back as base64, a third larger than its bytes."""
+VIDEO_MAX_BYTES = 512 * 1024 * 1024
+STATUS_MAX_BYTES = 1024 * 1024
+POLL_TIMEOUT = 30.0
+REMOTE_ID = re.compile(r"[A-Za-z0-9._:/-]{1,300}")
+CODE = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class Made:
+    """A picture, as imagegen reads one: the bytes, the model, a cost."""
+
+    __slots__ = ("cost", "data", "model")
+
+    def __init__(self, data: bytes, model: str = "", cost: str = "") -> None:
+        self.data = data
+        self.model = model
+        self.cost = cost
+
+
+class Status:
+    """Where a video job stands, as videogen reads one."""
+
+    __slots__ = ("cost", "error", "state", "url")
+
+    def __init__(self, state: str, url: str = "", error: str = "", cost: str = "") -> None:
+        self.state = state
+        self.url = url
+        self.error = error
+        self.cost = cost
+
+
+class Retry(Exception):
+    """A request worth making again - the network, a 5xx, a 429. videogen
+    retries an exception whose `retry` is true."""
+
+    retry = True
+
+
+class XAIImages:
+    """Grok Imagine pictures: `/images/generations`, and `/images/edits` as
+    JSON with the picture as a data URI, one at a time."""
+
+    host = "api.x.ai"
+    edits = True
+    masks = False
+    max_images = 1
+    """`/images/edits` takes one `image`; nothing documents more."""
+
+    def __init__(
+        self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
+    ) -> None:
+        self.model = (model or "grok-imagine-image-2.0").strip()
+        self._key = api_key or auth_token or ""
+
+    def ready(self) -> str:
+        return "" if self._key else "no xai key (ultron auth add xai)"
+
+    async def generate(self, request: Any) -> Made:
+        if not request.prompt.strip():
+            raise ValueError("nothing to make: the prompt is empty")
+        body: dict[str, Any] = {
+            "model": self.model,
+            "prompt": request.prompt,
+            "response_format": "b64_json",
+        }
+        if request.images:
+            # JSON, not multipart: xAI refuses the form OpenAI's edits take.
+            image = request.images[0]
+            body["image"] = {"url": _data_uri(image.data, image.media_type), "type": "image_url"}
+            url = f"{IMAGES_URL}/edits"
+        else:
+            body["n"] = 1
+            if request.aspect in IMAGE_ASPECTS:
+                body["aspect_ratio"] = IMAGE_ASPECTS[request.aspect]
+            url = f"{IMAGES_URL}/generations"
+        parsed = await _send(
+            "POST", url, self._key, request.timeout, body=body, max_bytes=PICTURE_MAX_BYTES
+        )
+        return Made(_first_b64(parsed), model=self.model)
+
+
+class XAIVideo:
+    """Grok Imagine videos: `/videos/generations`, then `/videos/{id}`."""
+
+    host = "api.x.ai"
+
+    def __init__(
+        self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
+    ) -> None:
+        self.model = (model or "grok-imagine-video-1.5").strip()
+        self._key = api_key or auth_token or ""
+
+    def ready(self) -> str:
+        return "" if self._key else "no xai key (ultron auth add xai)"
+
+    def cannot(self, request: Any) -> str:
+        if request.last is not None and self.model == "grok-imagine-video":
+            return f"{self.model} takes no last frame"
+        return ""
+
+    async def submit(self, request: Any) -> str:
+        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
+        if request.seconds:
+            body["duration"] = request.seconds
+        if request.aspect in VIDEO_ASPECTS:
+            body["aspect_ratio"] = VIDEO_ASPECTS[request.aspect]
+        if request.resolution:
+            body["resolution"] = request.resolution
+        if request.first is not None:
+            body["image"] = {"url": _data_uri(request.first.data, request.first.media_type)}
+        if request.last is not None:
+            body["last_frame"] = {"url": _data_uri(request.last.data, request.last.media_type)}
+        parsed = await _send(
+            "POST", f"{VIDEOS_URL}/generations", self._key, request.timeout, body=body
+        )
+        return _remote(parsed.get("request_id"))
+
+    async def status(self, remote: str) -> Status:
+        parsed = await _send("GET", f"{VIDEOS_URL}/{remote}", self._key, POLL_TIMEOUT)
+        state = str(parsed.get("status") or "")
+        if state == "done":
+            video = parsed.get("video")
+            url = str(video.get("url") or "") if isinstance(video, Mapping) else ""
+            return Status("done", url=url) if url else Status("failed", error="xAI sent no video")
+        if state in ("failed", "expired"):
+            error = parsed.get("error")
+            code = _code(error.get("code")) if isinstance(error, Mapping) else ""
+            return Status("failed", error=f"xAI says {state}" + (f" ({code})" if code else ""))
+        return Status("running")
+
+    async def download(self, status: Any, timeout: float) -> bytes:
+        # A public link: the key stays home.
+        return await _download(status.url, timeout)
+
+
+async def _send(
+    method: str,
+    url: str,
+    key: str,
+    timeout: float,
+    *,
+    body: Mapping[str, Any] | None = None,
+    max_bytes: int = STATUS_MAX_BYTES,
+) -> Mapping[str, Any]:
+    """One JSON request to xAI. A 5xx, a 429 or the network is `Retry`; any
+    other 4xx is final. Either way the message is the status and xAI's error
+    code - identifiers, never its prose, which would reach the model."""
+    from ultron.sdk.web import WebError, get, post
+
+    headers = {"Authorization": f"Bearer {key}"}
+    try:
+        if method == "POST":
+            response = await post(
+                url,
+                json=body,
+                headers=headers,
+                timeout=timeout,
+                max_bytes=max_bytes,
+                user_agent="ultron-xai",
+            )
+        else:
+            response = await get(
+                url,
+                headers=headers,
+                timeout=timeout,
+                max_bytes=max_bytes,
+                max_redirects=0,
+                user_agent="ultron-xai",
+            )
+    except WebError as exc:
+        raise Retry(f"xAI unreachable: {type(exc).__name__}") from None
+    try:
+        parsed = json.loads(response.body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        parsed = {}
+    parsed = parsed if isinstance(parsed, Mapping) else {}
+    if response.status >= 400:
+        error = parsed.get("error")
+        said = [_code(error.get(k)) for k in ("code", "type")] if isinstance(error, Mapping) else []
+        named = ", ".join(dict.fromkeys(part for part in said if part))
+        failure = f"HTTP {response.status} from xAI" + (f" ({named})" if named else "")
+        if response.status >= 500 or response.status == 429:
+            raise Retry(failure)
+        raise RuntimeError(failure)
+    return parsed
+
+
+async def _download(url: str, timeout: float) -> bytes:
+    from ultron.sdk.web import WebError, get
+
+    try:
+        response = await get(
+            url, timeout=timeout, max_bytes=VIDEO_MAX_BYTES, user_agent="ultron-xai"
+        )
+    except WebError as exc:
+        raise Retry(f"xAI download failed: {type(exc).__name__}") from None
+    if response.status >= 500 or response.status == 429:
+        raise Retry(f"HTTP {response.status} downloading from xAI")
+    if response.status >= 400:
+        raise RuntimeError(f"HTTP {response.status} downloading from xAI")
+    if response.truncated:
+        raise RuntimeError(f"the video is over {VIDEO_MAX_BYTES // (1024 * 1024)} MB")
+    return response.body
+
+
+def _data_uri(data: bytes, media_type: str) -> str:
+    return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
+
+
+def _first_b64(parsed: Mapping[str, Any]) -> bytes:
+    """The first picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
+    rows = parsed.get("data")
+    first = rows[0] if isinstance(rows, list) and rows else None
+    encoded = first.get("b64_json") if isinstance(first, Mapping) else None
+    if not encoded:
+        raise RuntimeError("xAI sent no picture")
+    return base64.b64decode(str(encoded))
+
+
+def _code(value: Any) -> str:
+    """A vendor's error code or status as an identifier - never its prose."""
+    return CODE.sub("_", str(value or "")).strip("_")[:60]
+
+
+def _remote(value: Any) -> str:
+    remote = str(value or "")
+    if not REMOTE_ID.fullmatch(remote) or ".." in remote:
+        raise RuntimeError("xAI sent no usable job id")
+    return remote
+
+
+def _key_only(credential: Mapping[str, str]) -> dict[str, str]:
+    return {k: v for k, v in credential.items() if k in ("api_key", "auth_token")}
+
+
 class XAIPlugin(Plugin):
     """The xAI provider."""
 
@@ -267,3 +517,22 @@ class XAIPlugin(Plugin):
             "xai/stt",
             lambda **kwargs: XAITranscriber(model=transcription_model, **kwargs),
         )
+        # Grok Imagine for imagegen and videogen, when this Ultron has the points
+        # (SDK 1.39) - an older one still gets the provider and the transcriber.
+        if hasattr(ctx, "register_extension"):
+            ctx.register_extension(
+                "imagegen.backend",
+                "xai",
+                lambda: XAIImages(
+                    model=str(ctx.setting("image_model", "") or ""),
+                    **_key_only(ctx.credential("xai")),
+                ),
+            )
+            ctx.register_extension(
+                "videogen.backend",
+                "xai",
+                lambda: XAIVideo(
+                    model=str(ctx.setting("video_model", "") or ""),
+                    **_key_only(ctx.credential("xai")),
+                ),
+            )

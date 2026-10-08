@@ -1,25 +1,26 @@
 """imagegen: make and edit pictures, on any vendor a key is held for, saved in the workspace.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings one
-tool, `generate_image`, and six vendors behind it:
+tool, `generate_image`, two vendors of its own, and a point any other plugin can
+put a vendor into:
 
 - `OpenAIImages` - the Images API: words to `/images/generations` as JSON,
   pictures and a mask to `/images/edits` as multipart.
 - `GoogleImages` - Gemini's `generateContent` with an `IMAGE` modality, pictures
   inline beside the prompt; an `imagen-*` model goes to Imagen's `:predict`.
-- `XAIImages` - Grok Imagine: `/images/generations`, and `/images/edits` as JSON
-  with the picture as a data URI, one at a time.
-- `OpenRouterImages` - OpenRouter's Images API, pictures as `input_references`.
-- `TogetherImages` - Together's `/images/generations`, words only.
-- `FireworksImages` - a FLUX `text_to_image` workflow, words only, bytes back.
+- `imagegen.backend` - every other vendor, registered by the plugin that owns
+  it with `ctx.register_extension("imagegen.backend", name, build)` (SDK 1.39).
+  The `xai`, `openrouter`, `together` and `fireworks` provider plugins do; the
+  interface is in `PLUGIN.md`, and nothing here names them.
 
-The last four are the vendors of the provider plugins of the same names, and
-spend the key that plugin's provider uses. Keys come from `ctx.credential`,
-asked when a vendor is reached, so a key added mid-session is the one spent and
-a vendor never reached is never read. The picture is written into the workspace, put in the media
-store with `ctx.media.put` so it survives a reload, and handed back as an
-`ImageResult` so the model sees it. Every vendor attempt is a `generate`
-record through `ctx.audit`, beside the tool call's own record.
+OpenAI and Google stay here because their plugins ship inside Ultron, which
+does not know imagegen exists. Their keys come from `ctx.credential`; a backend
+reads its own with its own plugin's. Either way a key is read when its vendor
+is reached, so a key added mid-session is the one spent and a vendor never
+reached is never read. The picture is written into the workspace, put in the
+media store with `ctx.media.put` so it survives a reload, and handed back as an
+`ImageResult` so the model sees it. Every vendor attempt is a `generate` record
+through `ctx.audit`, beside the tool call's own record.
 """
 
 from __future__ import annotations
@@ -45,17 +46,17 @@ MAX_INPUT_BYTES = 50 * 1024 * 1024
 """OpenAI's per-image limit, and so the most one picture to edit may weigh."""
 REPLY_MAX_BYTES = 64 * 1024 * 1024
 """A picture comes back as base64, a third larger than its bytes."""
-VENDORS = ("openai", "google", "xai", "openrouter", "together", "fireworks")
-"""Every vendor, in the order they are tried when `provider` names none."""
+BUILT_IN = ("openai", "google")
+"""imagegen's own vendors, tried in this order before any backend another
+plugin registered, when `provider` names none."""
+POINT = "imagegen.backend"
+"""Where another plugin puts a vendor (`ctx.register_extension`, SDK 1.39)."""
 HOSTS = {
     "openai": "api.openai.com",
     "google": "generativelanguage.googleapis.com",
-    "xai": "api.x.ai",
-    "openrouter": "openrouter.ai",
-    "together": "api.together.ai",
-    "fireworks": "api.fireworks.ai",
 }
-"""Where each vendor's bytes came from, for the envelope's source label."""
+"""Where each built-in vendor's bytes came from, for the envelope's source
+label. A backend says its own with `host`."""
 
 EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
 
@@ -121,6 +122,9 @@ class Request:
 
 
 class Made:
+    """What a vendor made. A backend may return any object with `data`, and
+    optionally `model` and `cost`; `_ask` reads it into one of these."""
+
     __slots__ = ("cost", "data", "model")
 
     def __init__(self, data: bytes, model: str = "", cost: str = "") -> None:
@@ -249,34 +253,6 @@ def _first_b64(parsed: Mapping[str, Any], where: str) -> bytes:
     return base64.b64decode(str(encoded))
 
 
-def _data_uri(image: Source) -> str:
-    return f"data:{image.media_type};base64,{base64.b64encode(image.data).decode('ascii')}"
-
-
-def _bearer(credential: Mapping[str, str]) -> str:
-    """An API key or a token, either of which these vendors take as a bearer."""
-    return str(credential.get("api_key") or credential.get("auth_token") or "")
-
-
-async def _post_json(
-    url: str, body: Mapping[str, Any], key: str, timeout: float, where: str
-) -> Mapping[str, Any]:
-    from ultron.sdk.web import post
-
-    response = await post(
-        url,
-        json=body,
-        headers={"Authorization": f"Bearer {key}"},
-        timeout=timeout,
-        max_bytes=REPLY_MAX_BYTES,
-        user_agent="ultron-imagegen",
-    )
-    parsed = _json(response.body)
-    if response.status >= 400:
-        raise RuntimeError(_openai_error(parsed, response.status, where))
-    return parsed
-
-
 # -- Google ----------------------------------------------------------------------
 
 GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta"
@@ -398,173 +374,6 @@ def _gemini_parts(reply: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return [p for p in parts if isinstance(p, Mapping)] if isinstance(parts, list) else []
 
 
-# -- xAI -------------------------------------------------------------------------
-
-XAI_URL = "https://api.x.ai/v1/images"
-XAI_ASPECTS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
-"""Grok Imagine's ratios run wide; 16:9 and 9:16 are the pair it lists."""
-
-
-class XAIImages:
-    name = "xai"
-    edits = True
-    masks = False
-    max_images = 1
-    """`/images/edits` takes one `image`; nothing documents more."""
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "grok-imagine-image-2.0").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no xai key (ultron auth add xai)"
-
-    async def generate(self, request: Request) -> Made:
-        if not request.prompt.strip():
-            raise ValueError("nothing to make: the prompt is empty")
-        body: dict[str, Any] = {
-            "model": self.model,
-            "prompt": request.prompt,
-            "response_format": "b64_json",
-        }
-        if request.images:
-            # JSON, not multipart: xAI refuses the form OpenAI's edits take.
-            body["image"] = {"url": _data_uri(request.images[0]), "type": "image_url"}
-            url = f"{XAI_URL}/edits"
-        else:
-            body["n"] = 1
-            if request.aspect in XAI_ASPECTS:
-                body["aspect_ratio"] = XAI_ASPECTS[request.aspect]
-            url = f"{XAI_URL}/generations"
-        parsed = await _post_json(url, body, self._key, request.timeout, "xAI")
-        return Made(_first_b64(parsed, "xAI"), model=self.model)
-
-
-# -- OpenRouter ------------------------------------------------------------------
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/images"
-OPENROUTER_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
-
-
-class OpenRouterImages:
-    name = "openrouter"
-    edits = True
-    masks = False
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "openai/gpt-image-2").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no openrouter key (ultron auth add openrouter)"
-
-    async def generate(self, request: Request) -> Made:
-        if not request.prompt.strip():
-            raise ValueError("nothing to make: the prompt is empty")
-        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt, "n": 1}
-        if request.aspect in OPENROUTER_ASPECTS:
-            body["aspect_ratio"] = OPENROUTER_ASPECTS[request.aspect]
-        if request.images:
-            body["input_references"] = [
-                {"type": "image_url", "image_url": {"url": _data_uri(image)}}
-                for image in request.images
-            ]
-        parsed = await _post_json(OPENROUTER_URL, body, self._key, request.timeout, "OpenRouter")
-        usage = parsed.get("usage")
-        cost = ""
-        if isinstance(usage, Mapping) and isinstance(usage.get("cost"), int | float):
-            cost = f"${usage['cost']:g}"
-        return Made(_first_b64(parsed, "OpenRouter"), model=self.model, cost=cost)
-
-
-# -- Together --------------------------------------------------------------------
-
-TOGETHER_URL = "https://api.together.ai/v1/images/generations"
-TOGETHER_SIZES = {"square": (1024, 1024), "landscape": (1216, 832), "portrait": (832, 1216)}
-"""Pixels, not a ratio: Together takes `width` and `height`. Near 3:2, in 64s."""
-
-
-class TogetherImages:
-    name = "together"
-    edits = False
-    """`image_url` exists for some models, but nothing says it takes a data
-    URI, and a workspace picture is not at a public URL."""
-    masks = False
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "black-forest-labs/FLUX.1-schnell").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no together key (ultron auth add together)"
-
-    async def generate(self, request: Request) -> Made:
-        if not request.prompt.strip():
-            raise ValueError("nothing to make: the prompt is empty")
-        if request.images:
-            raise ValueError(f"{self.model} at Together makes pictures from words only")
-        body: dict[str, Any] = {
-            "model": self.model,
-            "prompt": request.prompt,
-            "n": 1,
-            "response_format": "base64",
-            "output_format": "png",
-        }
-        if request.aspect in TOGETHER_SIZES:
-            body["width"], body["height"] = TOGETHER_SIZES[request.aspect]
-        parsed = await _post_json(TOGETHER_URL, body, self._key, request.timeout, "Together")
-        return Made(_first_b64(parsed, "Together"), model=self.model)
-
-
-# -- Fireworks -------------------------------------------------------------------
-
-FIREWORKS_URL = "https://api.fireworks.ai/inference/v1/workflows"
-FIREWORKS_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
-
-
-class FireworksImages:
-    name = "fireworks"
-    edits = False
-    """Kontext edits at Fireworks are a submit-and-poll API; not built."""
-    masks = False
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        model = (model or "flux-1-schnell-fp8").strip()
-        # Fireworks writes ids in full; a bare name is one of its own models.
-        self.model = (
-            model if model.startswith("accounts/") else f"accounts/fireworks/models/{model}"
-        )
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no fireworks key (ultron auth add fireworks)"
-
-    async def generate(self, request: Request) -> Made:
-        from ultron.sdk.web import post
-
-        if not request.prompt.strip():
-            raise ValueError("nothing to make: the prompt is empty")
-        if request.images:
-            raise ValueError("Fireworks makes pictures from words only here")
-        body: dict[str, Any] = {"prompt": request.prompt}
-        if request.aspect in FIREWORKS_ASPECTS:
-            body["aspect_ratio"] = FIREWORKS_ASPECTS[request.aspect]
-        response = await post(
-            f"{FIREWORKS_URL}/{self.model}/text_to_image",
-            json=body,
-            # The picture itself as the body, rather than base64 inside JSON.
-            headers={"Authorization": f"Bearer {self._key}", "Accept": "image/png"},
-            timeout=request.timeout,
-            max_bytes=REPLY_MAX_BYTES,
-            user_agent="ultron-imagegen",
-        )
-        if response.status >= 400:
-            raise RuntimeError(_openai_error(_json(response.body), response.status, "Fireworks"))
-        if not response.body:
-            raise RuntimeError("Fireworks sent no picture")
-        return Made(response.body, model=self.model.rsplit("/", 1)[-1])
-
-
 def _json(raw: bytes) -> Mapping[str, Any]:
     try:
         decoded = json.loads(raw.decode("utf-8"))
@@ -595,7 +404,7 @@ class GenerateImage(Tool):
     def __init__(self, ctx: PluginContext) -> None:
         self.ctx = ctx
         self.workspace = Path(ctx.workspace).resolve()
-        self.vendors: Callable[[], Iterable[Any]] = self._vendors
+        self.vendors: Callable[[], Iterable[tuple[str, Any]]] = self._vendors
 
     @property
     def description(self) -> str:  # type: ignore[override]
@@ -681,57 +490,60 @@ class GenerateImage(Tool):
             return ToolResult.error(f"{path} already exists; name a new file")
         request = Request(prompt, sources, masked, aspect, self._timeout())
         passed: list[str] = []
-        for vendor in self.vendors():
-            missing = vendor.ready() or _cannot(vendor, request)
+        for name, vendor in self.vendors():
+            missing = _unready(vendor) or _cannot(vendor, request)
             if missing:
-                passed.append(f"{vendor.name}: {missing}")
+                passed.append(f"{name}: {missing}")
                 continue
             assert_active()
             made, error, took = await self._ask(vendor, request)
             media_type = sniff(made.data) if made is not None else ""
             if made is not None and not error and not media_type:
                 error = "what came back is not a PNG, JPEG, GIF or WebP picture"
-            self._audit(vendor.name, request, made, media_type, error, took)
+            self._audit(name, request, made, media_type, error, took)
             if made is None or error:
-                passed.append(f"{vendor.name}: {error}")
+                passed.append(f"{name}: {error}")
                 continue
-            return self._deliver(made, media_type, vendor.name, prompt, path, passed)
+            host = str(getattr(vendor, "host", "") or HOSTS.get(name, name))
+            return self._deliver(made, media_type, name, host, prompt, path, passed)
         failure = "; ".join(passed) or "no vendor is configured"
         return ToolResult.error(f"no picture made: {failure}")
 
     # -- the parts -------------------------------------------------------------
 
-    def _vendors(self) -> Iterator[Any]:
-        """Every vendor, the preferred one first, each built with the key it
-        holds now only when it is reached - a vendor after the one that
-        answered is never built, so its key is never read."""
-        first = str(self.ctx.setting("provider", "") or "").strip().lower()
-        order = [first] if first in VENDORS else []
-        order += [name for name in VENDORS if name not in order]
-        for name in order:
-            yield self._build(name)
+    def _vendors(self) -> Iterator[tuple[str, Any]]:
+        """Every vendor by name, the preferred one first, then the built-ins,
+        then the backends other plugins registered in their install order.
+        Each is built with the key it holds now only when it is reached - a
+        vendor after the one that answered is never built, so its key is never
+        read. A backend registered under a built-in's name stands in for it.
 
-    def _build(self, name: str) -> Any:
+        The backends are read now, not at `register`: a plugin installed after
+        this one, or enabled since, is in; one disabled since is out."""
+        builders: dict[str, Callable[[], Any]] = {name: self._builder(name) for name in BUILT_IN}
+        builders.update(self.ctx.extensions_in(POINT))
+        first = str(self.ctx.setting("provider", "") or "").strip().lower()
+        order = [first] if first in builders else []
+        order += [name for name in builders if name not in order]
+        for name in order:
+            try:
+                yield name, builders[name]()
+            except Exception as exc:  # another plugin's code; it fails as a vendor fails
+                yield name, _Broken(f"could not be built: {type(exc).__name__}: {exc}")
+
+    def _builder(self, name: str) -> Callable[[], Any]:
         ctx = self.ctx
 
         def model() -> str:
             return str(ctx.setting(f"{name}_model", "") or "")
 
         if name == "openai":
-            return OpenAIImages(
+            return lambda: OpenAIImages(
                 model=model(),
                 quality=str(ctx.setting("openai_quality", "") or ""),
                 **ctx.credential("openai"),
             )
-        if name == "google":
-            return GoogleImages(model=model(), **_key_only(ctx.credential("google")))
-        built = {
-            "xai": XAIImages,
-            "openrouter": OpenRouterImages,
-            "together": TogetherImages,
-            "fireworks": FireworksImages,
-        }[name]
-        return built(model=model(), **_key_only(ctx.credential(name)))
+        return lambda: GoogleImages(model=model(), **_key_only(ctx.credential("google")))
 
     def _timeout(self) -> float:
         try:
@@ -766,8 +578,16 @@ class GenerateImage(Tool):
         except Exception as exc:  # a vendor may fail in any way; the next one is asked
             message = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
             return None, message, time.monotonic() - started
-        if not isinstance(made, Made) or not made.data:
+        data = getattr(made, "data", None)
+        if not isinstance(data, bytes | bytearray) or not data:
             return None, "nothing came back", time.monotonic() - started
+        # Read into imagegen's own shape: a backend's object is another
+        # plugin's, and nothing past this line should depend on what it is.
+        made = Made(
+            bytes(data),
+            model=str(getattr(made, "model", "") or ""),
+            cost=str(getattr(made, "cost", "") or ""),
+        )
         return made, "", time.monotonic() - started
 
     def _audit(
@@ -811,6 +631,7 @@ class GenerateImage(Tool):
         made: Made,
         media_type: str,
         vendor: str,
+        host: str,
         prompt: str,
         path: str,
         passed: list[str],
@@ -840,7 +661,7 @@ class GenerateImage(Tool):
         # The picture inside an envelope, the line about it outside: the same
         # shape `view_image` gives a fetched picture. Wrapped here because the
         # executor, wrapping an untrusted result itself, would drop `images`.
-        envelope = wrap_open("", source=HOSTS.get(vendor, vendor))
+        envelope = wrap_open("", source=host)
         return ImageResult(content=line, images=(block,), envelope=envelope, wrapped=True)
 
     def _target(self, path: str, prompt: str, media_type: str) -> Path:
@@ -868,6 +689,29 @@ class GenerateImage(Tool):
             return str(path)
 
 
+class _Broken:
+    """A backend whose builder raised: passed over, with why, like any vendor
+    that is not ready."""
+
+    def __init__(self, why: str) -> None:
+        self.why = why
+
+    def ready(self) -> str:
+        return self.why
+
+
+def _unready(vendor: Any) -> str:
+    """Why a vendor cannot be asked, or empty. A backend is another plugin's
+    code: one with no `ready` is ready, and one whose `ready` raises is not."""
+    ready = getattr(vendor, "ready", None)
+    if ready is None:
+        return ""
+    try:
+        return str(ready() or "")
+    except Exception as exc:
+        return f"ready() failed: {type(exc).__name__}"
+
+
 def _cannot(vendor: Any, request: Request) -> str:
     if request.images and not getattr(vendor, "edits", False):
         return "does not edit pictures"
@@ -880,7 +724,7 @@ def _cannot(vendor: Any, request: Request) -> str:
 
 
 def _key_only(credential: Mapping[str, str]) -> dict[str, str]:
-    """Every constructor but OpenAI's takes `api_key` and `auth_token`, nothing else."""
+    """Google's constructor takes `api_key` and `auth_token`, nothing else."""
     return {k: v for k, v in credential.items() if k in ("api_key", "auth_token")}
 
 

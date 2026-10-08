@@ -60,6 +60,24 @@ has a key for - OpenAI, Google - asks for it with `ctx.credential("openai")` ins
 1.38), and lists the vendor under `vendor_credentials` in its manifest; any vendor it did
 not list is refused. Ask when the request is made, not in `register`, as `imagegen` does.
 
+## Extending another plugin
+
+A plugin can be extended by plugins it has never heard of (SDK 1.39). The owner reads a
+point named for itself - `ctx.extensions_in("imagegen.backend")` - and anyone writes into
+it with `ctx.register_extension("imagegen.backend", "acme", build)`. The writer needs no
+`requires_plugins` and no import: with the owner absent, the entry sits unread. That is how
+`xai`, `openrouter`, `together` and `fireworks` give `imagegen` and `videogen` their
+vendors, and how a new image or video vendor joins without a change to either.
+
+- **Owning a point:** publish the interface in your `PLUGIN.md`, as `imagegen` and
+  `videogen` do under *Adding a vendor*, and treat what you read as code you did not write:
+  read it when you need it (never in `register`), duck-type it, bound every call, and turn
+  whatever it raises into a result.
+- **Writing into one:** guard with `if hasattr(ctx, "register_extension"):` so the plugin
+  still loads on an older Ultron, and leave the entry out of `contracts`, which an older
+  Ultron warns about. Register a builder rather than a built object when the owner's
+  interface asks for one, so a key is read only when the owner reaches you.
+
 ## Before opening a pull request
 
 From a checkout of Ultron beside this one:

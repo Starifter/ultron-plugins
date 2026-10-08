@@ -1,17 +1,17 @@
 ---
 name: videogen
-description: Make videos with Google Veo, xAI, OpenRouter or Together in the background, saved in the workspace.
+description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
-version: "1.0.0"
-requires_ultron_sdk: ">=1.38,<2"
-vendor_credentials: [google, xai, openrouter, together]
+version: "2.0.0"
+requires_ultron_sdk: ">=1.39,<2"
+vendor_credentials: [google]
 contracts:
   tools: [generate_video, video_status]
 config_schema:
   provider:
     type: str
     default: ""
-    description: "google, xai, openrouter or together, tried first. Empty tries them in that order."
+    description: "A vendor to try first - google, or a backend's name such as xai. Empty tries google, then the backends."
   poll_seconds:
     type: float
     default: 10
@@ -32,18 +32,6 @@ config_schema:
     type: str
     default: veo-3.1-fast-generate-preview
     description: "A Veo model: veo-3.1-generate-preview, veo-3.1-fast-generate-preview or veo-3.1-lite-generate-preview."
-  xai_model:
-    type: str
-    default: grok-imagine-video-1.5
-    description: "A Grok Imagine video model. The classic grok-imagine-video takes no last frame."
-  openrouter_model:
-    type: str
-    default: google/veo-3.1
-    description: "Any video model OpenRouter routes to, by its slug - bytedance/seedance-2.0, say."
-  together_model:
-    type: str
-    default: minimax/hailuo-02
-    description: "A video model Together serves, as Together writes it."
 ---
 
 # videogen
@@ -59,35 +47,83 @@ background - one to several minutes - and saved in the workspace when it is read
 
 ## Keys
 
-The ones Ultron already holds for its model providers - `ultron auth add google` (or `xai`,
-`openrouter`, `together`), or the provider's variable in `~/.ultron/.env` (`GEMINI_API_KEY`,
-`XAI_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`). One key is enough. Google is the
-bundled provider; the other three are the keys the `xai`, `openrouter` and `together`
-provider plugins use, so a person who chats through one of them can make videos through it
-too. The plugin reads them with `ctx.credential` (SDK 1.38), which is why this manifest
-declares all four under `vendor_credentials` and `/plugins` says so before you install it. A
-key is read when its vendor is reached and again when a job is picked back up in a new
-session; each read is an `auth` record in the trail with a fingerprint, never the key.
+Google uses the key Ultron already holds for its model provider - `ultron auth add google`,
+or `GEMINI_API_KEY` in `~/.ultron/.env` - read with `ctx.credential` (SDK 1.38), which is
+why this manifest declares it under `vendor_credentials`. Every other vendor is a backend
+(below) and reads its key itself, in its own plugin's name. A key is read when its vendor is
+reached and again when a job is picked back up in a new session; each read is an `auth`
+record in the trail with a fingerprint, never the key.
 
 OpenAI is not here: it shut down Sora 2 and its Videos API on 2026-09-24. Sora through
 OpenRouter or Together went with it.
 
 ## Vendors
 
+One is built in:
+
 - **Google** (`veo-3.1-fast-generate-preview`): 4, 6 or 8 seconds, 16:9 or 9:16, 720p or
   1080p (1080p at 8 seconds only), a first frame and a last frame.
-- **xAI** (`grok-imagine-video-1.5`): 1 to 15 seconds, any of the shapes, 480p to 1080p, a
-  first frame and a last frame.
-- **OpenRouter** (`google/veo-3.1`): whichever video model `openrouter_model` names, billed
-  by OpenRouter; what it accepts is the model's business, and a refusal passes to the next
-  vendor.
-- **Together** (`minimax/hailuo-02`): the same, at Together, sized in pixels.
 
-`provider` picks which is asked first; the rest follow in the order above. A vendor with no
-usable key, one that cannot make what was asked for, or one that refuses the submission is
-passed over and named in the result. Once a vendor has taken a job it is that vendor's: a job
-that fails later is not sent anywhere else, because the first one may already have been
-billed.
+Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
+in this session, without a restart:
+
+| Plugin | Vendor | What it makes | Its setting |
+|---|---|---|---|
+| `xai` | `grok-imagine-video-1.5` | 1 to 15 seconds, any shape, 480p to 1080p, first and last frame | `video_model` |
+| `openrouter` | `google/veo-3.1` | whatever the routed model accepts, billed by OpenRouter | `video_model` |
+| `together` | `minimax/hailuo-02` | the same, at Together, sized in pixels | `video_model` |
+
+`provider` picks which is asked first; then Google, and the backends in the order their
+plugins install. A vendor with no usable key, one that cannot make what was asked for, or
+one that refuses the submission is passed over and named in the result. Once a vendor has
+taken a job it is that vendor's: a job that fails later is not sent anywhere else, because
+the first one may already have been billed.
+
+**From 1.x:** the three vendors above used to live here, read with this plugin's
+credential and set with `xai_model`, `openrouter_model` and `together_model`. Those
+settings are gone - `/plugins videogen` warns about any still set - and each vendor now
+needs its own plugin enabled, with its model in that plugin's `video_model`. A job a 1.x
+session left running is still collected, as long as its vendor's plugin is enabled.
+
+## Adding a vendor
+
+A plugin adds a vendor by putting a builder into `videogen.backend` (SDK 1.39):
+
+```python
+def register(self, ctx):
+    if hasattr(ctx, "register_extension"):  # still loads on an Ultron before 1.39
+        ctx.register_extension("videogen.backend", "acme", lambda: AcmeVideo(ctx))
+```
+
+It needs nothing from videogen, and videogen needs no change. The name is what `provider`
+takes, what the job file records, and how a job is found again in a later session - so keep
+it stable. A backend registered under `google` stands in for the built-in one.
+
+**The builder** takes no arguments and returns a vendor. It is called when videogen reaches
+that vendor and again when it resumes one of its jobs, so read the key there.
+
+**The vendor** is any object with:
+
+| | |
+|---|---|
+| `model` | The model it will use, for the job record and the result. Optional. |
+| `host` | Where the video comes from. Optional. |
+| `ready()` | `""` when it can be asked, or why not. Optional. |
+| `cannot(request)` | `""` when it can make this, or why not - `"makes 16:9 and 9:16 only"`. Optional. |
+| `async submit(request)` | Start the job; return the vendor's job id (letters, digits, `._:/-`, at most 300). |
+| `async status(job_id)` | Return an object with `state` - `running`, `done` or `failed` - and `url`, `error` and `cost` (strings, any may be empty). |
+| `async download(status, timeout)` | The video's bytes. `status` is the object your `status` returned. |
+
+`request` has `prompt`, `first` and `last` (each `None` or an object with `data` and
+`media_type`), `seconds` (0 for the vendor's default), `aspect` (`""`, `landscape`,
+`portrait` or `square`), `resolution` (`""`, `480p`, `720p` or `1080p`) and `timeout`.
+Raise to fail. An exception whose `retry` attribute is true - a dropped connection, a 5xx,
+a 429 - is tried again, up to five in a row; any other ends the job. Messages and `error`
+are shown to the model, so make them identifiers - an HTTP status, a vendor's error code -
+never the vendor's own prose. Make requests with `ultron.sdk.web` so the operator's address
+policy applies, and send your key only to your own API's host. videogen polls, retries,
+caps the download at 512 MB, checks it is a video, saves it and tells the model; a vendor
+does none of that.
 
 ## How a job runs
 

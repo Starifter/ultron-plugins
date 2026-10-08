@@ -1,17 +1,17 @@
 ---
 name: imagegen
-description: Make and edit pictures with OpenAI, Google, xAI, OpenRouter, Together or Fireworks, saved in the workspace.
+description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
-version: "1.1.0"
-requires_ultron_sdk: ">=1.38,<2"
-vendor_credentials: [openai, google, xai, openrouter, together, fireworks]
+version: "2.0.0"
+requires_ultron_sdk: ">=1.39,<2"
+vendor_credentials: [openai, google]
 contracts:
   tools: [generate_image]
 config_schema:
   provider:
     type: str
     default: ""
-    description: "openai, google, xai, openrouter, together or fireworks, tried first. Empty tries them in that order."
+    description: "A vendor to try first - openai, google, or a backend's name such as xai. Empty tries openai, google, then the backends."
   timeout_seconds:
     type: float
     default: 120
@@ -32,22 +32,6 @@ config_schema:
     type: str
     default: gemini-3.1-flash-image-preview
     description: "A Gemini image model, or an imagen-* model, which makes pictures from words only."
-  xai_model:
-    type: str
-    default: grok-imagine-image-2.0
-    description: "A Grok Imagine image model."
-  openrouter_model:
-    type: str
-    default: openai/gpt-image-2
-    description: "Any image model OpenRouter routes to, by its slug - bytedance-seed/seedream-4.5, say."
-  together_model:
-    type: str
-    default: black-forest-labs/FLUX.1-schnell
-    description: "An image model Together serves, as Together writes it."
-  fireworks_model:
-    type: str
-    default: flux-1-schnell-fp8
-    description: "A FLUX text-to-image model at Fireworks - flux-1-dev-fp8, say - or its full accounts/... id."
 ---
 
 # imagegen
@@ -62,32 +46,80 @@ before telling you it is right.
 
 ## Keys
 
-The ones Ultron already holds for its model providers - `ultron auth add openai` (or
-`google`, `xai`, `openrouter`, `together`, `fireworks`), or the provider's variable in
-`~/.ultron/.env` (`OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, `OPENROUTER_API_KEY`,
-`TOGETHER_API_KEY`, `FIREWORKS_API_KEY`). One key is enough; the last four are the keys the
-`xai`, `openrouter`, `together` and `fireworks` provider plugins use, so a person who chats
-through one of them can make pictures through it too. The plugin reads them with
-`ctx.credential` (SDK 1.38), which is why this manifest declares all six under
-`vendor_credentials` and `/plugins` says so before you install it. A key is read only when
-its vendor is reached, and each read is an `auth` record in the trail with a fingerprint,
-never the key. With no key the tool is still there, and every call says which keys are
-missing.
+OpenAI and Google use the keys Ultron already holds for its model providers - `ultron auth
+add openai` or `google`, or `OPENAI_API_KEY` / `GEMINI_API_KEY` in `~/.ultron/.env`. The
+plugin reads them with `ctx.credential` (SDK 1.38), which is why this manifest declares both
+under `vendor_credentials` and `/plugins` says so before you install it. Every other vendor
+is a backend (below) and reads its key itself, in its own plugin's name. A key is read only
+when its vendor is reached, and each read is an `auth` record in the trail with a
+fingerprint, never the key. With no key anywhere the tool is still there, and every call
+says which vendors were passed over and why.
 
 ## Vendors
+
+Two are built in:
 
 - **OpenAI** (`gpt-image-2`): generates, edits, and takes a mask.
 - **Google** (`gemini-3.1-flash-image-preview`): generates and edits, no mask. An `imagen-*`
   model generates from words only.
-- **xAI** (`grok-imagine-image-2.0`): generates, and edits one picture at a time, no mask.
-- **OpenRouter** (`openai/gpt-image-2`): generates and edits, no mask - whichever image model
-  `openrouter_model` names, billed by OpenRouter.
-- **Together** (`black-forest-labs/FLUX.1-schnell`): generates from words only.
-- **Fireworks** (`flux-1-schnell-fp8`): generates from words only.
 
-`provider` picks which is asked first; the rest follow in the order above. A vendor with no
-usable key, one that cannot do the edit asked for, or one that fails is passed over and named
-in the result.
+Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
+in this session, without a restart:
+
+| Plugin | Vendor | What it does | Its setting |
+|---|---|---|---|
+| `xai` | `grok-imagine-image-2.0` | generates, edits one picture at a time, no mask | `image_model` |
+| `openrouter` | `openai/gpt-image-2` | generates and edits, no mask, billed by OpenRouter | `image_model` |
+| `together` | `black-forest-labs/FLUX.1-schnell` | generates from words only | `image_model` |
+| `fireworks` | `flux-1-schnell-fp8` | generates from words only | `image_model` |
+
+`provider` picks which is asked first; then OpenAI, Google, and the backends in the order
+their plugins install. A vendor with no usable key, one that cannot do the edit asked for,
+or one that fails is passed over and named in the result.
+
+**From 1.x:** the four vendors above used to live here, read with this plugin's credential
+and set with `xai_model`, `openrouter_model`, `together_model` and `fireworks_model`. Those
+settings are gone - `/plugins imagegen` warns about any still set - and each vendor now
+needs its own plugin enabled, with its model in that plugin's `image_model`.
+
+## Adding a vendor
+
+A plugin adds a vendor by putting a builder into `imagegen.backend` (SDK 1.39):
+
+```python
+def register(self, ctx):
+    if hasattr(ctx, "register_extension"):  # still loads on an Ultron before 1.39
+        ctx.register_extension("imagegen.backend", "acme", lambda: AcmeImages(ctx))
+```
+
+It needs nothing from imagegen - not an import, not `requires_plugins` - and imagegen needs
+no change: with imagegen absent the entry sits unread. The name is what `provider` takes and
+what the result and the trail call the vendor. A backend registered under `openai` or
+`google` stands in for the built-in one.
+
+**The builder** takes no arguments and returns a vendor. It is called only when imagegen
+reaches that vendor, so read the key there, with your own plugin's `ctx.credential` (and
+your vendor under your manifest's `vendor_credentials`) or from the environment.
+
+**The vendor** is any object with:
+
+| | |
+|---|---|
+| `ready()` | `""` when it can be asked, or why not - `"no acme key (ultron auth add acme)"`. Optional. |
+| `edits` | `True` if it takes pictures to work from. Optional, default `False`. |
+| `masks` | `True` if it takes a mask. Optional, default `False`. |
+| `max_images` | How many pictures one edit takes. Optional, default 8. |
+| `host` | Where the bytes come from, for the result's envelope - `api.acme.ai`. Optional, default the name. |
+| `async generate(request)` | Make one picture. Returns an object with `data` (the picture's bytes), and optionally `model` and `cost` (both strings). |
+
+`request` has `prompt` (a string), `images` (a tuple of objects with `data`, `media_type`
+and `name`), `mask` (one of those, or `None`), `aspect` (`""`, `square`, `landscape` or
+`portrait`) and `timeout` (seconds; imagegen also enforces it). Raise to fail: the
+exception's message is shown to the model, so make it an identifier - an HTTP status, a
+vendor's error code - and never the vendor's own prose. Make requests with
+`ultron.sdk.web.post` so the operator's address policy applies. imagegen checks what comes
+back is a picture, saves it, envelopes it and records the attempt; a vendor does none of
+that.
 
 ## What it does
 
