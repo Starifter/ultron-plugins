@@ -821,6 +821,15 @@ class Videogen:
             return
         self.waking = loop.create_task(self._wake(), context=contextvars.Context())
 
+    async def _send_wake(self, text: str) -> bool:
+        """`ctx.wake`, with `deliver` when a person set `announce_to` - the
+        owner's DM or a named place (SDK 1.41). An Ultron before 1.41 refuses
+        the keyword, and the next turn is told instead."""
+        to = str(self.ctx.setting("announce_to", "") or "").strip()
+        if to:
+            return bool(await self.ctx.wake(text, deliver=to))
+        return bool(await self.ctx.wake(text))
+
     async def _wake(self) -> None:
         """OpenClaw's completion event: a turn of the session's own that says
         which jobs finished, so the agent tells the person without waiting for
@@ -840,7 +849,7 @@ class Videogen:
             lines.append("Tell the person, briefly, and say where to find it.")
             woke = False
             try:
-                woke = bool(await self.ctx.wake("\n".join(lines)))
+                woke = bool(await self._send_wake("\n".join(lines)))
             except asyncio.CancelledError:
                 raise
             except Exception:  # an Ultron that refuses the wake still tells the next turn

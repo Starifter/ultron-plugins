@@ -145,9 +145,11 @@ class Waker:
         self.answer = answer
         self.texts: list[tuple[str, str]] = []
         self.hold: asyncio.Event | None = None
+        self.delivers: list[str] = []
 
-    async def __call__(self, plugin: str, text: str) -> bool:
+    async def __call__(self, plugin: str, text: str, deliver: str = "") -> bool:
         self.texts.append((plugin, text))
+        self.delivers.append(deliver)
         if self.hold is not None:
             await self.hold.wait()
         return self.answer
@@ -623,6 +625,19 @@ async def test_a_wake_that_did_not_run_leaves_it_for_the_next_turn(
     await it.woken()
     assert len(waker.texts) == 1
     assert f"video {job} is ready" in it.runner.notices()
+
+
+async def test_announce_to_is_handed_to_the_wake_only_when_set(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    await call(it.generate, prompt="one")
+    await it.woken()
+    waker2 = Waker()
+    (tmp_path / "b").mkdir()
+    other = install(tmp_path / "b", waker=waker2, settings={"announce_to": "channel:dm:tg:1"})
+    await call(other.generate, prompt="two")
+    await other.woken()
+    assert waker.delivers == [""] and waker2.delivers == ["channel:dm:tg:1"]
 
 
 async def test_announce_notice_never_wakes(tmp_path: Path, wire: Wire) -> None:
