@@ -1,10 +1,11 @@
 ---
 name: openrouter
-description: The OpenRouter model provider - one key, every model it routes to.
-version: "1.1.0"
+description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image and video models for imagegen and videogen.
+version: "1.2.0"
 requires_ultron_sdk: ">=1.23,<2"
-categories: [provider, models]
+categories: [provider, models, media]
 logo: logo.svg
+vendor_credentials: [openrouter]
 contracts:
   providers: [openrouter]
   logins: [openrouter]
@@ -34,6 +35,14 @@ config_schema:
     type: str
     default: Ultron
     description: "Sent as X-Title, the name OpenRouter lists the app under."
+  image_model:
+    type: str
+    default: openai/gpt-image-2
+    description: "The image model imagegen makes pictures with at OpenRouter, by its slug - bytedance-seed/seedream-4.5, say."
+  video_model:
+    type: str
+    default: google/veo-3.1
+    description: "The video model videogen makes videos with at OpenRouter, by its slug - bytedance/seedance-2.0, say."
 python_dependencies:
   - "openai>=1.66"
 ---
@@ -122,6 +131,27 @@ and `/auth` says `plugin-run flow`. OpenRouter has no `state` of its own, but ec
 time, on the redirect and on a pasted URL alike; a request that does not carry it is
 answered 400 and ignored, and the listener keeps waiting for the right one. The key does not expire; there is nothing to refresh.
 Revoke it at openrouter.ai/settings/keys.
+
+## Pictures and videos
+
+With [imagegen](../imagegen/PLUGIN.md) or [videogen](../videogen/PLUGIN.md) enabled,
+OpenRouter is one of their vendors: the plugin registers itself into `imagegen.backend` and
+`videogen.backend` (SDK 1.39; an older Ultron gets the provider and the sign-in only).
+Neither plugin needs a setting for it, and this one does not depend on them.
+
+- **Pictures** (`image_model`, default `openai/gpt-image-2`): generates and edits, no mask -
+  whichever image model `image_model` names, billed by OpenRouter.
+- **Videos** (`video_model`, default `google/veo-3.1`): whichever video model `video_model`
+  names, billed by OpenRouter; what it accepts is the model's business, and a refusal passes
+  to the next vendor. A first and a last frame go as `frame_images`. The finished video is
+  fetched from OpenRouter's own content URL, never from a link the reply names, because the
+  key goes with that request.
+
+Both spend the provider's credential - a key added by hand or the `openrouter:oauth`
+sign-in - read with `ctx.credential`, which is why the manifest lists `openrouter` under
+`vendor_credentials`, and only when imagegen or videogen reaches OpenRouter. Each read is an
+`auth` record in the trail with a fingerprint. A picture or a frame you hand imagegen or
+videogen reaches OpenRouter, with the prompt, when it is the vendor that makes it.
 
 ## What is not here
 

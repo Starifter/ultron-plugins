@@ -1,12 +1,18 @@
 ---
 name: fireworks
-description: The Fireworks AI model provider - open models, hosted at Fireworks.
-version: "1.0.0"
+description: The Fireworks AI model provider - open models, hosted at Fireworks - and FLUX pictures for imagegen.
+version: "1.1.0"
 requires_ultron_sdk: ">=1.25,<2"
-categories: [provider, models]
+categories: [provider, models, media]
 logo: logo.svg
+vendor_credentials: [fireworks]
 contracts:
   providers: [fireworks]
+config_schema:
+  image_model:
+    type: str
+    default: flux-1-schnell-fp8
+    description: "The FLUX text-to-image model imagegen makes pictures with at Fireworks - flux-1-dev-fp8, say - or its full accounts/... id."
 providers:
   fireworks:
     api_key_env_vars: [FIREWORKS_API_KEY]
@@ -53,10 +59,25 @@ be a guess. A model that reasons does so at its own default. Its reasoning is sh
 thinking and - since a Fireworks model loses its thinking between tool calls otherwise -
 sent back with each earlier turn, which is what Ultron's SDK 1.25 added.
 
+## Pictures
+
+With [imagegen](../imagegen/PLUGIN.md) enabled, Fireworks is one of its vendors: the plugin
+registers itself into `imagegen.backend` (SDK 1.39; an older Ultron gets the provider only).
+imagegen needs no setting for it, and this plugin does not depend on it.
+
+- **Pictures** (`image_model`, default `flux-1-schnell-fp8`): a FLUX `text_to_image`
+  workflow, generating from words only. A bare name is one of Fireworks' own models; a full
+  `accounts/...` id is used as written.
+
+It spends the provider's key, read with `ctx.credential` - which is why the manifest lists
+`fireworks` under `vendor_credentials` - and only when imagegen reaches Fireworks. Each read
+is an `auth` record in the trail with a fingerprint.
+
 ## What reaches Fireworks
 
 The conversation, the tool definitions, pictures for a model that takes them, and your
-key. A PDF is not sent - Fireworks asks for pages as pictures - and the row says so.
+key. A PDF is not sent - Fireworks asks for pages as pictures - and the row says so. When
+imagegen makes a picture at Fireworks, the prompt is sent and nothing else.
 
 ## Not tested live
 

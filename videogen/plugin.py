@@ -1,16 +1,20 @@
 """videogen: make videos in the background, on any vendor a key is held for.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings two
-tools and four vendors behind them:
+tools, one vendor of its own, and a point any other plugin can put a vendor
+into:
 
 - `GoogleVideo` - Veo through the Gemini API: `predictLongRunning`, then the
   operation, then the file it names.
-- `XAIVideo` - Grok Imagine: `/videos/generations`, then `/videos/{id}`.
-- `OpenRouterVideo` - OpenRouter's `/videos`, any model it routes to.
-- `TogetherVideo` - Together's `/v2/videos`, any model it serves.
+- `videogen.backend` - every other vendor, registered by the plugin that owns
+  it with `ctx.register_extension("videogen.backend", name, build)` (SDK 1.39).
+  The `xai`, `openrouter` and `together` provider plugins do; the interface is
+  in `PLUGIN.md`, and nothing here names them.
 
-The last three are the vendors of the provider plugins of the same names and
-spend the key that plugin's provider uses. Keys come from `ctx.credential`.
+Google stays here because its plugin ships inside Ultron, which does not know
+videogen exists; its key comes from `ctx.credential`, and a backend reads its
+own with its own plugin's. Whichever it is, `Vendor` is how this module sees
+it, so a backend's object is touched in one place.
 
 A video takes minutes, so nothing waits for one. `generate_video` submits and
 returns a job id; a task the plugin owns follows the job, downloads the video
@@ -60,14 +64,12 @@ RETRIES = 5
 """Status checks that fail on the network, or with a 5xx or 429, in a row."""
 KEEP = 200
 """Finished jobs kept in the file; the oldest past this are dropped."""
-VENDORS = ("google", "xai", "openrouter", "together")
-"""Every vendor, in the order they are tried when `provider` names none."""
-HOSTS = {
-    "google": "generativelanguage.googleapis.com",
-    "xai": "api.x.ai",
-    "openrouter": "openrouter.ai",
-    "together": "api.together.ai",
-}
+BUILT_IN = ("google",)
+"""videogen's own vendors, tried before any backend another plugin registered
+when `provider` names none."""
+POINT = "videogen.backend"
+"""Where another plugin puts a vendor (`ctx.register_extension`, SDK 1.39)."""
+GOOGLE_HOST = "generativelanguage.googleapis.com"
 
 FRAME_TYPES = ("image/png", "image/jpeg", "image/webp")
 EXTENSIONS = {"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm"}
@@ -153,19 +155,99 @@ class Request:
 
 class Status:
     """Where a job stands at the vendor: `running`, `done` with somewhere to
-    fetch it from, or `failed` with a code."""
+    fetch it from, or `failed` with a code. `raw` is what a backend returned,
+    handed back to its own `download`."""
 
-    __slots__ = ("cost", "error", "state", "url")
+    __slots__ = ("cost", "error", "raw", "state", "url")
 
-    def __init__(self, state: str, url: str = "", error: str = "", cost: str = "") -> None:
+    def __init__(
+        self, state: str, url: str = "", error: str = "", cost: str = "", raw: Any = None
+    ) -> None:
         self.state = state
         self.url = url
         self.error = error
         self.cost = cost
+        self.raw = raw
 
 
 class Retry(Exception):
-    """A status check worth making again: the network, a 5xx, a 429."""
+    """A status check worth making again: the network, a 5xx, a 429. A
+    backend says the same with any exception whose `retry` is true."""
+
+    retry = True
+
+
+def _retryable(exc: BaseException) -> bool:
+    return getattr(exc, "retry", False) is True
+
+
+class Vendor:
+    """A vendor as videogen asks one - a built-in, or another plugin's
+    backend - under the name it was found by.
+
+    A backend is code this plugin did not write, so everything it is asked goes
+    through here: a missing method is a vendor that cannot, one that raises is
+    one that failed, a job id is checked before it goes into a URL or a file,
+    and what `status` returns is read into videogen's own `Status`."""
+
+    __slots__ = ("impl", "name", "why")
+
+    def __init__(self, name: str, impl: Any, why: str = "") -> None:
+        self.name = name
+        self.impl = impl
+        self.why = why
+
+    @classmethod
+    def built(cls, name: str, builder: Callable[[], Any]) -> Vendor:
+        try:
+            return cls(name, builder())
+        except Exception as exc:  # another plugin's code fails as a vendor fails
+            return cls(name, None, f"could not be built: {_said(exc)}")
+
+    @property
+    def model(self) -> str:
+        return str(getattr(self.impl, "model", "") or "")
+
+    def ready(self) -> str:
+        if self.why:
+            return self.why
+        return self._ask("ready")
+
+    def cannot(self, request: Request) -> str:
+        return self._ask("cannot", request)
+
+    async def submit(self, request: Request) -> str:
+        return _remote(await self.impl.submit(request), self.name)
+
+    async def status(self, remote: str) -> Status:
+        said = await self.impl.status(remote)
+        state = str(getattr(said, "state", "") or "")
+        if state not in ("running", "done", "failed"):
+            raise RuntimeError(f"{self.name} answered a status videogen does not know")
+        return Status(
+            state,
+            url=str(getattr(said, "url", "") or ""),
+            error=str(getattr(said, "error", "") or ""),
+            cost=str(getattr(said, "cost", "") or ""),
+            raw=said,
+        )
+
+    async def download(self, status: Status, timeout: float) -> bytes:
+        data = await self.impl.download(status.raw if status.raw is not None else status, timeout)
+        if not isinstance(data, bytes | bytearray):
+            raise RuntimeError(f"{self.name} sent no video")
+        if len(data) > VIDEO_MAX_BYTES:
+            raise RuntimeError(f"the video is over {VIDEO_MAX_BYTES // (1024 * 1024)} MB")
+        return bytes(data)
+
+    def _ask(self, method: str, *arguments: Any) -> str:
+        found = getattr(self.impl, method, None)
+        if found is None:
+            return ""
+        try:
+            return str(found(*arguments) or "")
+        except Exception as exc:
+            return f"{method}() failed: {type(exc).__name__}"
 
 
 def _json(raw: bytes) -> Mapping[str, Any]:
@@ -270,7 +352,7 @@ GOOGLE_ASPECTS = {"landscape": "16:9", "portrait": "9:16"}
 
 
 class GoogleVideo:
-    name = "google"
+    host = GOOGLE_HOST
     seconds = (4, 6, 8)
 
     def __init__(
@@ -354,7 +436,7 @@ class GoogleVideo:
         # to a signed storage link, and the core client drops `x-goog-api-key`
         # at that hop (Starifter/ultron, redirect-key-headers); an Ultron from
         # before it carries the key to Google's storage, as `curl -L` does.
-        if urlsplit(status.url).hostname != HOSTS["google"]:
+        if urlsplit(status.url).hostname != GOOGLE_HOST:
             raise RuntimeError("Google named a download somewhere other than its API")
         return await _download(status.url, "Google", self._headers(), timeout)
 
@@ -364,243 +446,6 @@ class GoogleVideo:
 
 def _inline(frame: Frame) -> dict[str, Any]:
     return {"inlineData": {"mimeType": frame.media_type, "data": frame.b64()}}
-
-
-# -- xAI -------------------------------------------------------------------------
-
-XAI_URL = "https://api.x.ai/v1/videos"
-XAI_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
-
-
-class XAIVideo:
-    name = "xai"
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "grok-imagine-video-1.5").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no xai key (ultron auth add xai)"
-
-    def cannot(self, request: Request) -> str:
-        if request.last is not None and self.model == "grok-imagine-video":
-            return f"{self.model} takes no last frame"
-        return ""
-
-    async def submit(self, request: Request) -> str:
-        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["duration"] = request.seconds
-        if request.aspect in XAI_ASPECTS:
-            body["aspect_ratio"] = XAI_ASPECTS[request.aspect]
-        if request.resolution:
-            body["resolution"] = request.resolution
-        if request.first is not None:
-            body["image"] = {"url": request.first.data_uri()}
-        if request.last is not None:
-            body["last_frame"] = {"url": request.last.data_uri()}
-        parsed = await _call(
-            "POST",
-            f"{XAI_URL}/generations",
-            "xAI",
-            headers=self._headers(),
-            timeout=request.timeout,
-            body=body,
-        )
-        return _remote(parsed.get("request_id"), "xAI")
-
-    async def status(self, remote: str) -> Status:
-        parsed = await _call(
-            "GET", f"{XAI_URL}/{remote}", "xAI", headers=self._headers(), timeout=POLL_TIMEOUT
-        )
-        state = str(parsed.get("status") or "")
-        if state == "done":
-            video = parsed.get("video")
-            url = str(video.get("url") or "") if isinstance(video, Mapping) else ""
-            return Status("done", url=url) if url else Status("failed", error="xAI sent no video")
-        if state in ("failed", "expired"):
-            error = parsed.get("error")
-            code = _code(error.get("code")) if isinstance(error, Mapping) else ""
-            return Status("failed", error=f"xAI says {state}" + (f" ({code})" if code else ""))
-        return Status("running")
-
-    async def download(self, status: Status, timeout: float) -> bytes:
-        # A public link: the key stays home.
-        return await _download(status.url, "xAI", {}, timeout)
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._key}"}
-
-
-# -- OpenRouter ------------------------------------------------------------------
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/videos"
-OPENROUTER_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
-
-
-class OpenRouterVideo:
-    name = "openrouter"
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "google/veo-3.1").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no openrouter key (ultron auth add openrouter)"
-
-    def cannot(self, request: Request) -> str:
-        return ""
-
-    async def submit(self, request: Request) -> str:
-        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["duration"] = request.seconds
-        if request.aspect in OPENROUTER_ASPECTS:
-            body["aspect_ratio"] = OPENROUTER_ASPECTS[request.aspect]
-        if request.resolution:
-            body["resolution"] = request.resolution
-        frames = [
-            {"type": "image_url", "image_url": {"url": frame.data_uri()}, "frame_type": kind}
-            for kind, frame in (("first_frame", request.first), ("last_frame", request.last))
-            if frame is not None
-        ]
-        if frames:
-            body["frame_images"] = frames
-        parsed = await _call(
-            "POST",
-            OPENROUTER_URL,
-            "OpenRouter",
-            headers=self._headers(),
-            timeout=request.timeout,
-            body=body,
-        )
-        return _remote(parsed.get("id"), "OpenRouter")
-
-    async def status(self, remote: str) -> Status:
-        parsed = await _call(
-            "GET",
-            f"{OPENROUTER_URL}/{remote}",
-            "OpenRouter",
-            headers=self._headers(),
-            timeout=POLL_TIMEOUT,
-        )
-        state = str(parsed.get("status") or "")
-        if state == "completed":
-            usage = parsed.get("usage")
-            cost = ""
-            if isinstance(usage, Mapping) and isinstance(usage.get("cost"), int | float):
-                cost = f"${usage['cost']:g}"
-            # Our own content URL rather than the one in the reply: the key goes
-            # with it, and a key goes only where this code chose to send it.
-            return Status("done", url=f"{OPENROUTER_URL}/{remote}/content?index=0", cost=cost)
-        if state == "failed":
-            error = parsed.get("error")
-            code = ""
-            if isinstance(error, Mapping):
-                code = _code(error.get("code")) or _code(error.get("type"))
-            return Status("failed", error="OpenRouter failed it" + (f" ({code})" if code else ""))
-        return Status("running")
-
-    async def download(self, status: Status, timeout: float) -> bytes:
-        return await _download(status.url, "OpenRouter", self._headers(), timeout)
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._key}"}
-
-
-# -- Together --------------------------------------------------------------------
-
-TOGETHER_URL = "https://api.together.ai/v2/videos"
-TOGETHER_SIZES = {
-    ("landscape", "480p"): (854, 480),
-    ("landscape", "720p"): (1280, 720),
-    ("landscape", "1080p"): (1920, 1080),
-    ("portrait", "480p"): (480, 854),
-    ("portrait", "720p"): (720, 1280),
-    ("portrait", "1080p"): (1080, 1920),
-    ("square", "480p"): (480, 480),
-    ("square", "720p"): (720, 720),
-    ("square", "1080p"): (1080, 1080),
-}
-"""Pixels, not a ratio: Together takes `width` and `height`."""
-
-
-class TogetherVideo:
-    name = "together"
-
-    def __init__(self, *, model: str = "", api_key: str | None = None, **rest: str) -> None:
-        self.model = (model or "minimax/hailuo-02").strip()
-        self._key = _bearer({"api_key": api_key or "", **rest})
-
-    def ready(self) -> str:
-        return "" if self._key else "no together key (ultron auth add together)"
-
-    def cannot(self, request: Request) -> str:
-        return ""
-
-    async def submit(self, request: Request) -> str:
-        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["seconds"] = str(request.seconds)
-        if request.aspect or request.resolution:
-            shape = (request.aspect or "landscape", request.resolution or "720p")
-            body["width"], body["height"] = TOGETHER_SIZES[shape]
-        frames = [
-            {"input_image": frame.b64(), "frame": kind}
-            for kind, frame in (("first", request.first), ("last", request.last))
-            if frame is not None
-        ]
-        if frames:
-            body["frame_images"] = frames
-        parsed = await _call(
-            "POST",
-            TOGETHER_URL,
-            "Together",
-            headers=self._headers(),
-            timeout=request.timeout,
-            body=body,
-        )
-        return _remote(parsed.get("id"), "Together")
-
-    async def status(self, remote: str) -> Status:
-        parsed = await _call(
-            "GET",
-            f"{TOGETHER_URL}/{remote}",
-            "Together",
-            headers=self._headers(),
-            timeout=POLL_TIMEOUT,
-        )
-        state = str(parsed.get("status") or "")
-        outputs = parsed.get("outputs")
-        outputs = outputs if isinstance(outputs, Mapping) else {}
-        if state == "completed":
-            url = str(outputs.get("video_url") or "")
-            cost = outputs.get("cost")
-            shown = f"${cost:g}" if isinstance(cost, int | float) else ""
-            if not url:
-                return Status("failed", error="Together sent no video")
-            return Status("done", url=url, cost=shown)
-        if state in ("failed", "cancelled"):
-            error = parsed.get("error")
-            code = ""
-            if isinstance(error, Mapping):
-                code = _code(error.get("code")) or _code(error.get("type"))
-            return Status("failed", error=f"Together says {state}" + (f" ({code})" if code else ""))
-        return Status("running")
-
-    async def download(self, status: Status, timeout: float) -> bytes:
-        return await _download(status.url, "Together", {}, timeout)
-
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._key}"}
-
-
-BUILDERS: dict[str, Callable[..., Any]] = {
-    "google": GoogleVideo,
-    "xai": XAIVideo,
-    "openrouter": OpenRouterVideo,
-    "together": TogetherVideo,
-}
 
 
 # -- jobs ------------------------------------------------------------------------
@@ -721,8 +566,7 @@ class Videogen:
         self.session = str(getattr(ctx, "session_key", "") or "")
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.ended: dict[str, asyncio.Event] = {}
-        self.vendors: Callable[[], Iterator[Any]] = self._vendors
-        self.build: Callable[[str], Any] = self._build
+        self.vendors: Callable[[], Iterator[Vendor]] = self._vendors
         self.interval = self._clamped("poll_seconds", 10.0, 2.0, 120.0)
         self.resumed = False
 
@@ -743,20 +587,35 @@ class Videogen:
 
     # -- vendors ---------------------------------------------------------------
 
-    def _vendors(self) -> Iterator[Any]:
+    def builders(self) -> dict[str, Callable[[], Any]]:
+        """Every vendor's builder by name: the built-ins, then the backends
+        other plugins registered, in their install order. Read now rather than
+        at `register`, so a plugin enabled since is in and one disabled since
+        is out. A backend registered under `google` stands in for it."""
+        found: dict[str, Callable[[], Any]] = {"google": self._google}
+        found.update(self.ctx.extensions_in(POINT))
+        return found
+
+    def _vendors(self) -> Iterator[Vendor]:
         """Every vendor, the preferred one first, each built with the key it
         holds now only when it is reached."""
+        builders = self.builders()
         first = str(self.ctx.setting("provider", "") or "").strip().lower()
-        order = [first] if first in VENDORS else []
-        order += [name for name in VENDORS if name not in order]
+        order = [first] if first in builders else []
+        order += [name for name in builders if name not in order]
         for name in order:
-            yield self.build(name)
+            yield Vendor.built(name, builders[name])
 
-    def _build(self, name: str) -> Any:
-        credential = self.ctx.credential(name)
+    def build(self, name: str) -> Vendor | None:
+        """One vendor by name, as a job picked up again needs it, or `None`
+        when nothing by that name is registered any more."""
+        builder = self.builders().get(name)
+        return Vendor.built(name, builder) if builder is not None else None
+
+    def _google(self) -> GoogleVideo:
+        credential = self.ctx.credential("google")
         key = {k: v for k, v in credential.items() if k in ("api_key", "auth_token")}
-        model = str(self.ctx.setting(f"{name}_model", "") or "")
-        return BUILDERS[name](model=model, **key)
+        return GoogleVideo(model=str(self.ctx.setting("google_model", "") or ""), **key)
 
     # -- the lifecycle ---------------------------------------------------------
 
@@ -768,7 +627,7 @@ class Videogen:
         """Targets a running job has claimed, so two jobs never pick one name."""
         return {job.target for job in self.file.load().values() if job.state == "running"}
 
-    def start(self, job: Job, vendor: Any) -> None:
+    def start(self, job: Job, vendor: Vendor) -> None:
         """Follow `job` in a task of the session's, never of the call's.
 
         An empty context, so the submitting call's authority does not ride
@@ -792,10 +651,13 @@ class Videogen:
         for job in self.mine():
             if job.state != "running" or job.id in self.tasks:
                 continue
-            if job.vendor not in BUILDERS:
-                self._end(job, error=f"no such vendor {job.vendor!r} to resume with")
-                continue
             vendor = self.build(job.vendor)
+            if vendor is None:
+                self._end(
+                    job,
+                    error=f"no vendor {job.vendor!r} to resume with - is its plugin enabled?",
+                )
+                continue
             missing = vendor.ready()
             if missing:
                 self._end(job, error=f"could not resume: {missing}")
@@ -810,7 +672,7 @@ class Videogen:
             task.cancel()
         self.tasks.clear()
 
-    async def _follow(self, job: Job, vendor: Any) -> None:
+    async def _follow(self, job: Job, vendor: Vendor) -> None:
         began = time.monotonic()
         limit = self.deadline() - max(0.0, time.time() - job.created)
         failures = 0
@@ -822,18 +684,18 @@ class Videogen:
                 try:
                     status = await vendor.status(job.remote)
                     failures = 0
-                except Retry as exc:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # a 4xx, a reply of the wrong shape, or a retry
+                    if not _retryable(exc):
+                        self._end(job, error=_said(exc))
+                        return
                     failures += 1
                     if failures >= RETRIES:
                         self._end(job, error=f"{exc}, {RETRIES} times in a row")
                         return
                     await asyncio.sleep(self.interval)
                     continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # a 4xx, a reply of the wrong shape
-                    self._end(job, error=_said(exc))
-                    return
                 if status.state == "failed":
                     self._end(job, error=status.error or "the vendor failed it")
                     return
@@ -845,22 +707,20 @@ class Videogen:
             self.tasks.pop(job.id, None)
             self.ended.setdefault(job.id, asyncio.Event()).set()
 
-    async def _collect(self, job: Job, vendor: Any, status: Status) -> None:
+    async def _collect(self, job: Job, vendor: Vendor, status: Status) -> None:
         data = b""
         for attempt in range(RETRIES):
             try:
                 data = await vendor.download(status, max(self.timeout(), 300.0))
                 break
-            except Retry as exc:
-                if attempt == RETRIES - 1:
-                    self._end(job, error=str(exc), cost=status.cost)
-                    return
-                await asyncio.sleep(self.interval)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self._end(job, error=_said(exc), cost=status.cost)
-                return
+                if not _retryable(exc) or attempt == RETRIES - 1:
+                    error = str(exc) if _retryable(exc) else _said(exc)
+                    self._end(job, error=error, cost=status.cost)
+                    return
+                await asyncio.sleep(self.interval)
         media_type = sniff_video(data)
         if not media_type:
             self._end(
@@ -1133,7 +993,7 @@ class GenerateVideo(Tool):
 
     def _submitted(
         self,
-        vendor: Any,
+        vendor: Vendor,
         remote: str,
         request: Request,
         target: str,
@@ -1213,12 +1073,12 @@ class GenerateVideo(Tool):
         return target.relative_to(self.workspace).as_posix()
 
 
-def _submission(vendor: Any, request: Request) -> dict[str, Any]:
+def _submission(vendor: Vendor, request: Request) -> dict[str, Any]:
     """What a submission record says. Never the prompt: it is the tool call's
     own argument, already in that record."""
     arguments: dict[str, Any] = {
         "vendor": vendor.name,
-        "model": getattr(vendor, "model", ""),
+        "model": vendor.model,
         "frames": request.frames,
     }
     for key in ("seconds", "aspect", "resolution"):
