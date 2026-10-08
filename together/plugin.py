@@ -120,22 +120,13 @@ class TogetherProvider(OpenAICompatProvider):
 # Together, never before.
 
 IMAGES_URL = f"{BASE_URL}/images/generations"
-IMAGE_SIZES = {"square": (1024, 1024), "landscape": (1216, 832), "portrait": (832, 1216)}
-"""Pixels, not a ratio: Together takes `width` and `height`. Near 3:2, in 64s."""
+IMAGE_SIZES = ("1024x1024", "1216x832", "832x1216")
+"""Pixels, not a ratio: Together takes `width` and `height`. Square and near 3:2,
+in 64s; a shape asked for is made as the nearest of these."""
 VIDEOS_URL = "https://api.together.ai/v2/videos"
 """Videos are Together's `v2`; everything else here is `v1`."""
-VIDEO_SIZES = {
-    ("landscape", "480p"): (854, 480),
-    ("landscape", "720p"): (1280, 720),
-    ("landscape", "1080p"): (1920, 1080),
-    ("portrait", "480p"): (480, 854),
-    ("portrait", "720p"): (720, 1280),
-    ("portrait", "1080p"): (1080, 1920),
-    ("square", "480p"): (480, 480),
-    ("square", "720p"): (720, 720),
-    ("square", "1080p"): (1080, 1080),
-}
-"""Pixels, not a ratio: Together takes `width` and `height`."""
+TOGETHER_IMAGE_TO_VIDEO_MODELS = ("Wan-AI/Wan2.2-I2V-A14B",)
+"""OpenClaw's: the Together video model that starts from a picture."""
 PICTURE_MAX_BYTES = 64 * 1024 * 1024
 """A picture comes back as base64, a third larger than its bytes."""
 VIDEO_MAX_BYTES = 512 * 1024 * 1024
@@ -150,15 +141,33 @@ CODE = re.compile(r"[^A-Za-z0-9_.-]+")
 USER_AGENT = "ultron-together"
 
 
-class Made:
-    """A picture, as imagegen reads one: the bytes, the model, a cost."""
+class Pictures:
+    """What imagegen reads back: `images` (each with `data`), the model, a cost.
+    `data` is the first, for an imagegen before 4.0."""
 
-    __slots__ = ("cost", "data", "model")
+    __slots__ = ("cost", "images", "model")
 
-    def __init__(self, data: bytes, model: str = "", cost: str = "") -> None:
-        self.data = data
+    def __init__(self, images: list[bytes], model: str = "", cost: str = "") -> None:
+        self.images = [Picture(data) for data in images]
         self.model = model
         self.cost = cost
+
+    @property
+    def data(self) -> bytes:
+        return self.images[0].data
+
+
+class Picture:
+    __slots__ = ("data",)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+
+
+def _wants(request: Any, name: str, default: Any = "") -> Any:
+    """A field of imagegen's or videogen's request, or its default when an
+    older one sent a request without it."""
+    return getattr(request, name, default)
 
 
 class Status:
@@ -188,7 +197,19 @@ class TogetherImages:
     edits = False
     """`image_url` exists for some models, but nothing says it takes a data URI, and
     a workspace picture is not at a public URL."""
-    masks = False
+    capabilities = {
+        "generate": {
+            "max_count": 4,
+            "supports_size": True,
+            "supports_aspect_ratio": False,
+            "supports_resolution": False,
+        },
+        "edit": {"enabled": False},
+        "geometry": {"sizes": IMAGE_SIZES},
+        "output": {},
+    }
+    """Together has no counterpart in OpenClaw; this is what its endpoint takes:
+    `width` and `height` and `n`, and no quality, format or background."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -199,7 +220,7 @@ class TogetherImages:
     def ready(self) -> str:
         return "" if self._key else "no together key (ultron auth add together)"
 
-    async def generate(self, request: Any) -> Made:
+    async def generate(self, request: Any) -> Pictures:
         from ultron.sdk.web import post
 
         if not request.prompt.strip():
@@ -209,12 +230,13 @@ class TogetherImages:
         body: dict[str, Any] = {
             "model": self.model,
             "prompt": request.prompt,
-            "n": 1,
+            "n": max(1, min(4, int(_wants(request, "count", 1) or 1))),
             "response_format": "base64",
             "output_format": "png",
         }
-        if request.aspect in IMAGE_SIZES:
-            body["width"], body["height"] = IMAGE_SIZES[request.aspect]
+        size = re.fullmatch(r"(\d+)x(\d+)", str(_wants(request, "size") or ""))
+        if size:
+            body["width"], body["height"] = int(size[1]), int(size[2])
         response = await post(
             IMAGES_URL,
             json=body,
@@ -226,7 +248,7 @@ class TogetherImages:
         parsed = _json(response.body)
         if response.status >= 400:
             raise RuntimeError(_failure(parsed, response.status, ("code", "type")))
-        return Made(_first_b64(parsed), model=self.model)
+        return Pictures(_all_b64(parsed), model=self.model)
 
 
 class TogetherVideo:
@@ -244,23 +266,33 @@ class TogetherVideo:
     def ready(self) -> str:
         return "" if self._key else "no together key (ultron auth add together)"
 
-    def cannot(self, request: Any) -> str:
-        return ""
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """OpenClaw's Together video provider: up to ten seconds, sized in
+        pixels, and one picture to start from on the image-to-video model."""
+        starts = self.model in TOGETHER_IMAGE_TO_VIDEO_MODELS
+        return {
+            "generate": {"max_videos": 1, "max_duration_seconds": 10, "supports_size": True},
+            "image_to_video": {
+                "enabled": True,
+                "max_input_images": 1 if starts else 0,
+                "max_duration_seconds": 10,
+                "supports_size": True,
+            },
+            "video_to_video": {"enabled": False},
+        }
 
     async def submit(self, request: Any) -> str:
         body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["seconds"] = str(request.seconds)
-        if request.aspect or request.resolution:
-            shape = (request.aspect or "landscape", request.resolution or "720p")
-            body["width"], body["height"] = VIDEO_SIZES[shape]
-        frames = [
-            {"input_image": base64.b64encode(frame.data).decode("ascii"), "frame": kind}
-            for kind, frame in (("first", request.first), ("last", request.last))
-            if frame is not None
-        ]
-        if frames:
-            body["frame_images"] = frames
+        duration = int(_wants(request, "duration_seconds", 0) or getattr(request, "seconds", 0))
+        if duration:
+            body["seconds"] = max(1, min(10, duration))
+        size = re.fullmatch(r"(\d+)x(\d+)", str(_wants(request, "size") or ""))
+        if size:
+            body["width"], body["height"] = int(size[1]), int(size[2])
+        images = list(getattr(request, "images", ()) or ())
+        if images:
+            body["media"] = {"reference_images": [_data_uri(images[0])]}
         parsed = await _call(
             "POST", VIDEOS_URL, headers=self._headers(), timeout=request.timeout, body=body
         )
@@ -376,14 +408,21 @@ def _failure(
     return f"HTTP {status} from Together" + (f" ({named})" if named else "")
 
 
-def _first_b64(parsed: Mapping[str, Any]) -> bytes:
-    """The first picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
+def _all_b64(parsed: Mapping[str, Any]) -> list[bytes]:
+    """Every picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
     rows = parsed.get("data")
-    first = rows[0] if isinstance(rows, list) and rows else None
-    encoded = first.get("b64_json") if isinstance(first, Mapping) else None
-    if not encoded:
+    found = [
+        base64.b64decode(str(row["b64_json"]))
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, Mapping) and row.get("b64_json")
+    ]
+    if not found:
         raise RuntimeError("Together sent no picture")
-    return base64.b64decode(str(encoded))
+    return found
+
+
+def _data_uri(image: Any) -> str:
+    return f"data:{image.media_type};base64,{base64.b64encode(image.data).decode('ascii')}"
 
 
 def _code(value: Any) -> str:

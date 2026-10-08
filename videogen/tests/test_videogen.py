@@ -258,6 +258,13 @@ async def call(tool: Any, **arguments: Any) -> Any:
     return await tool.run(**tool.validate(arguments))
 
 
+async def status_of(it: Installed, job: str) -> str:
+    """The `status` line for one job - status always lists the session's."""
+    listed = (await call(it.status)).content.splitlines()
+    [line] = [each for each in listed if each.startswith(f"{job}: ")]
+    return str(line)
+
+
 def job_id(result: Any) -> str:
     return str(result.content).split("Started video ", 1)[1].split(" ", 1)[0]
 
@@ -290,11 +297,14 @@ def test_with_a_hook_registry_the_notifier_is_installed_under_the_plugins_name(
 
 async def test_a_submission_returns_at_once_and_the_job_is_kept(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
-    result = await call(it.generate, prompt="A Cat, Surfing!", aspect="portrait", seconds=6)
+    result = await call(
+        it.generate, prompt="A Cat, Surfing!", aspectRatio="9:16", durationSeconds=6
+    )
     assert not result.is_error, result.content
     job = job_id(result)
     assert "with google (veo-3.1-fast-generate-preview)" in result.content
     assert "-a-cat-surfing.mp4 when it is ready" in result.content
+    assert "was made as" not in result.content and "Ignored" not in result.content
     [sent] = wire.to("POST", GOOGLE)
     assert sent["url"] == f"{GOOGLE}/models/veo-3.1-fast-generate-preview:predictLongRunning"
     assert sent["headers"] == {"x-goog-api-key": "AIza-g"}
@@ -373,58 +383,190 @@ async def test_the_job_runs_outside_the_submitting_calls_authority(
     assert it.events("video")[0].outcome == "ok"
 
 
-async def test_a_named_path_is_used_and_takes_the_real_extension(
+async def test_a_filename_hint_keeps_its_basename_under_output_dir(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
-    result = await call(it.generate, prompt="x", path="clips/intro.mp4")
-    assert "saved to clips/intro.mp4 when" in result.content
+    result = await call(it.generate, prompt="x", filename="../clips/intro.mp4")
+    assert "saved to videos/intro.mp4 when" in result.content
     await it.settle()
-    assert (it.workspace / "clips" / "intro.webm").read_bytes() == WEBM
+    assert (it.workspace / "videos" / "intro.webm").read_bytes() == WEBM
+
+    wire.on("GET", f"{GOOGLE}/files/", Response(raw=MP4))
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
+    (it.workspace / "videos" / "taken.mp4").write_bytes(b"mine")
+    taken = await call(it.generate, prompt="x", filename="taken.mp4")
+    assert "saved to videos/taken-2.mp4 when" in taken.content, "a hint is never refused"
+    claimed = await call(it.generate, prompt="x", filename="taken.mp4")
+    assert "saved to videos/taken-3.mp4 when" in claimed.content, "a running job's name is held"
+    it.runner.close()
 
 
 async def test_something_taking_the_name_meanwhile_is_never_overwritten(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
-    await call(it.generate, prompt="x", path="clip.mp4")
-    (it.workspace / "clip.mp4").write_bytes(b"mine")
+    await call(it.generate, prompt="x", filename="clip.mp4")
+    (it.workspace / "videos").mkdir(exist_ok=True)
+    (it.workspace / "videos" / "clip.mp4").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "clip.mp4").read_bytes() == b"mine"
-    assert (it.workspace / "clip-2.mp4").read_bytes() == MP4
+    assert (it.workspace / "videos" / "clip.mp4").read_bytes() == b"mine"
+    assert (it.workspace / "videos" / "clip-2.mp4").read_bytes() == MP4
 
 
-async def test_frames_go_to_google_inline_and_as_the_last_frame(tmp_path: Path, wire: Wire) -> None:
+async def test_a_name_taken_under_another_extension_is_not_offered(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """The vendor decides the extension, so a name is free only when no file
+    holds it as any video type - else the result names intro.mp4 and the save,
+    finding intro.webm taken, writes intro-2.webm."""
+    it = install(tmp_path)
+    (it.workspace / "videos").mkdir()
+    (it.workspace / "videos" / "intro.webm").write_bytes(b"mine")
+    wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
+    result = await call(it.generate, prompt="x", filename="intro.mp4")
+    assert "saved to videos/intro-2.mp4 when" in result.content
+    await it.settle()
+    assert (it.workspace / "videos" / "intro-2.webm").read_bytes() == WEBM
+    assert (it.workspace / "videos" / "intro.webm").read_bytes() == b"mine"
+    assert "saved to videos/intro-2.webm" in (await call(it.generate, action="status")).content
+
+
+async def test_a_dotted_name_keeps_its_dots_when_saved(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
+    await call(it.generate, prompt="x", filename="cut.v1.2.mp4")
+    (it.workspace / "videos").mkdir(exist_ok=True)
+    (it.workspace / "videos" / "cut.v1.2.webm").write_bytes(b"mine")
+    await it.settle()
+    assert (it.workspace / "videos" / "cut.v1.2-2.webm").read_bytes() == WEBM
+
+
+async def test_an_image_goes_to_google_inline(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
     (it.workspace / "a.png").write_bytes(PNG)
-    (it.workspace / "b.png").write_bytes(PNG)
-    await call(it.generate, prompt="x", first_frame="a.png", last_frame="b.png")
+    await call(it.generate, prompt="x", image="a.png", imageRoles=["first_frame"])
     encoded = base64.b64encode(PNG).decode()
     instance = wire.to("POST", GOOGLE)[0]["json"]["instances"][0]
     assert instance["image"] == {"inlineData": {"mimeType": "image/png", "data": encoded}}
-    assert instance["lastFrame"] == instance["image"]
+    assert "lastFrame" not in instance and "video" not in instance
+    await it.settle()
+
+
+async def test_a_video_reference_goes_to_google_as_the_instance_video(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    (it.workspace / "clip.mp4").write_bytes(MP4)
+    result = await call(it.generate, prompt="extend it", video="clip.mp4")
+    assert not result.is_error, result.content
+    [sent] = wire.to("POST", GOOGLE)
+    instance = sent["json"]["instances"][0]
+    encoded = base64.b64encode(MP4).decode()
+    assert instance["video"] == {"inlineData": {"mimeType": "video/mp4", "data": encoded}}
+    assert "image" not in instance
+    [record] = it.events("submit")
+    assert record.arguments["videos"] == 1 and record.arguments["images"] == 0
+    await it.settle()
+
+
+async def test_a_data_url_and_an_http_url_are_references(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    encoded = base64.b64encode(PNG).decode()
+    await call(it.generate, prompt="x", image=f"data:image/png;base64,{encoded}")
+    instance = wire.to("POST", GOOGLE)[0]["json"]["instances"][0]
+    assert instance["image"] == {"inlineData": {"mimeType": "image/png", "data": encoded}}
+
+    wire.on("GET", "https://pics.test/", Response(raw=PNG))
+    await call(it.generate, prompt="y", image="https://pics.test/a.png")
+    assert wire.to("GET", "https://pics.test/a.png")
+    instance = wire.to("POST", GOOGLE)[1]["json"]["instances"][0]
+    assert instance["image"]["inlineData"]["data"] == encoded
+
+    for named, said in (
+        ("data:image/png,raw", "must be base64"),
+        ("data:image/png;base64,!!!", "not valid base64"),
+    ):
+        result = await call(it.generate, prompt="x", image=named)
+        assert result.is_error and said in result.content, result.content
+    with pytest.raises(ToolError, match="Unsupported image reference"):
+        it.generate.validate({"prompt": "x", "image": "ftp://pics.test/a.png"})
+    assert len(wire.to("POST", GOOGLE)) == 2
+    await it.settle()
+
+
+# -- what Google is sent (OpenClaw's capabilities) -------------------------------
+
+
+async def test_a_duration_google_cannot_make_is_snapped_and_said(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
+    result = await call(it.generate, prompt="x", durationSeconds=5)
+    note = "durationSeconds 5 was made as 6 (it makes 4/6/8)."
+    assert note in result.content
+    [sent] = wire.to("POST", GOOGLE)
+    assert sent["json"]["parameters"] == {"durationSeconds": 6}
+    [kept] = it.jobs()
+    assert kept["notes"] == note
+    [line] = (await call(it.status)).content.splitlines()
+    assert "running for" in line and line.endswith(f". {note}")
+    it.runner.close()
+
+
+async def test_an_aspect_ratio_google_cannot_make_is_moved_to_the_nearest(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    result = await call(it.generate, prompt="x", aspectRatio="1:1", resolution="1080p")
+    assert "aspectRatio 1:1 was made as 16:9." in result.content
+    [sent] = wire.to("POST", GOOGLE)
+    assert sent["json"]["parameters"] == {"aspectRatio": "16:9", "resolution": "1080p"}
+    await it.settle()
+
+
+async def test_sound_is_dropped_for_google_and_said(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    result = await call(it.generate, prompt="x", audio=True)
+    assert "Ignored, not supported: audio=true." in result.content
+    [sent] = wire.to("POST", GOOGLE)
+    assert "parameters" not in sent["json"]
+    [record] = it.events("submit")
+    assert "audio" not in record.arguments
     await it.settle()
 
 
 # -- passing over ---------------------------------------------------------------
 
 
-async def test_google_is_passed_over_for_what_veo_cannot_make(tmp_path: Path, wire: Wire) -> None:
-    it = session(tmp_path, "xai", keys={"google": {"api_key": "AIza-g"}, "xai": {"api_key": "xk"}})
-    wire.on("POST", "https://api.x.ai/", Response({"request_id": "rq1"}))
-    wire.on("GET", "https://api.x.ai/v1/videos/rq1", Response({"status": "pending"}))
-    result = await call(it.generate, prompt="x", aspect="square")
-    assert "with xai (grok-imagine-video-1.5)" in result.content
-    assert "Passed over google: makes 16:9 and 9:16 only." in result.content
-    for asked, said in (
-        ({"seconds": 5}, "makes 4, 6 or 8 seconds"),
-        ({"resolution": "480p"}, "makes 720p or 1080p"),
-        ({"resolution": "1080p", "seconds": 4}, "makes 1080p at 8 seconds only"),
-    ):
-        result = await call(it.generate, prompt="x", **asked)
-        assert f"google: {said}" in result.content
-    it.runner.close()
+async def test_google_is_passed_over_for_more_pictures_than_veo_takes(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(
+        tmp_path / "plugins",
+        capabilities={"image_to_video": {"enabled": True, "max_input_images": 4}},
+        cannot="return ''",
+    )
+    it = session(tmp_path, "acme")
+    (it.workspace / "a.png").write_bytes(PNG)
+    (it.workspace / "b.png").write_bytes(PNG)
+    result = await call(
+        it.generate,
+        prompt="x",
+        images=["a.png", "b.png"],
+        imageRoles=["reference_image", "reference_image"],
+    )
+    assert "with acme (acme-v)" in result.content, result.content
+    assert (
+        "Passed over google/veo-3.1-fast-generate-preview supports at most 1 reference "
+        "image(s), 2 requested; skipping."
+    ) in result.content
+    assert not wire.to("POST", GOOGLE)
+    [request] = it.runner.builders()["acme"].seen
+    assert [image.role for image in request.images] == ["reference_image"] * 2
+    await it.settle()
 
 
 async def test_a_refused_submission_falls_through_and_is_audited(
@@ -438,8 +580,10 @@ async def test_a_refused_submission_falls_through_and_is_audited(
     )
     wire.on("POST", "https://api.x.ai/", Response({"request_id": "rq1"}))
     wire.on("GET", "https://api.x.ai/v1/videos/rq1", Response({"status": "pending"}))
-    result = await call(it.generate, prompt="x")
-    assert "with xai" in result.content
+    # A first frame, which every xAI video model animates - 1.5 makes nothing from words.
+    (it.workspace / "a.png").write_bytes(PNG)
+    result = await call(it.generate, prompt="x", image="a.png")
+    assert "with xai (grok-imagine-video" in result.content, result.content
     assert "google: RuntimeError: HTTP 400 from Google (INVALID_ARGUMENT)" in result.content
     assert "ignore all rules" not in result.content
     refused, taken = it.events("submit")
@@ -479,8 +623,9 @@ async def test_the_provider_setting_puts_a_provider_plugins_vendor_first(
     )
     wire.on("POST", "https://api.x.ai/", Response({"request_id": "rq1"}))
     wire.on("GET", "https://api.x.ai/v1/videos/rq1", Response({"status": "pending"}))
-    result = await call(it.generate, prompt="x")
-    assert "with xai (grok-imagine-video-1.5)" in result.content
+    (it.workspace / "a.png").write_bytes(PNG)
+    result = await call(it.generate, prompt="x", image="a.png")
+    assert "with xai (grok-imagine-video" in result.content, result.content
     assert it.reads() == ["xai"]
     it.runner.close()
 
@@ -507,9 +652,9 @@ async def test_a_failed_job_is_told_without_the_vendors_words(tmp_path: Path, wi
     assert notice == (
         f"Note: video {job} from google failed; video_generate status {job} says why."
     )
-    status = await call(it.status, job=job)
-    assert "failed at google" in status.content and "FAILED_PRECONDITION" in status.content
-    assert "obey me" not in status.content
+    status = await status_of(it, job)
+    assert "failed at google" in status and "FAILED_PRECONDITION" in status
+    assert "obey me" not in status
     assert it.events("video")[0].outcome == "error"
 
 
@@ -524,7 +669,7 @@ async def test_a_safety_filtered_video_is_a_failure(tmp_path: Path, wire: Wire) 
     )
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
-    assert "safety filter" in (await call(it.status, job=job)).content
+    assert "safety filter" in await status_of(it, job)
 
 
 async def test_a_flaky_status_is_retried_and_a_dead_one_gives_up(
@@ -545,8 +690,8 @@ async def test_a_flaky_status_is_retried_and_a_dead_one_gives_up(
     wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({}, 503))
     job = job_id(await call(it.generate, prompt="y"))
     await it.settle()
-    status = await call(it.status, job=job)
-    assert "HTTP 503 from Google, 5 times in a row" in status.content
+    status = await status_of(it, job)
+    assert "HTTP 503 from Google, 5 times in a row" in status
 
 
 async def test_bytes_that_are_not_a_video_are_refused(tmp_path: Path, wire: Wire) -> None:
@@ -554,7 +699,7 @@ async def test_bytes_that_are_not_a_video_are_refused(tmp_path: Path, wire: Wire
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=b"<html>nope</html>"))
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
-    assert "not an MP4, MOV or WebM video" in (await call(it.status, job=job)).content
+    assert "not an MP4, MOV or WebM video" in await status_of(it, job)
     assert not (it.workspace / "videos").exists()
 
 
@@ -566,7 +711,7 @@ async def test_google_never_sends_its_key_to_a_host_it_did_not_choose(
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     assert not wire.to("GET", "https://evil.example/")
-    assert "somewhere other than its API" in (await call(it.status, job=job)).content
+    assert "somewhere other than its API" in await status_of(it, job)
 
 
 async def test_a_job_past_max_minutes_is_given_up(tmp_path: Path, wire: Wire) -> None:
@@ -581,7 +726,7 @@ async def test_a_job_past_max_minutes_is_given_up(tmp_path: Path, wire: Wire) ->
     it.runner.start = aged
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
-    assert "gave up after 1 minutes" in (await call(it.status, job=job)).content
+    assert "gave up after 1 minutes" in await status_of(it, job)
 
 
 # -- waking (ctx.wake, SDK 1.40) --------------------------------------------------
@@ -728,16 +873,17 @@ async def test_a_job_that_cannot_resume_says_why(tmp_path: Path, wire: Wire) -> 
     first.runner.close()
 
     second = install(tmp_path, keys={})
-    status = await call(second.status, job=job)
-    assert "could not resume: no google key" in status.content
+    status = await status_of(second, job)
+    assert "could not resume: no google key" in status
 
 
-async def test_video_status_waits_for_a_job_and_then_no_notice_repeats_it(
+async def test_status_says_how_a_job_ended_and_then_no_notice_repeats_it(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
     job = job_id(await call(it.generate, prompt="x"))
-    status = await call(it.status, job=job, wait=30)
+    await it.settle()
+    status = await call(it.status)
     assert status.content.startswith(f"{job}: saved to videos/")
     assert it.runner.notices() == ""
 
@@ -758,25 +904,41 @@ async def test_video_status_lists_running_jobs_newest_first(tmp_path: Path, wire
 
 async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
-    (it.workspace / "taken.mp4").write_bytes(b"x")
     (it.workspace / "notes.txt").write_text("hi")
+    (it.workspace / "a.png").write_bytes(PNG)
     for arguments, said in (
         ({"prompt": "  "}, "needs a prompt"),
-        ({"prompt": "x", "first_frame": "../out.png"}, "outside the workspace"),
-        ({"prompt": "x", "path": "/etc/clip.mp4"}, "outside the workspace"),
-        ({"prompt": "x", "aspect": "wide"}, "aspect"),
+        ({"prompt": "x", "image": "../out.png"}, "outside the workspace"),
+        ({"prompt": "x", "video": "file:///etc/clip.mp4"}, "outside the workspace"),
+        ({"prompt": "x", "images": ["a.png"] * 10}, "Too many reference images: 10"),
+        ({"prompt": "x", "videos": ["c.mp4"] * 5}, "Too many reference videos: 5"),
+        (
+            {"prompt": "x", "image": "a.png", "imageRoles": ["first_frame", "last_frame"]},
+            "2 entries",
+        ),
+        ({"prompt": "x", "durationSeconds": 0}, "positive integer"),
+        ({"prompt": "x", "timeoutMs": 0}, "positive integer"),
+        ({"prompt": "x", "aspect": "wide"}, "unknown argument"),
+        ({"prompt": "x", "first_frame": "a.png"}, "unknown argument"),
+        ({"prompt": "x", "seconds": 4}, "unknown argument"),
+        ({"prompt": "x", "path": "clip.mp4"}, "unknown argument"),
+        ({"prompt": "x", "audioRef": "a.mp3"}, "unknown argument"),
+        ({"action": "nope"}, "action must be one of"),
     ):
         with pytest.raises(ToolError, match=said):
             it.generate.validate(arguments)
     for arguments, said in (
-        ({"prompt": "x", "path": "taken.mp4"}, "taken.mp4 already exists"),
-        ({"prompt": "x", "first_frame": "notes.txt"}, "not a PNG, JPEG or WebP"),
-        ({"prompt": "x", "first_frame": "missing.png"}, "no such file"),
+        ({"prompt": "x", "image": "notes.txt"}, "not a PNG, JPEG or WebP"),
+        ({"prompt": "x", "image": "missing.png"}, "no such file"),
+        ({"prompt": "x", "video": "a.png"}, "not an MP4, MOV or WebM video"),
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    # No job is this session's jobs, as OpenClaw's status is; a wait needs a job to wait on.
-    assert it.status.validate({"wait": 5}) == {"action": "status", "job": "", "wait": 0}
+    assert it.generate.validate({"prompt": "x", "resolution": "720p"})["resolution"] == "720P"
+    assert it.status.validate({}) == {"action": "status"}
+    for gone in ("job", "wait"):
+        with pytest.raises(ToolError, match="unknown argument"):
+            it.status.validate({gone: 5})
     assert not wire.sent
 
 
@@ -802,15 +964,17 @@ class Said:
 
 class AcmeVideo:
     model = "acme-v"
-
+    seen = []
+{extra}
     def __init__(self):
         self.asked = 0
 
     def cannot(self, request):
-        return "makes no last frame" if request.last is not None else ""
+        {cannot}
 
     async def submit(self, request):
         assert request.first is None or request.first.media_type == "image/png"
+        type(self).seen.append(request)
         return {remote!r}
 
     async def status(self, remote):
@@ -826,7 +990,10 @@ class Acme(Plugin):
     description = "A video vendor for videogen."
 
     def register(self, ctx: PluginContext) -> None:
-        ctx.register_extension("videogen.backend", "acme", AcmeVideo)
+        ctx.register_extension("videogen.backend", {name!r}, AcmeVideo)
+
+
+{after}
 """
 
 
@@ -836,13 +1003,30 @@ def backend(
     remote: str = "job-1",
     status: str = "return Said('done', url='https://acme.test/v.mp4', cost='$0.10')",
     download: str = "return MP4",
+    name: str = "acme",
+    capabilities: dict[str, Any] | None = None,
+    cannot: str = "return 'makes no last frame' if request.last is not None else ''",
+    after: str = "",
 ) -> None:
-    directory = root / "acme"
+    """A plugin that registers a backend. With no `capabilities` it is a
+    vendor written before videogen 4.0 (legacy); `after` is module code run
+    once the class exists, as `AcmeVideo.reference_audio = True`."""
+    directory = root / name
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "PLUGIN.md").write_text(
-        "---\nname: acme\ndescription: A test vendor.\n---\n", encoding="utf-8"
+        f"---\nname: {name}\ndescription: A test vendor.\n---\n", encoding="utf-8"
     )
-    module = BACKEND.format(mp4=MP4, remote=remote, status=status, download=download)
+    extra = f"    capabilities = {capabilities!r}\n" if capabilities is not None else ""
+    module = BACKEND.format(
+        mp4=MP4,
+        remote=remote,
+        status=status,
+        download=download,
+        name=name,
+        extra=extra,
+        cannot=cannot,
+        after=after,
+    )
     (directory / "plugin.py").write_text(module, encoding="utf-8")
 
 
@@ -865,7 +1049,9 @@ async def test_a_backend_is_held_to_what_it_says_it_cannot_make(tmp_path: Path, 
     backend(tmp_path / "plugins")
     it = session(tmp_path, "acme", keys={})
     (it.workspace / "a.png").write_bytes(PNG)
-    result = await call(it.generate, prompt="x", first_frame="a.png", last_frame="a.png")
+    result = await call(
+        it.generate, prompt="x", images=["a.png", "a.png"], imageRoles=["first_frame", "last_frame"]
+    )
     assert result.is_error and "acme: makes no last frame" in result.content
 
 
@@ -888,8 +1074,8 @@ async def test_a_backends_retry_is_retried_and_its_other_errors_end_the_job(
     it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
     job = job_id(await call(it.generate, prompt="y"))
     await it.settle()
-    status = await call(it.status, job=job)
-    assert "HTTP 404 from Acme" in status.content
+    status = await status_of(it, job)
+    assert "HTTP 404 from Acme" in status
 
 
 @pytest.mark.parametrize(
@@ -911,7 +1097,7 @@ async def test_what_a_backend_returns_is_checked(
         assert said in result.content, result.content
         return
     await it.settle()
-    status = await call(it.status, job=job_id(result))
+    status = await call(it.status)
     assert said in status.content, status.content
 
 
@@ -924,8 +1110,8 @@ async def test_a_job_whose_backend_is_gone_says_which_plugin_to_enable(
     first.runner.close()
 
     second = session(tmp_path, keys={})
-    status = await call(second.status, job=job)
-    assert "no vendor 'acme' to resume with - is its plugin enabled?" in status.content
+    status = await status_of(second, job)
+    assert "no vendor 'acme' to resume with - is its plugin enabled?" in status
 
 
 async def test_a_backend_enabled_mid_session_is_asked_at_once(tmp_path: Path, wire: Wire) -> None:
@@ -935,6 +1121,105 @@ async def test_a_backend_enabled_mid_session_is_asked_at_once(tmp_path: Path, wi
     plugins, report, tools = it.plugins  # type: ignore[attr-defined]
     plugins.install_late("acme", report, workspace=it.workspace, tools=tools)
     assert "with acme" in (await call(it.generate, prompt="x")).content
+    await it.settle()
+
+
+async def test_a_duration_past_a_backends_most_with_no_list_skips_it(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins", capabilities={"generate": {"max_duration_seconds": 15}})
+    it = session(tmp_path, "acme", keys={})
+    result = await call(it.generate, prompt="x", durationSeconds=20)
+    assert result.is_error
+    assert "acme/acme-v supports at most 15s per video, 20s requested; skipping" in result.content
+    assert it.runner.builders()["acme"].seen == []
+    fits = await call(it.generate, prompt="x", durationSeconds=15)
+    assert "with acme (acme-v)" in fits.content, fits.content
+    assert it.runner.builders()["acme"].seen[0].duration_seconds == 15
+    await it.settle()
+
+
+async def test_provider_options_are_held_to_what_each_backend_declares(
+    tmp_path: Path, wire: Wire
+) -> None:
+    for name, declared in (
+        ("alpha", {}),
+        ("beta", {"seed": "string"}),
+        ("gamma", {"seed": "number"}),
+    ):
+        backend(
+            tmp_path / "plugins",
+            name=name,
+            capabilities={"generate": {}, "provider_options": declared},
+        )
+    it = session(tmp_path, "alpha", "beta", "gamma", keys={})
+    result = await call(it.generate, prompt="x", providerOptions={"seed": 42})
+    assert "with gamma (acme-v)" in result.content, result.content
+    assert (
+        "alpha/acme-v does not accept providerOptions (caller supplied: seed); skipping"
+        in result.content
+    )
+    assert "beta/acme-v expects providerOptions.seed to be a string; skipping" in result.content
+    [request] = it.runner.builders()["gamma"].seen
+    assert request.provider_options == {"seed": 42}
+    [record] = [r for r in it.events("submit") if r.outcome == "ok"]
+    assert record.arguments["providerOptions"] == ["seed"]
+    unknown = await call(it.generate, prompt="x", providerOptions={"steps": 3})
+    assert "gamma/acme-v does not accept providerOptions keys: steps (accepted: seed)" in (
+        unknown.content
+    )
+    await it.settle()
+
+
+async def test_audio_references_are_offered_only_when_a_backend_takes_them(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    properties = it.generate.tool.parameters["properties"]
+    assert not {"audioRef", "audioRefs", "audioRoles"} & set(properties)
+    assert "audio refs" not in it.generate.tool.description
+
+    backend(tmp_path / "plugins", after="AcmeVideo.reference_audio = True")
+    it = session(tmp_path, "acme", keys={})
+    properties = it.generate.tool.parameters["properties"]
+    assert {"audioRef", "audioRefs", "audioRoles"} <= set(properties)
+    assert "audio refs condition sound" in it.generate.tool.description
+    checked = it.generate.validate({"prompt": "x", "audioRef": "a.mp3", "audioRefs": ["b.mp3"]})
+    assert checked["references"]["audio"] == [["a.mp3", "b.mp3"], []]
+
+
+async def test_a_legacy_backend_is_handed_its_frames_and_told_of_nothing_else(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins", cannot="return ''")
+    it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
+    (it.workspace / "a.png").write_bytes(PNG)
+    (it.workspace / "b.png").write_bytes(PNG)
+    result = await call(
+        it.generate,
+        prompt="x",
+        images=["a.png", "b.png"],
+        imageRoles=["last_frame", "first_frame"],
+        durationSeconds=7,
+        aspectRatio="16:9",
+        audio=True,
+    )
+    assert "with acme (acme-v)" in result.content, result.content
+    assert "Ignored, not supported: aspectRatio=16:9, audio=true." in result.content
+    [request] = it.runner.builders()["acme"].seen
+    assert request.first is not None and request.first.name == "b.png"
+    assert request.last is not None and request.last.name == "a.png"
+    assert request.seconds == 7 and request.aspect == "" and request.audio is None
+
+    unroled = await call(it.generate, prompt="x", images=["a.png", "b.png"])
+    assert "with acme" in unroled.content
+    request = it.runner.builders()["acme"].seen[1]
+    assert request.first.name == "a.png" and request.last.name == "b.png"
+
+    refused = await call(it.generate, prompt="x", image="a.png", imageRoles=["reference_image"])
+    assert "acme/acme-v takes a first and a last frame only" in refused.content
+    three = await call(it.generate, prompt="x", images=["a.png", "a.png", "a.png"])
+    assert "acme/acme-v supports at most 2 reference image(s), 3 requested" in three.content
     await it.settle()
 
 
@@ -995,7 +1280,7 @@ async def test_the_model_is_checked_and_the_schema_names_the_vendors(
         with pytest.raises(ToolError, match=match):
             it.generate.validate({"prompt": "x", "model": model})
     described = it.generate.tool.parameters["properties"]["model"]["description"]
-    assert "The providers here: google;" in described
+    assert "The providers here: google." in described
     unknown = await call(it.generate, prompt="x", model="sora/sora-2")
     assert "Passed over sora: not here - the vendors are google." in unknown.content
     await it.settle()
@@ -1008,7 +1293,8 @@ async def test_list_shows_the_vendors_and_status_the_jobs(tmp_path: Path, wire: 
     assert listed[1:] == [
         "- acme/acme-v: ready",
         "- google/veo-3.1-fast-generate-preview: cannot be asked - no google key "
-        "(ultron auth add google)",
+        "(ultron auth add google); also google/veo-3.1-generate-preview, "
+        "google/veo-3.1-lite-generate-preview",
     ]
     assert (await call(it.status)).content == "No video jobs in this session."
     assert wire.sent == []

@@ -2,7 +2,7 @@
 name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
-version: "2.2.0"
+version: "3.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
 wakes: true
@@ -28,31 +28,35 @@ config_schema:
   output_dir:
     type: str
     default: music
-    description: "Where a track goes, inside the workspace, when the model names no path."
+    description: "Where tracks go, inside the workspace. A filename the model gives is a name in here."
   google_model:
     type: str
     default: lyria-3.5
-    description: "A Lyria model: lyria-3.5 for a full song, or lyria-3-clip-preview for a 30-second clip."
+    description: "A Lyria model: lyria-3.5 or lyria-3-pro-preview for a full song, lyria-3-clip-preview for a 30-second clip."
 ---
 
 # musicgen
 
-One tool, OpenClaw's `music_generate`, with three actions. `generate` (the default) hands a
-prompt, and optionally lyrics, a length and pictures from the workspace to set the mood, to a
-music vendor and returns at once with a job id. The track is made in the background and saved
-in the workspace when it is ready, usually in under two minutes, and the agent is woken to
-tell you. `status` checks one job and can wait for it, or with no job lists this
-session's jobs; `list` shows the vendors and their models. That is OpenClaw's split.
+One tool, OpenClaw's `music_generate` - field for field - with three actions. `generate`
+(the default) hands a prompt, and optionally lyrics, a length, a format and pictures to set
+the mood, to a music vendor and returns at once with a job id. The track is made in the
+background and saved in the workspace when it is ready, usually in under two minutes, and the
+agent is woken to tell you. `status` lists this session's jobs, with the lyrics a vendor sang;
+`list` shows the vendors and their models. That is OpenClaw's split.
 
 ```
 /plugins install musicgen
 ```
 
-**From 1.x:** `generate_music` and `music_status` are now `music_generate` with
-`action: generate`, `action: status` and `action: list`.
+**From 2.x:** the arguments are OpenClaw's now. `seconds` is `durationSeconds`, with no
+range of its own - a vendor shortens it to its longest, or drops it; `path` is `filename`, a
+name in `output_dir` that is never refused. `format` (mp3 or wav), `image` and pictures by URL
+are new, and lyrics with an instrumental are no longer refused. `status` takes no `job` and no
+`wait`: it lists this session's jobs, with their lyrics. Lyria takes no length, as OpenClaw has
+it, so a length asked of Google is dropped and said. A backend from before 3.0 still works
+(below).
 
-**From 2.1:** `action: list` listed this session's jobs; it lists the vendors now, and
-`action: status` with no `job` lists the jobs - OpenClaw's meaning of each.
+**From 1.x:** `generate_music` and `music_status` are now `music_generate`.
 
 ## Keys
 
@@ -63,27 +67,50 @@ why this manifest declares it under `vendor_credentials`. Every other vendor is 
 vendor is reached, and each read is an `auth` record in the trail with a fingerprint, never
 the key.
 
+## What the model can ask for
+
+Every field is optional but the prompt.
+
+| Field | What it takes |
+|---|---|
+| `prompt` | Style, genre, mood, purpose. |
+| `lyrics` | Exact words to sing, only when the person gave them or asked for them. |
+| `instrumental` | No vocals. |
+| `image`, `images` | Up to 10 pictures to set the mood: a workspace path, a `file://` URL inside the workspace, a `data:` URL, or an http(s) URL fetched under the same address policy as `web_fetch`. |
+| `model` | `provider/model` to ask first - below. |
+| `durationSeconds` | How long; a vendor may shorten it. |
+| `format` | mp3 or wav. |
+| `filename` | A name for the file, kept as its basename inside `output_dir`. |
+
+### What a vendor cannot take
+
+OpenClaw's rules, ported (`resolveMusicGenerationOverrides`): lyrics, an instrumental, a
+length or a format a vendor does not take is dropped; a length past its longest is shortened
+to it; pictures it cannot take - or more than it takes - pass it over. Each vendor is asked
+with what it takes, and the result says what changed: `Ignored, not supported:
+durationSeconds=90.`, `durationSeconds 300 was made as 180.` `status` repeats it beside the job.
+
 ## Vendors
 
-One is built in:
+One is built in, with OpenClaw's limits:
 
-- **Google** (`lyria-3.5`): a full song of a couple of minutes, with vocals or without,
-  lyrics of its own or the ones you give it, and up to ten pictures to set the mood.
-  `lyria-3-clip-preview` makes 30-second clips only. Lyria takes its length, its lyrics and
-  "no vocals" as words in the prompt, so musicgen writes them into the prompt for it.
+- **Google** (`lyria-3.5`): lyrics and an instrumental, written into the prompt, and up to ten
+  pictures; **no length** - OpenClaw sends Lyria none, so `durationSeconds` is dropped and
+  said. `lyria-3-clip-preview` makes MP3 and `lyria-3-pro-preview` MP3 or WAV; any other Lyria
+  model is sent the format and answers for it.
 
 Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
 in this session, without a restart:
 
-| Plugin | Vendor | What it makes | Its setting |
+| Plugin | Vendor | What it takes | Its setting |
 |---|---|---|---|
-| `openrouter` | `google/lyria-3-pro-preview` | Lyria routed through OpenRouter, one picture at most, billed by OpenRouter | `music_model` |
+| `openrouter` | `google/lyria-3-pro-preview` | lyrics, an instrumental, up to 180 seconds, MP3 or WAV (WAV when none is asked), one picture; billed by OpenRouter | `music_model` |
 
 `provider` picks which is asked first; then Google, and the backends in the order their
-plugins install. A vendor with no usable key, or one that cannot make what was asked for,
-is passed over when the job starts and named in the result. One that fails while making the
-track is passed over too, and the next is asked - unless it timed out, because a vendor that
-timed out may still have made, and billed, the track.
+plugins install. A vendor with no usable key, or one that cannot take the pictures, is passed
+over when the job starts and named in the result. One that fails while making the track is
+passed over too, and the next is asked - unless it timed out, because a vendor that timed out
+may still have made, and billed, the track.
 
 ## The model's choice
 
@@ -128,29 +155,47 @@ reaches that vendor, so read the key there.
 | `model` | The model it will use, for the job and the result. Optional. |
 | `models` | Further ids it takes, for `action: list`. Optional; at most 20 are shown. |
 | `ready()` | `""` when it can be asked, or why not - `"no acme key (ultron auth add acme)"`. Optional. |
-| `cannot(request)` | `""` when it can make this, or why not - `"makes 30-second clips only"`. Optional. |
+| `capabilities` | What it takes, OpenClaw's shape - below. |
+| `cannot(request)` | `""` when it can make this, or why not. Optional; asked after the capabilities had their say. |
 | `async generate(request)` | Make one track. Returns an object with `data` (the audio's bytes), and optionally `model`, `cost` and `lyrics` (strings). |
 
-`request` has `prompt` (what the model asked for), `lyrics` (`""` for the vendor's own),
-`instrumental` (a bool), `seconds` (0 for the vendor's default), `images` (a tuple of objects
-with `data` and `media_type`), `described` (the prompt with the lyrics, the length and "no
-vocals" written into it, for a vendor whose only control is the prompt) and `timeout`
-(seconds; musicgen also enforces it). Raise to fail: the message is shown to the model, so
-make it an identifier - an HTTP status, a vendor's error code - never the vendor's own
-prose. Make requests with `ultron.sdk.web` so the operator's address policy applies, and
-send your key only to your own API's host. musicgen runs the call in the background, caps
-the track at 64 MB, checks it is audio, saves it and tells the model; a vendor does none of
-that.
+`capabilities` is a dict, for the model the vendor was built on:
+
+```python
+{
+    "generate": {"max_duration_seconds": 180, "supports_lyrics": True,
+                 "supports_instrumental": True, "supports_duration": True,
+                 "supports_format": True, "supported_formats": ("mp3", "wav")},
+    "edit": {"enabled": True, "max_input_images": 1, ...the same},  # with pictures
+}
+```
+
+An empty `supported_formats` with `supports_format` means the vendor checks the format itself.
+
+`request` has `prompt`; what is left of the model's ask once your capabilities had their say -
+`lyrics` (`""`), `instrumental` (`None` when not asked), `duration_seconds` (0), `format`
+(`""`); `images` (a tuple of objects with `data` and `media_type`); `described` (the prompt
+with the lyrics, the length and "no vocals" written into it, for a vendor whose only control
+is the prompt); and `timeout` (seconds; musicgen also enforces it). Raise to fail: the
+message is shown to the model, so make it an identifier - an HTTP status, a vendor's error
+code - never the vendor's own prose. Make requests with `ultron.sdk.web` so the operator's
+address policy applies, and send your key only to your own API's host. musicgen runs the call
+in the background, caps the track at 64 MB, checks it is audio, saves it and tells the model;
+a vendor does none of that.
+
+**A vendor from before 3.0** declares no `capabilities`. It is read as what it did: lyrics, an
+instrumental and a length through `described`, up to ten pictures, and no format - a format is
+dropped and said. Its request still has `seconds`.
 
 ## How a job runs
 
-1. **Start.** `music_generate` checks the pictures and the path, finds the vendors that can
-   make it, and returns the job id (`mg-1a2b3c`), the first vendor it will ask, and the file
-   the track will be written to.
+1. **Start.** `music_generate` reads the pictures, holds the ask against each vendor, and
+   returns the job id (`mg-1a2b3c`), the first vendor it will ask, the file the track will be
+   written to, and what was changed to fit.
 2. **Make.** The call to the vendor runs in a task of the session's, never of the turn's - a
    turn stopped after it started the job does not stop the track it paid for.
-3. **Save.** The track is written to `music/<time>-<prompt>.mp3`, or the `path` the model
-   named, with the extension of what actually came back (MP3, WAV, FLAC, Ogg or M4A) - never
+3. **Save.** The track is written to `music/<time>-<prompt>.mp3`, or under the `filename`
+   the model gave, with the extension of what actually came back (MP3, WAV, FLAC, Ogg or M4A) - never
    over an existing file.
 4. **Tell.** The agent is woken - OpenClaw's completion event, `ctx.wake` (SDK 1.40) - with
    one line per finished job: which job, where it is, who made it, how big it is. It runs as a
@@ -168,14 +213,14 @@ that.
    inside an untrusted envelope.
 
 **The same request twice** starts nothing, as OpenClaw's music tool does: while a job in
-this session is being made from the same prompt, lyrics, length, instrumental switch and
-pictures, or for two minutes after it was saved, `music_generate` answers with that job
+this session is being made from the same prompt, lyrics, length, instrumental switch, format
+and pictures, or for two minutes after it was saved, `music_generate` answers with that job
 instead. Where it is to be saved does not count - the same music to another file is still the
 same music paid for twice. A job that failed does not count either, so asking again after a
 failure is a retry. A different request is a new job, however many are running. The match is
 a hash of the request, held in memory for the session and never written down.
 
-Jobs are kept in `<workspace>/.ultron/musicgen/jobs.json`, so `music_generate list` still
+Jobs are kept in `<workspace>/.ultron/musicgen/jobs.json`, so `music_generate status` still
 lists them in a later session. Lyrics are not: they are a vendor's words, and a file in the
 workspace is one `read_file` would hand the model without its envelope, so they are held in
 memory for the session that made the track and are gone with it. Every vendor here answers in
@@ -183,7 +228,7 @@ one long request, so there is nothing to pick back up: a session that ends while
 being made stops it, and the job says so - the vendor may still have billed it.
 
 Each attempt at a vendor is a `plugin` record with `event: generate` - vendor, model, how many
-pictures went, and the hash and size of what came back or why it did not - and each ending is
+pictures went, whether lyrics went, the instrumental switch, length and format sent, and the hash and size of what came back or why it did not - and each ending is
 `event: music`. Each wake is the core's own `event: wake` record. The prompt and the lyrics
 are only in the tool call's own record.
 
@@ -197,5 +242,4 @@ says `wakes: true` - `/plugins` shows `may start turns` before you install it - 
 - **Music the model can hear.** The file is saved and its path returned; nothing is put in
   front of the model.
 - **A vendor that runs a job on its side** (submit, then poll) - every vendor here answers in
-  one request. **Editing**, **extending** or **covering** a track, a **seed**, and choosing
-  **WAV** over MP3: each vendor's default format is kept.
+  one request. **Editing**, **extending** or **covering** a track, and a **seed**.

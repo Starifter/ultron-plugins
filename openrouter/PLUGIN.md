@@ -1,7 +1,7 @@
 ---
 name: openrouter
 description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image, video and music models for imagegen, videogen and musicgen.
-version: "1.4.0"
+version: "1.5.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -144,17 +144,24 @@ registers itself into `imagegen.backend`, `videogen.backend` and `musicgen.backe
 1.39; an older Ultron gets the provider and the sign-in only). None of them needs a setting
 for it, and this one does not depend on them.
 
-- **Pictures** (`image_model`, default `openai/gpt-image-2`): generates and edits, no mask -
-  whichever image model `image_model` names, billed by OpenRouter.
-- **Videos** (`video_model`, default `google/veo-3.1`): whichever video model `video_model`
-  names, billed by OpenRouter; what it accepts is the model's business, and a refusal passes
-  to the next vendor. A first and a last frame go as `frame_images`. The finished video is
-  fetched from OpenRouter's own content URL, never from a link the reply names, because the
-  key goes with that request.
+Each says what it takes in the generating plugin's `capabilities` - OpenClaw's OpenRouter
+providers, value for value - so a value it cannot take is moved to the nearest or dropped, and
+the result says so:
+
+- **Pictures** (`image_model`, default `openai/gpt-image-2`): up to four at once, edits of up
+  to five pictures, ten shapes, 1K to 4K - whichever image model `image_model` names, billed by
+  OpenRouter.
+- **Videos** (`video_model`, default `google/veo-3.1`): 4, 6 or 8 seconds, 16:9 or 9:16, 720P
+  or 1080P, a size, the audio switch (`generate_audio`), up to four pictures - the first and
+  last frames as `frame_images`, `reference_image` ones as `input_references` - and a `seed`
+  in `providerOptions`. OpenClaw's `callback_url` is not taken: it would have OpenRouter post
+  to an address the model chose. The finished video is fetched from OpenRouter's own content
+  URL, never from a link the reply names, because the key goes with that request.
 - **Music** (`music_model`, default `google/lyria-3-pro-preview`): Chat Completions with
   audio out, which OpenRouter sends only as a stream; the stream is read whole and the track
   put back together from its chunks, with whatever the model wrote beside it as the lyrics.
-  One picture at most. `google/lyria-3-clip-preview` makes 30-second clips.
+  Lyrics, an instrumental, up to 180 seconds, MP3 or WAV - WAV when none is asked, as
+  OpenClaw sends - and one picture at most.
 
 All three spend the provider's credential - a key added by hand or the `openrouter:oauth`
 sign-in - read with `ctx.credential`, which is why the manifest lists `openrouter` under

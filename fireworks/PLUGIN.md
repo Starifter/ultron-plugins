@@ -1,7 +1,7 @@
 ---
 name: fireworks
 description: The Fireworks AI model provider - open models, hosted at Fireworks - and FLUX pictures for imagegen.
-version: "1.2.0"
+version: "1.3.0"
 requires_ultron_sdk: ">=1.25,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -66,8 +66,10 @@ registers itself into `imagegen.backend` (SDK 1.39; an older Ultron gets the pro
 imagegen needs no setting for it, and this plugin does not depend on it.
 
 - **Pictures** (`image_model`, default `flux-1-schnell-fp8`): a FLUX `text_to_image`
-  workflow, generating from words only. A bare name is one of Fireworks' own models; a full
-  `accounts/...` id is used as written.
+  workflow, one picture a call from words only, in nine shapes (1:1, 2:3, 3:2, 4:5, 5:4, 16:9,
+  9:16, 9:21, 21:9) - the nearest is made of any other, and a size becomes its shape. A bare
+  name is one of Fireworks' own models; a full `accounts/...` id is used as written. OpenClaw
+  has no Fireworks image provider; this is what the workflow takes.
 
 It spends the provider's key, read with `ctx.credential` - which is why the manifest lists
 `fireworks` under `vendor_credentials` - and only when imagegen reaches Fireworks. Each read

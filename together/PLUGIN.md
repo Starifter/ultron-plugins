@@ -1,7 +1,7 @@
 ---
 name: together
 description: The Together AI model provider - open models, hosted at Together - and Together's image and video models for imagegen and videogen.
-version: "1.2.0"
+version: "1.3.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -69,12 +69,16 @@ Together is one of their vendors: the plugin registers itself into `imagegen.bac
 `videogen.backend` (SDK 1.39; an older Ultron gets the provider only). Neither plugin needs
 a setting for it, and this one does not depend on them.
 
-- **Pictures** (`image_model`, default `black-forest-labs/FLUX.1-schnell`): generates from
-  words only, sized in pixels.
-- **Videos** (`video_model`, default `minimax/hailuo-02`): whichever video model
-  `video_model` names, sized in pixels, with a first and a last frame; what it accepts is
-  the model's business, and a refusal passes to the next vendor. The finished video is a
-  public link, fetched without the key.
+Each says what it takes in imagegen's and videogen's `capabilities`, so a value it cannot
+take is moved to the nearest or dropped, and the result says so:
+
+- **Pictures** (`image_model`, default `black-forest-labs/FLUX.1-schnell`): up to four at
+  once, from words only, at 1024x1024, 1216x832 or 832x1216 - a shape asked for is made as the
+  nearest of those. OpenClaw has no Together image provider; this is what the endpoint takes.
+- **Videos** (`video_model`, default `minimax/hailuo-02`): OpenClaw's Together provider - up
+  to 10 seconds, sized in pixels from `size`; a picture to start from only on
+  `Wan-AI/Wan2.2-I2V-A14B`, sent as `media.reference_images`. The finished video is a public
+  link, fetched without the key.
 
 Both spend the provider's key, read with `ctx.credential` - which is why the manifest lists
 `together` under `vendor_credentials` - and only when imagegen or videogen reaches Together.
