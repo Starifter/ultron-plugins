@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import re
 import time
@@ -59,6 +60,23 @@ HOSTS = {
 label. A backend says its own with `host`."""
 
 EXTENSIONS = {"image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp"}
+ACTIONS = ("generate", "list")
+MODEL_ARGUMENT = (
+    "Which vendor and model to ask first, as provider/model - {example} - or a provider "
+    "alone for the model the person configured there. The providers here: {vendors}; "
+    "`action: list` shows each one's model. Leave it out for the person's choice. If it "
+    "fails or cannot do what is asked, the others are tried on their own models and the "
+    "result says so."
+)
+LISTED_MODELS = 20
+"""The most extra model ids one vendor's line names."""
+VENDOR_NAME = re.compile(r"[a-z0-9_-]{1,64}")
+"""What `provider` may say: an extension's name is lower case, letters,
+digits, `_` and `-`."""
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
+"""What `model` may say. The model chose it and it goes into a vendor's URL
+path - `models/<id>:predict` - so nothing that steps out of a path segment
+or starts a query: no `..`, `//`, `?`, `#`, `%` or space."""
 
 
 def sniff(data: bytes) -> str:
@@ -404,7 +422,7 @@ class ImageGenerate(Tool):
     def __init__(self, ctx: PluginContext) -> None:
         self.ctx = ctx
         self.workspace = Path(ctx.workspace).resolve()
-        self.vendors: Callable[[], Iterable[tuple[str, Any]]] = self._vendors
+        self.vendors: Callable[[str, str], Iterable[tuple[str, Any]]] = self._vendors
 
     @property
     def description(self) -> str:  # type: ignore[override]
@@ -417,7 +435,8 @@ class ImageGenerate(Tool):
             "Not every vendor edits; one that cannot is passed over. Each call is one picture "
             "and costs money: do not make variations nobody asked for. You are shown the "
             "picture you made - look before saying it is right - and the result names the "
-            "file; give the person that path."
+            "file; give the person that path. `action: list` shows each vendor, whether it "
+            "can be asked, and its model, as `model` takes it."
         )
 
     @property
@@ -425,9 +444,15 @@ class ImageGenerate(Tool):
         return {
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": list(ACTIONS),
+                    "description": "generate (the default) or list.",
+                },
                 "prompt": {
                     "type": "string",
-                    "description": "What to make, or what to change in the pictures given.",
+                    "description": "What to make, or what to change in the pictures given. "
+                    "Needed to generate.",
                 },
                 "images": {
                     "type": "array",
@@ -450,12 +475,22 @@ class ImageGenerate(Tool):
                     "description": "Where to save it, relative to the workspace. Leave it out "
                     "for a new file. Never an existing file.",
                 },
+                "model": {
+                    "type": "string",
+                    "description": MODEL_ARGUMENT.format(
+                        vendors=", ".join(self._names()), example="openai/gpt-image-2"
+                    ),
+                },
             },
-            "required": ["prompt"],
         }
 
     def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_arguments(self.parameters, arguments, tool=self.name)
+        action = str(checked.get("action", "") or "generate").strip().lower()
+        if action not in ACTIONS:
+            raise ToolError(f"action must be one of: {', '.join(ACTIONS)}")
+        if action == "list":
+            return {"action": action}
         prompt = str(checked.get("prompt", "") or "")
         if not prompt.strip():
             raise ToolError("image_generate needs a prompt")
@@ -471,16 +506,31 @@ class ImageGenerate(Tool):
         path = str(checked.get("path", "") or "").strip()
         for named in (*images, *([mask] if mask else []), *([path] if path else [])):
             inside(self.workspace, named)
-        return {"prompt": prompt, "images": images, "mask": mask, "aspect": aspect, "path": path}
+        provider, model = _choice(checked)
+        return {
+            "action": action,
+            "prompt": prompt,
+            "images": images,
+            "mask": mask,
+            "aspect": aspect,
+            "path": path,
+            "provider": provider,
+            "model": model,
+        }
 
     async def run(  # type: ignore[override]
         self,
-        prompt: str,
+        action: str = "generate",
+        prompt: str = "",
         images: list[str] | None = None,
         mask: str = "",
         aspect: str = "",
         path: str = "",
+        provider: str = "",
+        model: str = "",
     ) -> ToolResult:
+        if action == "list":
+            return ToolResult.ok(self._listing())
         try:
             sources = tuple(self._source(named) for named in images or ())
             masked = self._source(mask) if mask else None
@@ -490,7 +540,7 @@ class ImageGenerate(Tool):
             return ToolResult.error(f"{path} already exists; name a new file")
         request = Request(prompt, sources, masked, aspect, self._timeout())
         passed: list[str] = []
-        for name, vendor in self.vendors():
+        for name, vendor in self.vendors(provider, model):
             missing = _unready(vendor) or _cannot(vendor, request)
             if missing:
                 passed.append(f"{name}: {missing}")
@@ -511,39 +561,72 @@ class ImageGenerate(Tool):
 
     # -- the parts -------------------------------------------------------------
 
-    def _vendors(self) -> Iterator[tuple[str, Any]]:
-        """Every vendor by name, the preferred one first, then the built-ins,
-        then the backends other plugins registered in their install order.
-        Each is built with the key it holds now only when it is reached - a
-        vendor after the one that answered is never built, so its key is never
-        read. A backend registered under a built-in's name stands in for it.
-
-        The backends are read now, not at `register`: a plugin installed after
-        this one, or enabled since, is in; one disabled since is out."""
-        builders: dict[str, Callable[[], Any]] = {name: self._builder(name) for name in BUILT_IN}
+    def _builders(self) -> dict[str, Callable[..., Any]]:
+        """Every vendor's builder by name: the built-ins, then the backends
+        other plugins registered, in their install order. Read now, not at
+        `register`: a plugin installed after this one, or enabled since, is in;
+        one disabled since is out. A backend registered under a built-in's name
+        stands in for it."""
+        builders: dict[str, Callable[..., Any]] = {name: self._builder(name) for name in BUILT_IN}
         builders.update(self.ctx.extensions_in(POINT))
-        first = str(self.ctx.setting("provider", "") or "").strip().lower()
-        order = [first] if first in builders else []
+        return builders
+
+    def _names(self) -> list[str]:
+        return list(self._builders())
+
+    def _listing(self) -> str:
+        lines = [
+            "Image vendors, in the order they are asked. `model` takes provider/model; a "
+            "provider alone is the model shown."
+        ]
+        for name, vendor in self.vendors("", ""):
+            abilities = [
+                "edits" if getattr(vendor, "edits", False) else "",
+                "masks" if getattr(vendor, "masks", False) else "",
+            ]
+            lines.append(_listed(name, vendor, abilities))
+        return "\n".join(lines)
+
+    def _vendors(self, provider: str = "", model: str = "") -> Iterator[tuple[str, Any]]:
+        """Every vendor by name: the one the model named, then the one the
+        person configured, then the rest in `_builders` order. Each is built
+        with the key it holds now only when it is reached - a vendor after the
+        one that answered is never built, so its key is never read.
+
+        `model` goes to the vendor the model named and to no other: an id means
+        something only at its own vendor. A named vendor that is not here, or
+        whose builder cannot take a model, is passed over like one with no key."""
+        builders = self._builders()
+        configured = str(self.ctx.setting("provider", "") or "").strip().lower()
+        if provider and provider not in builders:
+            yield provider, _Broken(f"not here - the vendors are {', '.join(builders)}")
+        order = [name for name in dict.fromkeys((provider, configured)) if name in builders]
         order += [name for name in builders if name not in order]
         for name in order:
+            chosen = model if name == provider else ""
+            if chosen and not _takes_model(builders[name]):
+                yield name, _Broken(f"its plugin cannot be asked for {chosen}; update it")
+                continue
             try:
-                yield name, builders[name]()
+                yield name, builders[name](model=chosen) if chosen else builders[name]()
             except Exception as exc:  # another plugin's code; it fails as a vendor fails
                 yield name, _Broken(f"could not be built: {type(exc).__name__}: {exc}")
 
-    def _builder(self, name: str) -> Callable[[], Any]:
+    def _builder(self, name: str) -> Callable[..., Any]:
         ctx = self.ctx
 
-        def model() -> str:
+        def configured() -> str:
             return str(ctx.setting(f"{name}_model", "") or "")
 
         if name == "openai":
-            return lambda: OpenAIImages(
-                model=model(),
+            return lambda model="": OpenAIImages(
+                model=model or configured(),
                 quality=str(ctx.setting("openai_quality", "") or ""),
                 **ctx.credential("openai"),
             )
-        return lambda: GoogleImages(model=model(), **_key_only(ctx.credential("google")))
+        return lambda model="": GoogleImages(
+            model=model or configured(), **_key_only(ctx.credential("google"))
+        )
 
     def _timeout(self) -> float:
         try:
@@ -721,6 +804,63 @@ def _cannot(vendor: Any, request: Request) -> str:
     if request.mask is not None and not getattr(vendor, "masks", False):
         return "does not take a mask"
     return ""
+
+
+def _choice(checked: Mapping[str, Any]) -> tuple[str, str]:
+    """`model` as the model wrote it, split at its first `/` into a vendor's
+    name and that vendor's own id - which may hold more slashes, as
+    `openrouter/google/lyria-3-pro-preview` does. A vendor alone is its
+    configured model."""
+    named = str(checked.get("model", "") or "").strip()
+    provider, _, model = named.partition("/")
+    provider = provider.strip().lower()
+    if named and not VENDOR_NAME.fullmatch(provider):
+        raise ToolError(f"model {named!r} is not provider/model - openai/gpt-image-2, say")
+    if model and (not MODEL_ID.fullmatch(model) or ".." in model or "//" in model):
+        raise ToolError(f"{model!r} is not a model id")
+    return provider, model
+
+
+def _listed(name: str, vendor: Any, abilities: Iterable[str] = ()) -> str:
+    """One vendor's line for `action: list`: `model` as it would take it,
+    whether it can be asked, what it does, and any further ids it names.
+    Facts the vendors' plugins hold - asking each `ready()` reads its key, and
+    nothing is sent anywhere."""
+    model = str(getattr(vendor, "model", "") or "")
+    line = f"- {name}/{model}" if model else f"- {name}"
+    missing = _unready(vendor)
+    line += f": cannot be asked - {missing}" if missing else ": ready"
+    said = [each for each in abilities if each]
+    if said:
+        line += f"; {', '.join(said)}"
+    others = [f"{name}/{each}" for each in _models(vendor) if each != model]
+    if others:
+        line += f"; also {', '.join(others)}"
+    return line
+
+
+def _models(vendor: Any) -> list[str]:
+    """The ids a vendor says it also takes (`models`, optional), checked as
+    `model` would check them, at most `LISTED_MODELS`. Another plugin's code: one
+    that is not a list of ids, or that raises, names none."""
+    try:
+        said = list(getattr(vendor, "models", ()) or ())
+    except Exception:
+        return []
+    ids = [str(each).strip() for each in said if isinstance(each, str)]
+    ids = [each for each in ids if MODEL_ID.fullmatch(each) and ".." not in each]
+    return list(dict.fromkeys(ids))[:LISTED_MODELS]
+
+
+def _takes_model(builder: Callable[..., Any]) -> bool:
+    """Whether a builder takes `model=`. A backend written before the model
+    could choose takes no arguments, and asking it for one would build the
+    vendor's configured model under the name of the one asked for."""
+    try:
+        parameters = inspect.signature(builder).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "model" or p.kind is p.VAR_KEYWORD for p in parameters)
 
 
 def _key_only(credential: Mapping[str, str]) -> dict[str, str]:

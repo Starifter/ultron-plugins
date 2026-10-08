@@ -523,16 +523,16 @@ class XAIPlugin(Plugin):
             ctx.register_extension(
                 "imagegen.backend",
                 "xai",
-                lambda: XAIImages(
-                    model=str(ctx.setting("image_model", "") or ""),
+                lambda model="": XAIImages(
+                    model=model or str(ctx.setting("image_model", "") or ""),
                     **_key_only(ctx.credential("xai")),
                 ),
             )
             ctx.register_extension(
                 "videogen.backend",
                 "xai",
-                lambda: XAIVideo(
-                    model=str(ctx.setting("video_model", "") or ""),
+                lambda model="": XAIVideo(
+                    model=model or str(ctx.setting("video_model", "") or ""),
                     **_key_only(ctx.credential("xai")),
                 ),
             )

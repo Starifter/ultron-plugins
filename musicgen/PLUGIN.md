@@ -2,7 +2,7 @@
 name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
-version: "2.1.0"
+version: "2.2.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
 wakes: true
@@ -41,7 +41,8 @@ One tool, OpenClaw's `music_generate`, with three actions. `generate` (the defau
 prompt, and optionally lyrics, a length and pictures from the workspace to set the mood, to a
 music vendor and returns at once with a job id. The track is made in the background and saved
 in the workspace when it is ready, usually in under two minutes, and the agent is woken to
-tell you. `status` checks one job and can wait for it; `list` lists this session's jobs.
+tell you. `status` checks one job and can wait for it, or with no job lists this
+session's jobs; `list` shows the vendors and their models. That is OpenClaw's split.
 
 ```
 /plugins install musicgen
@@ -49,6 +50,9 @@ tell you. `status` checks one job and can wait for it; `list` lists this session
 
 **From 1.x:** `generate_music` and `music_status` are now `music_generate` with
 `action: generate`, `action: status` and `action: list`.
+
+**From 2.1:** `action: list` listed this session's jobs; it lists the vendors now, and
+`action: status` with no `job` lists the jobs - OpenClaw's meaning of each.
 
 ## Keys
 
@@ -81,6 +85,25 @@ is passed over when the job starts and named in the result. One that fails while
 track is passed over too, and the next is asked - unless it timed out, because a vendor that
 timed out may still have made, and billed, the track.
 
+## The model's choice
+
+The model may name the vendor and model itself, as `model: "google/lyria-3-pro-preview"` - the provider, a
+slash, and the id as that vendor writes it. Only the first slash splits, so
+`openrouter/google/lyria-3-pro-preview` is OpenRouter's `google/lyria-3-pro-preview`. A
+provider alone, `model: "openrouter"`, is that vendor's configured model. The vendor named is
+asked first, before `provider`. If it is not installed, cannot do what was asked, or fails,
+the others are tried on their own configured models - an id means something only at its
+own vendor - and the result names each one passed over. There is no allow list: any
+installed vendor and any id may be named, and the call costs money at whichever vendor
+answers. The id goes into a vendor's URL, so one with `..`, `//`, `?`, `#`, `%` or a space
+is refused before anything is spent.
+
+`action: list` shows every vendor in the order it would be asked, as `model` takes it -
+`google/lyria-3.5: ready` - and why one cannot be asked.
+Asking each vendor whether it is ready reads its key (an `auth` record each); nothing is
+sent anywhere. A vendor whose plugin names further ids lists them too. None of the vendors
+here fetches its vendor's whole catalogue, so an id the list does not show may still work.
+
 ## Adding a vendor
 
 A plugin adds a vendor by putting a builder into `musicgen.backend` (SDK 1.39):
@@ -92,10 +115,10 @@ def register(self, ctx):
 ```
 
 It needs nothing from musicgen, and musicgen needs no change: with musicgen absent the entry
-sits unread. The name is what `provider` takes and what the job and the trail call the
+sits unread. The name is the provider half of `model`, what `provider` takes, and what the job and the trail call the
 vendor. A backend registered under `google` stands in for the built-in one.
 
-**The builder** takes no arguments and returns a vendor. It is called only when musicgen
+**The builder** takes an optional `model` keyword - the id the model named, or nothing for your configured one - and returns a vendor: `lambda model="": AcmeX(model=model or configured)`. A builder that takes no arguments still works; when the model names one of its models, it is passed over with "update it" rather than built on the wrong model. It is called only when musicgen
 reaches that vendor, so read the key there.
 
 **The vendor** is any object with:
@@ -103,6 +126,7 @@ reaches that vendor, so read the key there.
 | | |
 |---|---|
 | `model` | The model it will use, for the job and the result. Optional. |
+| `models` | Further ids it takes, for `action: list`. Optional; at most 20 are shown. |
 | `ready()` | `""` when it can be asked, or why not - `"no acme key (ultron auth add acme)"`. Optional. |
 | `cannot(request)` | `""` when it can make this, or why not - `"makes 30-second clips only"`. Optional. |
 | `async generate(request)` | Make one track. Returns an object with `data` (the audio's bytes), and optionally `model`, `cost` and `lyrics` (strings). |

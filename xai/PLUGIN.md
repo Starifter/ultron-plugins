@@ -1,7 +1,7 @@
 ---
 name: xai
 description: The xAI model provider - Grok, at xAI - with Grok speech-to-text for voice notes, and Grok Imagine for imagegen and videogen.
-version: "1.2.0"
+version: "1.3.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, audio, media]
 logo: logo.svg

@@ -1,7 +1,7 @@
 ---
 name: together
 description: The Together AI model provider - open models, hosted at Together - and Together's image and video models for imagegen and videogen.
-version: "1.1.0"
+version: "1.2.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg

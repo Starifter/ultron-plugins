@@ -561,3 +561,131 @@ async def test_the_xai_plugin_is_a_vendor_when_both_are_enabled(tmp_path: Path, 
         (r.arguments["plugin"], r.arguments["vendor"]) for r in auditor.entries if r.kind == "auth"
     ]
     assert ("xai", "xai") in reads
+
+
+# -- the model's choice of vendor and model -------------------------------------
+
+
+async def test_the_model_names_the_vendor_and_its_model(tmp_path: Path, wire: Wire) -> None:
+    tool, auditor, _ = installed(tmp_path)
+    result = await call(tool, prompt="x", model="Google/gemini-2.5-flash-image")
+    assert "made by google (gemini-2.5-flash-image)" in result.content
+    [sent] = wire.sent
+    assert sent["url"].endswith("/models/gemini-2.5-flash-image:generateContent")
+    assert [r.arguments["vendor"] for r in auditor.entries if r.kind == "auth"] == ["google"]
+
+
+async def test_a_provider_alone_is_its_configured_model_before_the_persons_choice(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _ = installed(tmp_path, settings={"provider": "google"})
+    result = await call(tool, prompt="x", model="openai")
+    assert "made by openai (gpt-image-2)" in result.content
+
+
+async def test_a_chosen_vendor_that_fails_falls_back_and_its_model_stays_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wire = Wire(google=Response({"error": {"status": "NOT_FOUND"}}, 404))
+    monkeypatch.setattr("ultron.sdk.web.post", wire)
+    tool, auditor, _ = installed(tmp_path)
+    result = await call(tool, prompt="x", model="google/gemini-nope")
+    assert "made by openai (gpt-image-2)" in result.content
+    assert "passed over google: RuntimeError: HTTP 404 from Google (NOT_FOUND)" in result.content
+    assert wire.sent[1]["json"]["model"] == "gpt-image-2", "an id means nothing at another vendor"
+    assert [r.arguments.get("vendor") for r in generated(auditor)] == ["google", "openai"]
+
+
+async def test_a_vendor_that_is_not_here_is_passed_over_with_the_ones_that_are(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _ = installed(tmp_path)
+    result = await call(tool, prompt="x", model="midjourney/v7")
+    assert "made by openai (gpt-image-2)" in result.content
+    assert "passed over midjourney: not here - the vendors are openai, google" in result.content
+
+
+def test_the_model_is_checked_before_anything_runs(tmp_path: Path) -> None:
+    tool, _, _ = installed(tmp_path)
+    for model, match in (
+        ("gpt image 2", "not provider/model"),
+        ("/gpt-image-2", "not provider/model"),
+        ("google/../../files/x", "not a model id"),
+        ("google/m?key=1", "not a model id"),
+        ("google/a//b", "not a model id"),
+        ("google/m#x", "not a model id"),
+    ):
+        with pytest.raises(ToolError, match=match):
+            tool.validate({"prompt": "x", "model": model})
+    checked = tool.validate({"prompt": "x", "model": "fireworks/accounts/f/m-1.0"})
+    assert (checked["provider"], checked["model"]) == ("fireworks", "accounts/f/m-1.0")
+    assert "provider" not in tool.parameters["properties"], "one argument, provider/model"
+
+
+async def test_the_schema_names_every_vendor_installed_now(tmp_path: Path, wire: Wire) -> None:
+    backend(tmp_path / "plugins")
+    tool, (plugins, report, tools), _, _ = session(tmp_path)
+    said = lambda: tool.parameters["properties"]["model"]["description"]  # noqa: E731
+    assert "The providers here: openai, google;" in said()
+    plugins.install_late("acme", report, workspace=tmp_path / "ws", tools=tools)
+    assert "The providers here: openai, google, acme;" in said()
+
+
+async def test_a_backend_that_cannot_take_a_model_is_passed_over_not_misnamed(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins")
+    tool, _, _, _ = session(tmp_path, "acme", keys={"openai": {"api_key": "sk-o"}})
+    result = await call(tool, prompt="x", model="acme/acme-2")
+    assert "made by openai" in result.content
+    assert "acme: its plugin cannot be asked for acme-2; update it" in result.content
+
+
+async def test_the_xai_plugin_makes_it_on_the_model_the_model_chose(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _, _ = session(tmp_path, "xai", keys={"xai": {"api_key": "xai-k"}})
+    result = await call(tool, prompt="a fox", model="xai/grok-imagine-image-pro")
+    assert "made by xai (grok-imagine-image-pro)" in result.content
+    assert wire.sent[0]["json"]["model"] == "grok-imagine-image-pro"
+
+
+# -- action: list ---------------------------------------------------------------
+
+
+async def test_list_shows_each_vendor_in_order_as_model_takes_it(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, _ = installed(
+        tmp_path, keys={"google": {"api_key": "AIza-g"}}, settings={"provider": "google"}
+    )
+    result = await call(tool, action="list")
+    assert not result.is_error
+    assert result.content.splitlines()[1:] == [
+        "- google/gemini-3.1-flash-image-preview: ready; edits",
+        "- openai/gpt-image-2: cannot be asked - no openai key (ultron auth add openai); "
+        "edits, masks",
+    ]
+    assert wire.sent == [], "listing asks no vendor anything"
+
+
+async def test_list_names_a_backends_further_models_and_a_broken_one(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(
+        tmp_path / "plugins",
+        builder="lambda: type('V', (AcmeImages,), "
+        "{'model': 'acme-1', 'models': ['acme-1', 'acme-2', 'bad id', 7]})(ctx)",
+    )
+    backend(tmp_path / "plugins", "zeta", name="zeta", builder="lambda: 1 / 0")
+    tool, _, _, _ = session(tmp_path, "acme", "zeta")
+    lines = (await call(tool, action="list")).content.splitlines()
+    assert "- acme/acme-1: ready; also acme/acme-2" in lines
+    assert any(line.startswith("- zeta: cannot be asked - could not be built") for line in lines)
+
+
+def test_list_needs_no_prompt(tmp_path: Path) -> None:
+    tool, _, _ = installed(tmp_path)
+    assert tool.validate({"action": "list"}) == {"action": "list"}
+    with pytest.raises(ToolError, match="needs a prompt"):
+        tool.validate({})
