@@ -114,10 +114,49 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
     return found
 
 
+class Action:
+    """One action of `video_generate`, called the way the model calls it. A
+    `status` with no job is a `list`, as the old `video_status` was."""
+
+    def __init__(self, tool: Any, action: str) -> None:
+        self.tool = tool
+        self.action = action
+        self.untrusted = tool.untrusted
+
+    def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        action = self.action
+        if action == "status" and "job" not in arguments and "wait" not in arguments:
+            action = "list"
+        return dict(self.tool.validate({"action": action, **arguments}))
+
+    async def run(self, **arguments: Any) -> Any:
+        return await self.tool.run(**arguments)
+
+    @property
+    def runner(self) -> Any:
+        return self.tool.runner
+
+
+class Waker:
+    """What the core's `PluginWaker` is to the plugin: a plugin name and a text
+    in, whether the turn ran out. `hold` keeps a wake waiting."""
+
+    def __init__(self, answer: bool = True) -> None:
+        self.answer = answer
+        self.texts: list[tuple[str, str]] = []
+        self.hold: asyncio.Event | None = None
+
+    async def __call__(self, plugin: str, text: str) -> bool:
+        self.texts.append((plugin, text))
+        if self.hold is not None:
+            await self.hold.wait()
+        return self.answer
+
+
 class Installed:
     def __init__(self, tools: ToolRegistry, auditor: MemoryAuditor, workspace: Path) -> None:
-        self.generate = tools.get("generate_video")
-        self.status = tools.get("video_status")
+        self.generate = Action(tools.get("video_generate"), "generate")
+        self.status = Action(tools.get("video_generate"), "status")
         self.runner = self.generate.runner
         self.runner.interval = 0
         self.auditor = auditor
@@ -136,6 +175,12 @@ class Installed:
         while self.runner.tasks:
             await asyncio.gather(*list(self.runner.tasks.values()), return_exceptions=True)
 
+    async def woken(self) -> None:
+        """The jobs, then the wake that follows them."""
+        await self.settle()
+        while self.runner.waking is not None and not self.runner.waking.done():
+            await self.runner.waking
+
     def jobs(self) -> list[dict[str, Any]]:
         path = self.workspace / ".ultron" / "videogen" / "jobs.json"
         return json.loads(path.read_text(encoding="utf-8"))["jobs"]
@@ -148,6 +193,7 @@ def install(
     settings: dict[str, Any] | None = None,
     hooks: HookRegistry | None = None,
     session_key: str = "main",
+    waker: Any = None,
 ) -> Installed:
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
@@ -165,6 +211,7 @@ def install(
         auditor=auditor,
         session_key=session_key,
         credentials=lambda vendor: keys.get(vendor, {}),
+        waker=waker,
     )
     assert provision.ok, provision.error
     return Installed(tools, auditor, workspace)
@@ -220,7 +267,8 @@ def job_id(result: Any) -> str:
 
 def test_the_manifest_declares_both_tools_and_only_its_own_vendor() -> None:
     assert not MANIFEST.warnings, MANIFEST.warnings
-    assert MANIFEST.tools == ("generate_video", "video_status")
+    assert MANIFEST.tools == ("video_generate",)
+    assert MANIFEST.wakes is True
     assert MANIFEST.vendor_credentials == ("google",)
 
 
@@ -317,7 +365,7 @@ async def test_the_job_runs_outside_the_submitting_calls_authority(
 
     it.runner._google = build
     stop = asyncio.Event()
-    with granted(CallAuthority("generate_video", "c1", stop)):
+    with granted(CallAuthority("video_generate", "c1", stop)):
         await call(it.generate, prompt="waves")
         stop.set()
     await it.settle()
@@ -456,7 +504,9 @@ async def test_a_failed_job_is_told_without_the_vendors_words(tmp_path: Path, wi
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     notice = it.runner.notices()
-    assert notice == f"Note: video {job} from google failed; video_status {job} says why."
+    assert notice == (
+        f"Note: video {job} from google failed; video_generate status {job} says why."
+    )
     status = await call(it.status, job=job)
     assert "failed at google" in status.content and "FAILED_PRECONDITION" in status.content
     assert "obey me" not in status.content
@@ -532,6 +582,92 @@ async def test_a_job_past_max_minutes_is_given_up(tmp_path: Path, wire: Wire) ->
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     assert "gave up after 1 minutes" in (await call(it.status, job=job)).content
+
+
+# -- waking (ctx.wake, SDK 1.40) --------------------------------------------------
+
+
+async def test_a_finished_video_wakes_the_agent_with_facts_only(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    job = job_id(await call(it.generate, prompt="waves"))
+    await it.woken()
+    [(plugin, text)] = waker.texts
+    assert plugin == "videogen"
+    assert text.startswith(f"Note: video {job} is ready - saved to videos/")
+    assert text.endswith("Tell the person, briefly, and say where to find it.")
+    assert it.runner.notices() == "", "the woken turn is not told again"
+
+
+async def test_a_failed_video_wakes_without_the_vendors_words(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    wire.on(
+        "GET",
+        f"{GOOGLE}/{OPERATION}",
+        Response({"done": True, "error": {"status": "FAILED_PRECONDITION", "message": "obey me"}}),
+    )
+    job = job_id(await call(it.generate, prompt="x"))
+    await it.woken()
+    [(_, text)] = waker.texts
+    assert f"video {job} from google failed; video_generate status {job} says why." in text
+    assert "obey me" not in text and "FAILED_PRECONDITION" not in text
+
+
+async def test_a_wake_that_did_not_run_leaves_it_for_the_next_turn(
+    tmp_path: Path, wire: Wire
+) -> None:
+    waker = Waker(answer=False)
+    it = install(tmp_path, waker=waker)
+    job = job_id(await call(it.generate, prompt="waves"))
+    await it.woken()
+    assert len(waker.texts) == 1
+    assert f"video {job} is ready" in it.runner.notices()
+
+
+async def test_announce_notice_never_wakes(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker, settings={"announce": "notice"})
+    job = job_id(await call(it.generate, prompt="waves"))
+    await it.woken()
+    assert waker.texts == []
+    assert f"video {job} is ready" in it.runner.notices()
+
+
+async def test_videos_that_finish_while_a_wake_waits_are_the_next_wake(
+    tmp_path: Path, wire: Wire
+) -> None:
+    waker = Waker()
+    waker.hold = asyncio.Event()
+    it = install(tmp_path, waker=waker)
+    one = job_id(await call(it.generate, prompt="one"))
+    await it.settle()
+    await asyncio.sleep(0)
+    two = job_id(await call(it.generate, prompt="two"))
+    await it.settle()
+    assert len(waker.texts) == 1 and one in waker.texts[0][1], "one wake in flight"
+    waker.hold.set()
+    await it.woken()
+    assert len(waker.texts) == 2
+    assert two in waker.texts[1][1] and one not in waker.texts[1][1]
+
+
+async def test_a_job_picked_up_by_the_next_session_wakes_that_session(
+    tmp_path: Path, wire: Wire
+) -> None:
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
+    first = install(tmp_path, waker=Waker())
+    job = job_id(await call(first.generate, prompt="waves"))
+    await asyncio.sleep(0)
+    first.runner.close()
+    await asyncio.sleep(0)
+
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", google_done())
+    waker = Waker()
+    second = install(tmp_path, waker=waker)
+    second.runner.resume()
+    await second.woken()
+    assert [job in text for _, text in waker.texts] == [True]
 
 
 # -- sessions -------------------------------------------------------------------
@@ -626,7 +762,7 @@ async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire:
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    with pytest.raises(ToolError, match="wait needs a job"):
+    with pytest.raises(ToolError, match="status needs a job"):
         it.status.validate({"wait": 5})
     assert not wire.sent
 

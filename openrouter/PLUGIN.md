@@ -1,7 +1,7 @@
 ---
 name: openrouter
-description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image and video models for imagegen and videogen.
-version: "1.2.0"
+description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image, video and music models for imagegen, videogen and musicgen.
+version: "1.3.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -43,6 +43,10 @@ config_schema:
     type: str
     default: google/veo-3.1
     description: "The video model videogen makes videos with at OpenRouter, by its slug - bytedance/seedance-2.0, say."
+  music_model:
+    type: str
+    default: google/lyria-3-pro-preview
+    description: "The music model musicgen makes tracks with at OpenRouter, by its slug - google/lyria-3-clip-preview, say."
 python_dependencies:
   - "openai>=1.66"
 ---
@@ -132,12 +136,13 @@ time, on the redirect and on a pasted URL alike; a request that does not carry i
 answered 400 and ignored, and the listener keeps waiting for the right one. The key does not expire; there is nothing to refresh.
 Revoke it at openrouter.ai/settings/keys.
 
-## Pictures and videos
+## Pictures, videos and music
 
-With [imagegen](../imagegen/PLUGIN.md) or [videogen](../videogen/PLUGIN.md) enabled,
-OpenRouter is one of their vendors: the plugin registers itself into `imagegen.backend` and
-`videogen.backend` (SDK 1.39; an older Ultron gets the provider and the sign-in only).
-Neither plugin needs a setting for it, and this one does not depend on them.
+With [imagegen](../imagegen/PLUGIN.md), [videogen](../videogen/PLUGIN.md) or
+[musicgen](../musicgen/PLUGIN.md) enabled, OpenRouter is one of their vendors: the plugin
+registers itself into `imagegen.backend`, `videogen.backend` and `musicgen.backend` (SDK
+1.39; an older Ultron gets the provider and the sign-in only). None of them needs a setting
+for it, and this one does not depend on them.
 
 - **Pictures** (`image_model`, default `openai/gpt-image-2`): generates and edits, no mask -
   whichever image model `image_model` names, billed by OpenRouter.
@@ -146,12 +151,16 @@ Neither plugin needs a setting for it, and this one does not depend on them.
   to the next vendor. A first and a last frame go as `frame_images`. The finished video is
   fetched from OpenRouter's own content URL, never from a link the reply names, because the
   key goes with that request.
+- **Music** (`music_model`, default `google/lyria-3-pro-preview`): Chat Completions with
+  audio out, which OpenRouter sends only as a stream; the stream is read whole and the track
+  put back together from its chunks, with whatever the model wrote beside it as the lyrics.
+  One picture at most. `google/lyria-3-clip-preview` makes 30-second clips.
 
-Both spend the provider's credential - a key added by hand or the `openrouter:oauth`
+All three spend the provider's credential - a key added by hand or the `openrouter:oauth`
 sign-in - read with `ctx.credential`, which is why the manifest lists `openrouter` under
-`vendor_credentials`, and only when imagegen or videogen reaches OpenRouter. Each read is an
-`auth` record in the trail with a fingerprint. A picture or a frame you hand imagegen or
-videogen reaches OpenRouter, with the prompt, when it is the vendor that makes it.
+`vendor_credentials`, and only when imagegen, videogen or musicgen reaches OpenRouter. Each
+read is an `auth` record in the trail with a fingerprint. A picture or a frame you hand any
+of them reaches OpenRouter, with the prompt, when it is the vendor that makes it.
 
 ## What is not here
 

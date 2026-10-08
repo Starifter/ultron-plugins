@@ -67,10 +67,11 @@ point named for itself - `ctx.extensions_in("imagegen.backend")` - and anyone wr
 it with `ctx.register_extension("imagegen.backend", "acme", build)`. The writer needs no
 `requires_plugins` and no import: with the owner absent, the entry sits unread. That is how
 `xai`, `openrouter`, `together` and `fireworks` give `imagegen` and `videogen` their
-vendors, and how a new image or video vendor joins without a change to either.
+vendors and `openrouter` gives `musicgen` one, and how a new image, video or music vendor
+joins without a change to any of them.
 
-- **Owning a point:** publish the interface in your `PLUGIN.md`, as `imagegen` and
-  `videogen` do under *Adding a vendor*, and treat what you read as code you did not write:
+- **Owning a point:** publish the interface in your `PLUGIN.md`, as `imagegen`,
+  `videogen` and `musicgen` do under *Adding a vendor*, and treat what you read as code you did not write:
   read it when you need it (never in `register`), duck-type it, bound every call, and turn
   whatever it raises into a result.
 - **Writing into one:** guard with `if hasattr(ctx, "register_extension"):` so the plugin

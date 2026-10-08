@@ -23,7 +23,7 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 
 | plugin | what it adds |
 |---|---|
-| `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs - and its image and video models as vendors for `imagegen` and `videogen`. |
+| `openrouter` | A model provider: one `OPENROUTER_API_KEY`, every model OpenRouter routes to, with a live catalog of what each costs - and its image, video and music models as vendors for `imagegen`, `videogen` and `musicgen`. |
 | `llama-cpp` | A model provider for a `llama-server` on this machine: GGUF models, no key, no bill, with an embedder for memory search. |
 | `ollama` | Two model providers: `ollama` for a local Ollama (no key, no bill, context checked against what Ollama loaded) and `ollama-cloud` for ollama.com with `OLLAMA_API_KEY`, plus an embedder. |
 | `lmstudio` | A model provider for LM Studio on this machine: loads the model at the context you choose, no key, no bill, with an embedder. |
@@ -35,7 +35,8 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops, and FLUX as a vendor for `imagegen`. Needs SDK 1.25. |
 | `diffs` | A `diffs` tool, OpenClaw's: a diff rendered for a person - a viewer opened from the call's card in the web UI, a PNG or a PDF for a channel. Needs SDK 1.33; files need Playwright. |
 | `imagegen` | A `generate_image` tool: make or edit a picture with OpenAI, Google, or any vendor another plugin adds - `xai`, `openrouter`, `together` and `fireworks` do - saved in the workspace and shown to the model. Needs SDK 1.39. |
-| `videogen` | `generate_video` and `video_status`: start a video with Google Veo, or any vendor another plugin adds - `xai`, `openrouter` and `together` do - made in the background and saved in the workspace; the model is told on its next turn. Needs SDK 1.39. |
+| `videogen` | `video_generate` (generate, status, list): start a video with Google Veo, or any vendor another plugin adds - `xai`, `openrouter` and `together` do - made in the background and saved in the workspace; the agent is woken to tell you when it is done (SDK 1.40), or told on its next turn. Needs SDK 1.39. |
+| `musicgen` | `music_generate` (generate, status, list): a song or an instrumental from Google Lyria, or any vendor another plugin adds - `openrouter` does - with your lyrics or its own, made in the background and saved in the workspace; the agent is woken to tell you when it is done (SDK 1.40), or told on its next turn. Needs SDK 1.39. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
 
 ## What "official" means

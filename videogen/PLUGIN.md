@@ -2,12 +2,17 @@
 name: videogen
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
-version: "2.0.0"
+version: "3.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
+wakes: true
 contracts:
-  tools: [generate_video, video_status]
+  tools: [video_generate]
 config_schema:
+  announce:
+    type: str
+    default: wake
+    description: "How a finished job is told: wake (the agent is woken to tell the person, SDK 1.40) or notice (a line on the next turn)."
   provider:
     type: str
     default: ""
@@ -36,14 +41,18 @@ config_schema:
 
 # videogen
 
-Two tools. `generate_video` hands a prompt, and optionally a first and a last frame from the
-workspace, to a video vendor and returns at once with a job id; the video is made in the
-background - one to several minutes - and saved in the workspace when it is ready.
-`video_status` lists this session's jobs, or checks one and can wait for it.
+One tool, OpenClaw's `video_generate`, with three actions. `generate` (the default) hands a
+prompt, and optionally a first and a last frame from the workspace, to a video vendor and
+returns at once with a job id; the video is made in the background - one to several minutes -
+saved in the workspace when it is ready, and the agent is woken to tell you. `status` checks
+one job and can wait for it; `list` lists this session's jobs.
 
 ```
 /plugins install videogen
 ```
+
+**From 2.x:** `generate_video` and `video_status` are now `video_generate` with
+`action: generate`, `action: status` and `action: list`.
 
 ## Keys
 
@@ -127,7 +136,7 @@ does none of that.
 
 ## How a job runs
 
-1. **Submit.** `generate_video` checks the frames and the path, sends the job to the first
+1. **Submit.** `video_generate` checks the frames and the path, sends the job to the first
    vendor that takes it, and returns the job id (`vg-1a2b3c`), the vendor, and the file the
    video will be written to.
 2. **Follow.** The plugin asks the vendor every `poll_seconds`, in the background, for up to
@@ -135,20 +144,30 @@ does none of that.
    in a row, or a 4xx, ends the job.
 3. **Save.** The video is downloaded and written to `videos/<time>-<prompt>.mp4`, or the
    `path` the model named - never over an existing file.
-4. **Tell.** On the session's next turn the model is given one line: which job finished, where
-   it is, who made it, how big it is. The line carries what the plugin worked out and never a
-   word a vendor wrote; why a job failed is behind `video_status`, whose result arrives inside
-   an untrusted envelope. A notice never starts a turn by itself.
+4. **Tell.** The agent is woken - OpenClaw's completion event, `ctx.wake` (SDK 1.40) - with
+   one line per finished job: which job, where it is, who made it, how big it is. It runs as a
+   turn of the session's own after whatever is running, never inside a person's turn, and its
+   reply goes where the session's replies go: a video asked for in a Telegram DM is announced
+   in that DM. Several jobs that finish together are one wake. Where the agent cannot be woken
+   - `announce: notice`, an Ultron before 1.40, a `cron` or group session, a lane busy past the
+   core's wait, `plugins_no_wake` - the same line rides the session's next turn instead. The
+   line carries what the plugin worked out and never a word a vendor wrote; why a job failed is
+   behind `video_generate status`, whose result arrives inside an untrusted envelope.
 
 Jobs are kept in `<workspace>/.ultron/videogen/jobs.json`. A session that ends with a job
 still running leaves it there, and the next session with the same key picks it back up, so a
-video that was paid for is still collected. Nothing is sent to a vendor to resume, only asked.
+video that was paid for is still collected - and the next session is the one woken when it is.
+Nothing is sent to a vendor to resume, only asked.
 
 Each submission is a `plugin` record with `event: submit` - vendor, model, how many frames
 went, and the vendor's job id - and each ending is `event: video`, with the hash and size of
-what came back or the reason it did not. The prompt is only in the tool call's own record.
+what came back or the reason it did not. Each wake is the core's own `event: wake` record. The
+prompt is only in the tool call's own record.
 
-Every video is a paid request, and every frame handed in is sent to that vendor.
+Every video is a paid request, and every frame handed in is sent to that vendor. So is every
+wake: one model turn the person did not type. That is why the manifest says `wakes: true` -
+`/plugins` shows `may start turns` before you install it - and why `announce: notice`, or
+`plugins_no_wake: [videogen]` in `config.json`, turns it off.
 
 ## Not built
 
