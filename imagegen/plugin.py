@@ -1,7 +1,7 @@
 """imagegen: make and edit pictures, on any vendor a key is held for, saved in the workspace.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings one
-tool, `generate_image`, two vendors of its own, and a point any other plugin can
+tool, `image_generate`, two vendors of its own, and a point any other plugin can
 put a vendor into:
 
 - `OpenAIImages` - the Images API: words to `/images/generations` as JSON,
@@ -395,8 +395,8 @@ def inside(workspace: Path, path: str) -> Path:
     return resolved
 
 
-class GenerateImage(Tool):
-    name = "generate_image"
+class ImageGenerate(Tool):
+    name = "image_generate"
     untrusted = True
     """The picture is a vendor's bytes. A result with a picture carries its own
     envelope (`_deliver`); any other result the executor wraps whole."""
@@ -458,10 +458,10 @@ class GenerateImage(Tool):
         checked = validate_arguments(self.parameters, arguments, tool=self.name)
         prompt = str(checked.get("prompt", "") or "")
         if not prompt.strip():
-            raise ToolError("generate_image needs a prompt")
+            raise ToolError("image_generate needs a prompt")
         images = [str(p).strip() for p in checked.get("images") or () if str(p).strip()]
         if len(images) > MAX_INPUTS:
-            raise ToolError(f"generate_image takes at most {MAX_INPUTS} images, not {len(images)}")
+            raise ToolError(f"image_generate takes at most {MAX_INPUTS} images, not {len(images)}")
         mask = str(checked.get("mask", "") or "").strip()
         if mask and not images:
             raise ToolError("a mask needs the image it masks in `images`")
@@ -741,4 +741,4 @@ class ImagegenPlugin(Plugin):
     description = "Make and edit pictures with any image vendor a key is held for."
 
     def register(self, ctx: PluginContext) -> None:
-        ctx.register_tool(GenerateImage(ctx))
+        ctx.register_tool(ImageGenerate(ctx))
