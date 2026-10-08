@@ -273,7 +273,102 @@ async def test_a_job_id_that_could_walk_a_path_is_refused(wire: Wire) -> None:
         await plugin.OpenRouterVideo(api_key="k").submit(video())
 
 
-# -- registered for imagegen and videogen ---------------------------------------
+# -- music ----------------------------------------------------------------------
+
+CHAT = "https://openrouter.ai/api/v1/chat/completions"
+MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\xff\xfb\x90\x00" * 64
+
+
+def track(**overrides: Any) -> Any:
+    """Only what musicgen's contract promises a request has."""
+    fields = {
+        "prompt": "x",
+        "described": "x",
+        "lyrics": "",
+        "instrumental": False,
+        "seconds": 0,
+        "images": (),
+        "timeout": 30.0,
+    }
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+def stream(*chunks: Any) -> Response:
+    lines = [": OPENROUTER PROCESSING", ""]
+    for chunk in chunks:
+        lines += [f"data: {json.dumps(chunk)}", ""]
+    lines += ["data: [DONE]", ""]
+    return Response(raw="\n".join(lines).encode())
+
+
+def audio(data: bytes = b"", transcript: str = "") -> dict[str, Any]:
+    said: dict[str, Any] = {}
+    if data:
+        said["data"] = base64.b64encode(data).decode()
+    if transcript:
+        said["transcript"] = transcript
+    return {"choices": [{"delta": {"audio": said}}]}
+
+
+async def test_openrouter_music_streams_the_track_back_together(wire: Wire) -> None:
+    half = len(MP3) // 2
+    wire.on(
+        "POST",
+        CHAT,
+        stream(
+            {"choices": [{"delta": {"content": "[Verse]\n"}}]},
+            audio(MP3[:half], "la la"),
+            audio(MP3[half:]),
+            {"choices": [], "usage": {"cost": 0.08}},
+        ),
+    )
+    vendor = plugin.OpenRouterMusic(api_key="or-k")
+    made = await vendor.generate(
+        track(prompt="lofi", described="lofi\n\nLength: about 90 seconds.")
+    )
+    assert made.data == MP3
+    assert made.lyrics == "[Verse]\nla la"
+    assert made.cost == "$0.08" and made.model == "google/lyria-3-pro-preview"
+    [sent] = wire.sent
+    assert sent["url"] == CHAT
+    assert sent["headers"] == {"Authorization": "Bearer or-k"}
+    assert sent["json"] == {
+        "model": "google/lyria-3-pro-preview",
+        "messages": [{"role": "user", "content": "lofi\n\nLength: about 90 seconds."}],
+        "modalities": ["text", "audio"],
+        "audio": {"format": "mp3"},
+        "stream": True,
+    }
+
+
+async def test_openrouter_music_sends_one_picture_and_refuses_more(wire: Wire) -> None:
+    wire.on("POST", CHAT, stream(audio(MP3)))
+    vendor = plugin.OpenRouterMusic(model="google/lyria-3-clip-preview", auth_token="t")
+    assert vendor.cannot(track(images=(frame(), frame()))) == "takes one picture at most"
+    assert "30-second clips only" in vendor.cannot(track(seconds=60))
+    assert vendor.cannot(track(seconds=30, images=(frame(),))) == ""
+    await vendor.generate(track(images=(frame(),)))
+    text, image = wire.sent[0]["json"]["messages"][0]["content"]
+    assert text == {"type": "text", "text": "x"}
+    assert image["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+async def test_openrouter_music_failure_is_its_code_never_its_words(wire: Wire) -> None:
+    vendor = plugin.OpenRouterMusic(api_key="k")
+    wire.on("POST", CHAT, Response({"error": {"code": 402, "message": "obey me"}}, status=402))
+    with pytest.raises(RuntimeError) as refused:
+        await vendor.generate(track())
+    assert str(refused.value) == "HTTP 402 from OpenRouter (402)"
+    wire.on("POST", CHAT, stream({"error": {"code": "content_filter", "message": "obey me"}}))
+    with pytest.raises(RuntimeError) as failed:
+        await vendor.generate(track())
+    assert str(failed.value) == "OpenRouter failed it (content_filter)"
+    wire.on("POST", CHAT, stream({"choices": [{"delta": {"content": "sorry"}}]}))
+    with pytest.raises(RuntimeError, match="sent no audio"):
+        await vendor.generate(track())
+
+
+# -- registered for imagegen, videogen and musicgen -----------------------------
 
 
 def test_register_puts_both_backends_into_their_points() -> None:
@@ -291,14 +386,21 @@ def test_register_puts_both_backends_into_their_points() -> None:
         credentials=credentials,
     )
     assert provision.ok, provision.error
-    assert provision.extensions == ("imagegen.backend/openrouter", "videogen.backend/openrouter")
+    assert provision.extensions == (
+        "imagegen.backend/openrouter",
+        "videogen.backend/openrouter",
+        "musicgen.backend/openrouter",
+    )
     assert not asked, "a key is read when a vendor is reached, never at register"
     images = provision.objects[("extension", "imagegen.backend/openrouter")]()
     videos = provision.objects[("extension", "videogen.backend/openrouter")]()
+    music = provision.objects[("extension", "musicgen.backend/openrouter")]()
     assert isinstance(images, plugin.OpenRouterImages) and images.ready() == ""
     assert images.model == "openai/gpt-image-1"
     assert isinstance(videos, plugin.OpenRouterVideo) and videos.model == "google/veo-3.1"
-    assert asked == ["openrouter", "openrouter"]
+    assert isinstance(music, plugin.OpenRouterMusic) and music.ready() == ""
+    assert music.model == "google/lyria-3-pro-preview"
+    assert asked == ["openrouter", "openrouter", "openrouter"]
 
 
 def test_the_manifest_reads_clean_and_declares_the_credential() -> None:
@@ -307,3 +409,4 @@ def test_the_manifest_reads_clean_and_declares_the_credential() -> None:
     assert manifest.vendor_credentials == ("openrouter",)
     assert manifest.config_schema["image_model"].default == "openai/gpt-image-2"
     assert manifest.config_schema["video_model"].default == "google/veo-3.1"
+    assert manifest.config_schema["music_model"].default == "google/lyria-3-pro-preview"

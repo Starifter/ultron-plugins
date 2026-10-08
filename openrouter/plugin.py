@@ -498,17 +498,20 @@ def _entry_of(item: Mapping[str, Any]) -> ModelEntry | None:
 
 # -- pictures and videos, for imagegen and videogen ------------------------------------
 #
-# OpenRouter's Images and Videos APIs, registered into `imagegen.backend` and
-# `videogen.backend` (SDK 1.39) so those plugins reach OpenRouter without knowing it
-# exists. The interfaces are theirs, written in their PLUGIN.md; nothing here imports
-# either. Each builder reads the key when imagegen or videogen reaches OpenRouter,
-# never before - a key added by hand or the `openrouter:oauth` sign-in, either of
-# which OpenRouter takes as a bearer.
+# OpenRouter's Images and Videos APIs and its music models, registered into
+# `imagegen.backend`, `videogen.backend` and `musicgen.backend` (SDK 1.39) so those
+# plugins reach OpenRouter without knowing it exists. The interfaces are theirs,
+# written in their PLUGIN.md; nothing here imports any of them. Each builder reads the
+# key when its plugin reaches OpenRouter, never before - a key added by hand or the
+# `openrouter:oauth` sign-in, either of which OpenRouter takes as a bearer.
 
 IMAGES_URL = f"{BASE_URL}/images"
 IMAGE_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
 VIDEOS_URL = f"{BASE_URL}/videos"
 VIDEO_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
+CHAT_URL = f"{BASE_URL}/chat/completions"
+MUSIC_REPLY_MAX_BYTES = 96 * 1024 * 1024
+"""A streamed track: base64 in JSON chunks, well over a third larger than its bytes."""
 PICTURE_MAX_BYTES = 64 * 1024 * 1024
 """A picture comes back as base64, a third larger than its bytes."""
 VIDEO_MAX_BYTES = 512 * 1024 * 1024
@@ -660,6 +663,126 @@ class OpenRouterVideo:
         return {"Authorization": f"Bearer {self._key}"}
 
 
+class Track:
+    """A track, as musicgen reads one: the bytes, the model, a cost, the lyrics."""
+
+    __slots__ = ("cost", "data", "lyrics", "model")
+
+    def __init__(self, data: bytes, model: str = "", cost: str = "", lyrics: str = "") -> None:
+        self.data = data
+        self.model = model
+        self.cost = cost
+        self.lyrics = lyrics
+
+
+class OpenRouterMusic:
+    """Lyria and the other music models at OpenRouter: Chat Completions with audio
+    out, which OpenRouter sends only as a stream. The stream is read whole - the
+    core client has no other way - and the track put back together from its
+    chunks."""
+
+    name = "openrouter"
+    host = "openrouter.ai"
+
+    def __init__(
+        self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
+    ) -> None:
+        self.model = (model or "google/lyria-3-pro-preview").strip()
+        self._key = api_key or auth_token or ""
+
+    def ready(self) -> str:
+        return "" if self._key else "no openrouter key (ultron auth add openrouter)"
+
+    def cannot(self, request: Any) -> str:
+        if len(request.images) > 1:
+            return "takes one picture at most"
+        if "clip" in self.model and request.seconds and request.seconds != 30:
+            return f"{self.model} makes 30-second clips only"
+        return ""
+
+    async def generate(self, request: Any) -> Track:
+        from ultron.sdk.web import WebError, post
+
+        # Lyria takes its length, its lyrics and "no vocals" as words; musicgen
+        # writes them in as `described`.
+        text = str(getattr(request, "described", "") or request.prompt)
+        content: Any = text
+        if request.images:
+            image = request.images[0]
+            content = [
+                {"type": "text", "text": text},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _data_uri(image.data, image.media_type)},
+                },
+            ]
+        body = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": content}],
+            "modalities": ["text", "audio"],
+            "audio": {"format": "mp3"},
+            "stream": True,
+        }
+        try:
+            response = await post(
+                CHAT_URL,
+                json=body,
+                headers={"Authorization": f"Bearer {self._key}"},
+                timeout=request.timeout,
+                max_bytes=MUSIC_REPLY_MAX_BYTES,
+                user_agent=USER_AGENT,
+            )
+        except WebError as exc:
+            raise RuntimeError(f"OpenRouter unreachable: {type(exc).__name__}") from None
+        if response.status >= 400:
+            raise RuntimeError(_failure(_decode_json(response.body), response.status))
+        if response.truncated:
+            raise RuntimeError(f"the reply is over {MUSIC_REPLY_MAX_BYTES // (1024 * 1024)} MB")
+        data, lyrics, cost = _audio_stream(response.body)
+        if not data:
+            raise RuntimeError("OpenRouter sent no audio")
+        return Track(data, model=self.model, cost=cost, lyrics=lyrics)
+
+
+def _audio_stream(raw: bytes) -> tuple[bytes, str, str]:
+    """The audio, the text and the cost of a Chat Completions stream: every
+    `delta.audio.data` decoded and joined, every transcript and content piece
+    joined, the last `usage.cost`. An `error` in the stream fails it by its code."""
+    audio = bytearray()
+    text: list[str] = []
+    cost = ""
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        if not line.startswith("data:"):
+            continue  # a blank line, or OpenRouter's `: OPENROUTER PROCESSING`
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        chunk = _decode_json(payload.encode("utf-8"))
+        error = chunk.get("error")
+        if isinstance(error, Mapping):
+            code = _code(error.get("code")) or _code(error.get("type"))
+            raise RuntimeError("OpenRouter failed it" + (f" ({code})" if code else ""))
+        usage = chunk.get("usage")
+        if isinstance(usage, Mapping) and isinstance(usage.get("cost"), int | float):
+            cost = f"${usage['cost']:g}"
+        for choice in chunk.get("choices") or ():
+            delta = choice.get("delta") if isinstance(choice, Mapping) else None
+            if not isinstance(delta, Mapping):
+                continue
+            said = delta.get("audio")
+            if isinstance(said, Mapping):
+                if said.get("data"):
+                    try:
+                        audio += base64.b64decode(str(said["data"]))
+                    except ValueError:
+                        raise RuntimeError("OpenRouter sent audio that is not base64") from None
+                if said.get("transcript"):
+                    text.append(str(said["transcript"]))
+            if isinstance(delta.get("content"), str):
+                text.append(delta["content"])
+    return bytes(audio), "".join(text).strip(), cost
+
+
 async def _post_picture(
     url: str, body: Mapping[str, Any], key: str, timeout: float
 ) -> Mapping[str, Any]:
@@ -804,9 +927,10 @@ class OpenRouterPlugin(Plugin):
         # The browser sign-in: a key minted by OpenRouter's PKCE page, stored as
         # the `openrouter:oauth` profile beside any key added by hand.
         ctx.register_login("openrouter", login)
-        # OpenRouter's pictures and videos for imagegen and videogen, when this
-        # Ultron has the points (SDK 1.39) - an older one still gets the provider
-        # and the sign-in. The key is read when one of them reaches OpenRouter.
+        # OpenRouter's pictures, videos and music for imagegen, videogen and
+        # musicgen, when this Ultron has the points (SDK 1.39) - an older one still
+        # gets the provider and the sign-in. The key is read when one of them
+        # reaches OpenRouter.
         if hasattr(ctx, "register_extension"):
             ctx.register_extension(
                 "imagegen.backend",
@@ -821,6 +945,14 @@ class OpenRouterPlugin(Plugin):
                 "openrouter",
                 lambda: OpenRouterVideo(
                     model=str(ctx.setting("video_model", "") or ""),
+                    **_key_only(ctx.credential("openrouter")),
+                ),
+            )
+            ctx.register_extension(
+                "musicgen.backend",
+                "openrouter",
+                lambda: OpenRouterMusic(
+                    model=str(ctx.setting("music_model", "") or ""),
                     **_key_only(ctx.credential("openrouter")),
                 ),
             )
