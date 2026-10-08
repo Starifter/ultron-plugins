@@ -54,7 +54,8 @@ class FireworksProvider(OpenAICompatProvider):
 # imagegen reaches Fireworks, never before.
 
 WORKFLOWS_URL = f"{BASE_URL}/workflows"
-IMAGE_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
+IMAGE_ASPECT_RATIOS = ("1:1", "2:3", "3:2", "4:5", "5:4", "16:9", "9:16", "9:21", "21:9")
+"""The shapes the FLUX workflow's `aspect_ratio` takes."""
 PICTURE_MAX_BYTES = 64 * 1024 * 1024
 CODE = re.compile(r"[^A-Za-z0-9_.-]+")
 USER_AGENT = "ultron-fireworks"
@@ -79,6 +80,19 @@ class FireworksImages:
     edits = False
     """Kontext edits at Fireworks are a submit-and-poll API; not built."""
     masks = False
+    capabilities = {
+        "generate": {
+            "max_count": 1,
+            "supports_size": False,
+            "supports_aspect_ratio": True,
+            "supports_resolution": False,
+        },
+        "edit": {"enabled": False},
+        "geometry": {"aspect_ratios": IMAGE_ASPECT_RATIOS},
+        "output": {},
+    }
+    """Fireworks has no counterpart in OpenClaw; this is what the workflow takes:
+    one picture a call, shaped by `aspect_ratio`, and nothing else."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -101,8 +115,9 @@ class FireworksImages:
         if request.images:
             raise ValueError("Fireworks makes pictures from words only here")
         body: dict[str, Any] = {"prompt": request.prompt}
-        if request.aspect in IMAGE_ASPECTS:
-            body["aspect_ratio"] = IMAGE_ASPECTS[request.aspect]
+        aspect = getattr(request, "aspect_ratio", "")
+        if aspect in IMAGE_ASPECT_RATIOS:
+            body["aspect_ratio"] = aspect
         response = await post(
             f"{WORKFLOWS_URL}/{self.model}/text_to_image",
             json=body,

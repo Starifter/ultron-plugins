@@ -31,32 +31,43 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import contextvars
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 from ultron.sdk.hook import Hook, HookOutcome, HookReturn, PromptEvent
 from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.runtime import ToolError, assert_active
 from ultron.sdk.tool_plugin import Tool, ToolResult, validate_arguments
 
-ASPECTS = ("landscape", "portrait", "square")
-RESOLUTIONS = ("480p", "720p", "1080p")
-MAX_SECONDS = 15
-"""The longest any vendor here makes; xAI's ceiling."""
-MAX_FRAME_BYTES = 20 * 1024 * 1024
-"""A frame is inlined as base64, and every vendor here caps a request well
-below what a larger picture would make of it."""
+MAX_REFERENCES = {"image": 9, "video": 4, "audio": 3}
+"""OpenClaw's: reference images, videos and audios one call may hand in."""
+ROLES = {
+    "image": ("first_frame", "last_frame", "reference_image"),
+    "video": ("reference_video",),
+    "audio": ("reference_audio",),
+}
+"""OpenClaw's canonical roles. A vendor may take other strings; they are passed
+through as written."""
+REFERENCE_MAX_BYTES = {
+    "image": 20 * 1024 * 1024,
+    "video": 100 * 1024 * 1024,
+    "audio": 50 * 1024 * 1024,
+}
+"""What one reference may weigh. Each is inlined as base64 to most vendors, and
+every vendor here caps a request well below what more would make of it."""
 VIDEO_MAX_BYTES = 512 * 1024 * 1024
 """What one download may weigh. Fifteen seconds of 1080p is tens of MB."""
 REPLY_MAX_BYTES = 1024 * 1024
@@ -75,15 +86,14 @@ GOOGLE_HOST = "generativelanguage.googleapis.com"
 
 FRAME_TYPES = ("image/png", "image/jpeg", "image/webp")
 EXTENSIONS = {"video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm"}
+VIDEO_SUFFIXES = tuple(f".{ext}" for ext in EXTENSIONS.values())
 REMOTE_ID = re.compile(r"[A-Za-z0-9._:/-]{1,300}")
 """A vendor's job id, which goes into a URL path. It came from the vendor and
 sits in a file a person can edit, so it is checked before it is used."""
 MODEL_ARGUMENT = (
-    "Which vendor and model to ask first, as provider/model - {example} - or a provider "
-    "alone for the model the person configured there. The providers here: {vendors}; "
-    "`action: list` shows each one's model. Leave it out for the person's choice. If it "
-    "fails or cannot do what is asked, the others are tried on their own models and the "
-    "result says so."
+    "Provider/model override, e.g. {example}. The providers here: {vendors}. If it fails "
+    "or cannot take the request, the others are tried on their own models and the result "
+    "says so."
 )
 LISTED_MODELS = 20
 """The most extra model ids one vendor's line names."""
@@ -116,6 +126,259 @@ def sniff_video(data: bytes) -> str:
     return ""
 
 
+def sniff_audio(data: bytes) -> str:
+    if data.startswith(b"ID3") or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0):
+        return "audio/mpeg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data.startswith(b"OggS"):
+        return "audio/ogg"
+    if data.startswith(b"fLaC"):
+        return "audio/flac"
+    if data[4:8] == b"ftyp":
+        return "audio/mp4"
+    return ""
+
+
+SNIFF = {"image": sniff_frame, "video": sniff_video, "audio": sniff_audio}
+KINDS = {
+    "image": "a PNG, JPEG or WebP picture",
+    "video": "an MP4, MOV or WebM video",
+    "audio": "an MP3, WAV, OGG, M4A or FLAC file",
+}
+
+
+# -- geometry, OpenClaw's -------------------------------------------------------
+#
+# `src/media-generation/runtime-shared.ts` and `geometry-normalization.ts`:
+# the closest supported aspect ratio by log distance, the closest size by shape
+# then area, the closest resolution within its unit. A copy of imagegen's: a
+# plugin imports `ultron.sdk` and nothing of another plugin's.
+
+ASPECT = re.compile(r"^(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)$")
+SIZE = re.compile(r"^(\d+)\s*x\s*(\d+)$", re.IGNORECASE)
+RANK = re.compile(r"^(\d+(?:\.\d+)?)([kp])$", re.IGNORECASE)
+
+
+def parse_aspect_ratio(raw: str | None) -> tuple[float, float, float] | None:
+    match = ASPECT.match((raw or "").strip())
+    if not match:
+        return None
+    width, height = float(match[1]), float(match[2])
+    if width <= 0 or height <= 0:
+        return None
+    return width, height, width / height
+
+
+def parse_size(raw: str | None) -> tuple[int, int, float, int] | None:
+    match = SIZE.match((raw or "").strip())
+    if not match:
+        return None
+    width, height = int(match[1]), int(match[2])
+    if width <= 0 or height <= 0:
+        return None
+    return width, height, width / height, width * height
+
+
+def derive_aspect_ratio(size: str | None) -> str | None:
+    parsed = parse_size(size)
+    if not parsed:
+        return None
+    divisor = math.gcd(parsed[0], parsed[1]) or 1
+    return f"{parsed[0] // divisor}:{parsed[1] // divisor}"
+
+
+def _closest(
+    values: Sequence[str], score: Callable[[str], tuple[float, float] | None]
+) -> str | None:
+    best: tuple[float, float, str] | None = None
+    for value in values:
+        scored = score(value)
+        if scored is None:
+            continue
+        candidate = (scored[0], scored[1], value)
+        if best is None or candidate < best:
+            best = candidate
+    return best[2] if best else None
+
+
+def closest_aspect_ratio(
+    requested: str | None, size: str | None, supported: Sequence[str] | None
+) -> str | None:
+    values = [each for each in supported or () if each.strip()]
+    if not values:
+        return requested or derive_aspect_ratio(size)
+    if requested and requested in values:
+        return requested
+    wanted = parse_aspect_ratio(requested) or parse_aspect_ratio(derive_aspect_ratio(size))
+    if not wanted:
+        return None
+
+    def score(candidate: str) -> tuple[float, float] | None:
+        parsed = parse_aspect_ratio(candidate)
+        if not parsed:
+            return None
+        return (
+            abs(math.log(parsed[2] / wanted[2])),
+            abs(parsed[0] * wanted[1] - wanted[0] * parsed[1]),
+        )
+
+    return _closest(values, score)
+
+
+def closest_size(
+    requested: str | None, aspect_ratio: str | None, supported: Sequence[str] | None
+) -> str | None:
+    values = [each for each in supported or () if each.strip()]
+    if not values:
+        return requested
+    if requested and requested in values:
+        return requested
+    wanted = parse_size(requested)
+    shape = parse_aspect_ratio(aspect_ratio)
+    if not wanted and not shape:
+        return None
+    ratio = wanted[2] if wanted else shape[2]  # type: ignore[index]
+
+    def score(candidate: str) -> tuple[float, float] | None:
+        parsed = parse_size(candidate)
+        if not parsed:
+            return None
+        area = abs(math.log(parsed[3] / wanted[3])) if wanted else float(parsed[3])
+        return abs(math.log(parsed[2] / ratio)), area
+
+    return _closest(values, score)
+
+
+def _rank(resolution: str | None) -> tuple[float, str] | None:
+    match = RANK.match((resolution or "").strip())
+    if not match:
+        return None
+    unit = match[2].upper()
+    value = float(match[1])
+    return (value * 1000 if unit == "K" else value), unit
+
+
+def closest_resolution(requested: str | None, supported: Sequence[str] | None) -> str | None:
+    values = [each for each in supported or () if each.strip()]
+    if not values:
+        return requested
+    if requested and requested in values:
+        return requested
+    wanted = _rank(requested)
+    if not wanted:
+        return None
+
+    def score(candidate: str) -> tuple[float, float] | None:
+        rank = _rank(candidate)
+        if not rank or rank[1] != wanted[1]:
+            return None
+        return abs(rank[0] - wanted[0]), 1.0 if rank[0] < wanted[0] else 0.0
+
+    return _closest(values, score)
+
+
+class Geometry:
+    """What `resolve_geometry` settled on: the values to send, what was moved
+    (`normalized`: key to (requested, applied, derived_from)), and what was
+    dropped (`ignored`: key and value)."""
+
+    __slots__ = ("aspect_ratio", "ignored", "normalized", "resolution", "size")
+
+    def __init__(self) -> None:
+        self.size: str | None = None
+        self.aspect_ratio: str | None = None
+        self.resolution: str | None = None
+        self.ignored: list[tuple[str, Any]] = []
+        self.normalized: dict[str, tuple[Any, Any, str]] = {}
+
+
+def resolve_geometry(
+    *,
+    size: str | None,
+    aspect_ratio: str | None,
+    resolution: str | None,
+    caps: Mapping[str, Any] | None,
+    fallback_sizes: Sequence[str] | None = None,
+    report_unrecognized: bool = False,
+    aspect_for_size: bool = False,
+) -> Geometry:
+    """OpenClaw's `resolveMediaGeometryOverrides`, line for line."""
+    out = Geometry()
+    if caps is None:
+        out.size, out.aspect_ratio, out.resolution = size, aspect_ratio, resolution
+        return out
+    sizes = caps.get("sizes")
+    ratios = caps.get("aspect_ratios")
+    resolutions = caps.get("resolutions")
+    supports_size = bool(caps.get("supports_size"))
+    supports_ratio = bool(caps.get("supports_aspect_ratio"))
+    supports_resolution = bool(caps.get("supports_resolution"))
+
+    if size and sizes and supports_size:
+        moved = closest_size(size, aspect_ratio if aspect_for_size else None, sizes)
+        if moved and moved != size:
+            out.normalized["size"] = (size, moved, "")
+        size = moved
+
+    if size and not supports_size:
+        # A size alone can still be honoured by a vendor that takes a shape.
+        translated = closest_aspect_ratio(aspect_ratio, size, ratios) if supports_ratio else None
+        if translated:
+            aspect_ratio = translated
+            out.normalized["aspectRatio"] = (None, translated, "size")
+        else:
+            out.ignored.append(("size", size))
+        size = None
+
+    if aspect_ratio and ratios and supports_ratio:
+        moved = closest_aspect_ratio(aspect_ratio, size, ratios)
+        if moved and moved != aspect_ratio:
+            out.normalized["aspectRatio"] = (aspect_ratio, moved, "")
+        elif not moved and report_unrecognized:
+            out.ignored.append(("aspectRatio", aspect_ratio))
+        aspect_ratio = moved
+    elif aspect_ratio and not supports_ratio:
+        translated = None
+        if supports_size and not size:
+            # An empty list means sizes are free, not that there are no hints.
+            pool = fallback_sizes if sizes is not None and len(sizes) == 0 else sizes
+            translated = closest_size(None, aspect_ratio, pool)
+        if translated:
+            size = translated
+            out.normalized["size"] = (None, translated, "aspectRatio")
+        else:
+            out.ignored.append(("aspectRatio", aspect_ratio))
+        aspect_ratio = None
+
+    if resolution and resolutions and supports_resolution:
+        moved = closest_resolution(resolution, resolutions)
+        if moved and moved != resolution:
+            out.normalized["resolution"] = (resolution, moved, "")
+        elif not moved and report_unrecognized:
+            out.ignored.append(("resolution", resolution))
+        resolution = moved
+    elif resolution and not supports_resolution:
+        out.ignored.append(("resolution", resolution))
+        resolution = None
+
+    out.size, out.aspect_ratio, out.resolution = size, aspect_ratio, resolution
+    return out
+
+
+def normalize_resolution(raw: str) -> str:
+    """OpenClaw's `normalizeResolution`: `720p` is `720P`, `4k` is `4K`, and
+    anything else - a vendor's own word - is kept as written."""
+    value = raw.strip()
+    upper = value.upper()
+    return upper if re.fullmatch(r"\d+[PK]", upper) else value
+
+
+def select_duration(seconds: int, supported: Sequence[int]) -> int:
+    """OpenClaw's `selectSupportedVideoDuration`: the nearest, the longer on a tie."""
+    return min(supported, key=lambda each: (abs(each - seconds), -each))
+
+
 def _code(value: Any) -> str:
     """A vendor's error code or status as an identifier - never its prose."""
     return CODE.sub("_", str(value or "")).strip("_")[:60]
@@ -124,19 +387,27 @@ def _code(value: Any) -> str:
 # -- what crosses to a vendor ----------------------------------------------------
 
 
-class Frame:
-    """A workspace picture handed to a vendor as a first or last frame.
+class Asset:
+    """A reference handed to a vendor: a picture, a video or a sound, with the
+    role it was given (`imageRoles` and the rest), or none.
 
     Plain classes rather than dataclasses throughout, for imagegen's reason: an
     install at SDK 1.38 from before Starifter/ultron#6 imports a directory
     plugin without registering it, and `@dataclass` under `from __future__
     import annotations` fails there."""
 
-    __slots__ = ("data", "media_type")
+    __slots__ = ("data", "media_type", "name", "role", "url")
 
-    def __init__(self, data: bytes, media_type: str) -> None:
+    def __init__(
+        self, data: bytes, media_type: str, role: str = "", name: str = "", url: str = ""
+    ) -> None:
         self.data = data
         self.media_type = media_type
+        self.role = role
+        self.name = name
+        self.url = url
+        """Where it was fetched from, for a vendor that takes a link and not
+        bytes - xAI's video edits. Empty for a workspace file."""
 
     def b64(self) -> str:
         return base64.b64encode(self.data).decode("ascii")
@@ -145,30 +416,89 @@ class Frame:
         return f"data:{self.media_type};base64,{self.b64()}"
 
 
+Frame = Asset
+"""The name a backend written for videogen 3.x knew."""
+
+
 class Request:
-    __slots__ = ("aspect", "first", "last", "prompt", "resolution", "seconds", "timeout")
+    """What one vendor is asked for, after its capabilities had their say.
+
+    `first`, `last`, `seconds` and `aspect` are what a backend written for
+    videogen 3.x read: the pictures given the first and last frame (or, with no
+    roles, the first and second), the duration, and an empty shape."""
+
+    __slots__ = (
+        "aspect_ratio",
+        "audio",
+        "audios",
+        "duration_seconds",
+        "images",
+        "prompt",
+        "provider_options",
+        "resolution",
+        "size",
+        "timeout",
+        "videos",
+        "watermark",
+    )
 
     def __init__(
         self,
         prompt: str,
-        first: Frame | None = None,
-        last: Frame | None = None,
-        seconds: int = 0,
-        aspect: str = "",
+        images: tuple[Asset, ...] = (),
+        videos: tuple[Asset, ...] = (),
+        audios: tuple[Asset, ...] = (),
+        *,
+        size: str = "",
+        aspect_ratio: str = "",
         resolution: str = "",
+        duration_seconds: int = 0,
+        audio: bool | None = None,
+        watermark: bool | None = None,
+        provider_options: Mapping[str, Any] | None = None,
         timeout: float = 120.0,
     ) -> None:
         self.prompt = prompt
-        self.first = first
-        self.last = last
-        self.seconds = seconds
-        self.aspect = aspect
+        self.images = images
+        self.videos = videos
+        self.audios = audios
+        self.size = size
+        self.aspect_ratio = aspect_ratio
         self.resolution = resolution
+        self.duration_seconds = duration_seconds
+        self.audio = audio
+        self.watermark = watermark
+        self.provider_options = dict(provider_options or {})
         self.timeout = timeout
+
+    def _role(self, role: str, fallback: int) -> Asset | None:
+        for image in self.images:
+            if image.role == role:
+                return image
+        unroled = [image for image in self.images if not image.role]
+        return unroled[fallback] if len(unroled) > fallback else None
+
+    @property
+    def first(self) -> Asset | None:
+        return self._role("first_frame", 0)
+
+    @property
+    def last(self) -> Asset | None:
+        if any(image.role == "first_frame" for image in self.images):
+            return self._role("last_frame", 0)
+        return self._role("last_frame", 1)
+
+    @property
+    def seconds(self) -> int:
+        return self.duration_seconds
+
+    @property
+    def aspect(self) -> str:
+        return ""
 
     @property
     def frames(self) -> int:
-        return (self.first is not None) + (self.last is not None)
+        return len(self.images)
 
 
 class Status:
@@ -231,6 +561,26 @@ class Vendor:
     @property
     def model(self) -> str:
         return str(getattr(self.impl, "model", "") or "")
+
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """The vendor's `capabilities`, OpenClaw's shape, read defensively. One
+        written before 4.0 declares none and is read as what it was: a vendor
+        that takes a first and a last frame, no reference video or sound, and no
+        size, shape, resolution, sound or watermark it could be told about - so
+        each of those is dropped and reported rather than sent to code that
+        would not read it. Its own `cannot` still has the last word."""
+        try:
+            said = getattr(self.impl, "capabilities", None)
+            if isinstance(said, Mapping):
+                return dict(said)
+        except Exception:
+            pass
+        return {
+            "legacy": True,
+            "generate": {},
+            "image_to_video": {"enabled": True, "max_input_images": 2},
+        }
 
     def ready(self) -> str:
         if self.why:
@@ -372,12 +722,66 @@ def _remote(value: Any, where: str) -> str:
 # -- Google ----------------------------------------------------------------------
 
 GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta"
-GOOGLE_ASPECTS = {"landscape": "16:9", "portrait": "9:16"}
+GOOGLE_DURATIONS = (4, 6, 8)
+
+
+def _google_common() -> dict[str, Any]:
+    """OpenClaw's `createGoogleVideoCommonCapabilities`."""
+    return {
+        "max_duration_seconds": 8,
+        "supported_duration_seconds": GOOGLE_DURATIONS,
+        "aspect_ratios": ("16:9", "9:16"),
+        "resolutions": ("720P", "1080P"),
+        "supports_aspect_ratio": True,
+        "supports_resolution": True,
+        "supports_size": True,
+        "supports_audio": False,
+    }
+
+
+def _google_aspect(aspect_ratio: str, size: str) -> str:
+    if aspect_ratio in ("16:9", "9:16"):
+        return aspect_ratio
+    parsed = parse_size(size)
+    if not parsed:
+        return ""
+    return "16:9" if parsed[0] >= parsed[1] else "9:16"
+
+
+def _google_resolution(resolution: str, size: str) -> str:
+    if resolution in ("720P", "1080P"):
+        return resolution.lower()
+    parsed = parse_size(size)
+    if not parsed:
+        return ""
+    edge = max(parsed[0], parsed[1])
+    return "1080p" if edge >= 1920 else "720p" if edge >= 1280 else ""
 
 
 class GoogleVideo:
     host = GOOGLE_HOST
-    seconds = (4, 6, 8)
+    models = (
+        "veo-3.1-fast-generate-preview",
+        "veo-3.1-generate-preview",
+        "veo-3.1-lite-generate-preview",
+    )
+    capabilities = {
+        "generate": {"max_videos": 1, **_google_common()},
+        "image_to_video": {
+            "enabled": True,
+            "max_videos": 1,
+            "max_input_images": 1,
+            **_google_common(),
+        },
+        "video_to_video": {
+            "enabled": True,
+            "max_videos": 1,
+            "max_input_videos": 1,
+            **_google_common(),
+        },
+    }
+    """OpenClaw's Google video provider: one picture to start from, or one video
+    to extend, never both."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -393,33 +797,23 @@ class GoogleVideo:
             return "a Google sign-in cannot make videos; add an AI Studio key"
         return "" if self._key else "no google key (ultron auth add google)"
 
-    def cannot(self, request: Request) -> str:
-        if request.aspect == "square":
-            return "makes 16:9 and 9:16 only"
-        if request.seconds and request.seconds not in self.seconds:
-            return "makes 4, 6 or 8 seconds"
-        if request.resolution == "480p":
-            return "makes 720p or 1080p"
-        if request.resolution == "1080p" and request.seconds not in (0, 8):
-            return "makes 1080p at 8 seconds only"
-        if request.last is not None and request.first is None:
-            return "needs a first frame to go with a last one"
-        return ""
-
     async def submit(self, request: Request) -> str:
         instance: dict[str, Any] = {"prompt": request.prompt}
-        if request.first is not None:
-            instance["image"] = _inline(request.first)
-        if request.last is not None:
-            instance["lastFrame"] = _inline(request.last)
+        if request.images:
+            instance["image"] = _inline(request.images[0])
+        if request.videos:
+            instance["video"] = _inline(request.videos[0])
         parameters: dict[str, Any] = {}
-        if request.aspect in GOOGLE_ASPECTS:
-            parameters["aspectRatio"] = GOOGLE_ASPECTS[request.aspect]
-        if request.resolution:
-            parameters["resolution"] = request.resolution
-        seconds = request.seconds or (8 if request.resolution == "1080p" else 0)
-        if seconds:
-            parameters["durationSeconds"] = seconds
+        aspect = _google_aspect(request.aspect_ratio, request.size)
+        if aspect:
+            parameters["aspectRatio"] = aspect
+        resolution = _google_resolution(request.resolution, request.size)
+        if resolution:
+            parameters["resolution"] = resolution
+        if request.duration_seconds:
+            parameters["durationSeconds"] = select_duration(
+                min(8, max(4, request.duration_seconds)), GOOGLE_DURATIONS
+            )
         body: dict[str, Any] = {"instances": [instance]}
         if parameters:
             body["parameters"] = parameters
@@ -468,8 +862,8 @@ class GoogleVideo:
         return {"x-goog-api-key": self._key}
 
 
-def _inline(frame: Frame) -> dict[str, Any]:
-    return {"inlineData": {"mimeType": frame.media_type, "data": frame.b64()}}
+def _inline(asset: Asset) -> dict[str, Any]:
+    return {"inlineData": {"mimeType": asset.media_type, "data": asset.b64()}}
 
 
 # -- jobs ------------------------------------------------------------------------
@@ -491,6 +885,7 @@ FIELDS = (
     "media_type",
     "cost",
     "notified",
+    "notes",
 )
 
 
@@ -519,6 +914,8 @@ class Job:
         self.media_type = str(values.get("media_type") or "")
         self.cost = str(values.get("cost") or "")
         self.notified = bool(values.get("notified"))
+        self.notes = str(values.get("notes") or "")
+        """What the vendor was sent instead of what was asked - Ultron's words."""
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in FIELDS}
@@ -607,7 +1004,11 @@ class Videogen:
             value = default
         return max(low, min(high, value))
 
-    def timeout(self) -> float:
+    def timeout(self, timeout_ms: int = 0) -> float:
+        """`timeoutMs` when the model gave one, else the person's
+        `timeout_seconds`: one request to a vendor."""
+        if timeout_ms:
+            return max(1.0, min(3600.0, timeout_ms / 1000))
         return self._clamped("timeout_seconds", 120.0, 5.0, 600.0)
 
     def deadline(self) -> float:
@@ -785,8 +1186,10 @@ class Videogen:
     def _write(self, job: Job, data: bytes, media_type: str) -> str:
         ext = EXTENSIONS[media_type]
         named = inside(self.workspace, job.target)
-        base = named.with_suffix("")
-        target = named.with_suffix(f".{ext}")
+        # Joined as text, not `with_suffix`: a name with a dot in it ("v1.2")
+        # would lose its tail.
+        stem = named.name.removesuffix(named.suffix)
+        target = named.parent / f"{stem}.{ext}"
         n = 2
         while True:
             try:
@@ -797,7 +1200,7 @@ class Videogen:
             except FileExistsError:
                 # Something took the name while the video was being made; the
                 # file beside it is the video, and nothing is overwritten.
-                target = base.with_name(f"{base.name}-{n}").with_suffix(f".{ext}")
+                target = named.parent / f"{stem}-{n}.{ext}"
                 n += 1
         return target.relative_to(self.workspace).as_posix()
 
@@ -1010,156 +1413,414 @@ def _age(seconds: float) -> str:
 ACTIONS = ("generate", "status", "list")
 
 
+MODE_LABELS = {
+    "generate": "text-to-video generation",
+    "image_to_video": "image-to-video generation",
+    "video_to_video": "video-to-video generation",
+}
+
+
+def video_mode(images: int, videos: int) -> str:
+    """OpenClaw's `resolveVideoGenerationMode`; empty for pictures and videos
+    both, which only a video-to-video mode that also takes pictures can do."""
+    if images and videos:
+        return ""
+    if videos:
+        return "video_to_video"
+    if images:
+        return "image_to_video"
+    return "generate"
+
+
+def mode_capabilities(
+    caps: Mapping[str, Any], images: int, videos: int
+) -> Mapping[str, Any] | None:
+    """OpenClaw's `resolveVideoGenerationModeCapabilities`."""
+    mode = video_mode(images, videos)
+    if mode:
+        found = caps.get(mode)
+        return found if isinstance(found, Mapping) else None
+    both = caps.get("video_to_video")
+    if (
+        isinstance(both, Mapping)
+        and both.get("enabled")
+        and (both.get("max_input_images") or 0) > 0
+    ):
+        return both
+    return None
+
+
+def capability_failure(
+    label: str, caps: Mapping[str, Any], images: tuple[Asset, ...], videos: int, audios: int
+) -> str:
+    """OpenClaw's `buildVideoGenerationCapabilityFailure`: a vendor that would
+    drop a reference handed in is passed over, never sent a request it would
+    answer without it."""
+    mode = video_mode(len(images), videos)
+    mode_caps = mode_capabilities(caps, len(images), videos)
+    modes = caps.get("modes")
+    if mode and isinstance(modes, list | tuple) and mode not in modes:
+        return f"{label} does not support {MODE_LABELS[mode]}; skipping"
+    if images or videos:
+        what = (
+            "combined image/video reference inputs"
+            if images and videos
+            else "reference image inputs"
+            if images
+            else "reference video inputs"
+        )
+        if mode_caps is None or not mode_caps.get("enabled"):
+            return f"{label} does not support {what}; skipping to avoid silent reference drop"
+    for kind, count, key in (
+        ("image", len(images), "max_input_images"),
+        ("video", videos, "max_input_videos"),
+        ("audio", audios, "max_input_audios"),
+    ):
+        limit = int((mode_caps or {}).get(key) or caps.get(key) or 0)
+        if count > limit:
+            if limit == 0:
+                return (
+                    f"{label} does not support reference {kind} inputs; skipping to avoid "
+                    f"silent {kind} drop"
+                )
+            return (
+                f"{label} supports at most {limit} reference {kind}(s), {count} requested; skipping"
+            )
+    if caps.get("legacy") and any(
+        image.role not in ("", "first_frame", "last_frame") for image in images
+    ):
+        return (
+            f"{label} takes a first and a last frame only; skipping to avoid silent reference drop"
+        )
+    return ""
+
+
+def options_failure(
+    label: str, options: Mapping[str, Any], declared: Mapping[str, str] | None
+) -> str:
+    """OpenClaw's `validateProviderOptionsAgainstDeclaration`: a vendor that
+    declares nothing takes options as they come; one that declares an empty set
+    takes none; one that declares keys takes those, of those types."""
+    if not options or declared is None:
+        return ""
+    if not declared:
+        supplied = ", ".join(options)
+        return f"{label} does not accept providerOptions (caller supplied: {supplied}); skipping"
+    unknown = [key for key in options if key not in declared]
+    if unknown:
+        return (
+            f"{label} does not accept providerOptions keys: {', '.join(unknown)} "
+            f"(accepted: {', '.join(declared)}); skipping"
+        )
+    for key, value in options.items():
+        expected = declared[key]
+        if expected == "number" and (
+            isinstance(value, bool)
+            or not isinstance(value, int | float)
+            or not math.isfinite(value)
+        ):
+            return f"{label} expects providerOptions.{key} to be a finite number; skipping"
+        if expected == "boolean" and not isinstance(value, bool):
+            return f"{label} expects providerOptions.{key} to be a boolean; skipping"
+        if expected == "string" and not isinstance(value, str):
+            return f"{label} expects providerOptions.{key} to be a string; skipping"
+    return ""
+
+
+def supported_durations(mode_caps: Mapping[str, Any] | None) -> tuple[int, ...]:
+    values = (mode_caps or {}).get("supported_duration_seconds") or ()
+    return tuple(
+        sorted({round(each) for each in values if isinstance(each, int | float) and each > 0})
+    )
+
+
+class VideoOverrides:
+    """OpenClaw's `resolveVideoGenerationOverrides` for one vendor."""
+
+    __slots__ = ("audio", "duration_seconds", "geometry", "ignored", "notes", "watermark")
+
+    def __init__(self) -> None:
+        self.geometry = Geometry()
+        self.duration_seconds = 0
+        self.audio: bool | None = None
+        self.watermark: bool | None = None
+        self.ignored: list[tuple[str, Any]] = []
+        self.notes: list[str] = []
+
+
+def resolve_video_overrides(
+    mode_caps: Mapping[str, Any] | None,
+    *,
+    size: str,
+    aspect_ratio: str,
+    resolution: str,
+    duration_seconds: int,
+    audio: bool | None,
+    watermark: bool | None,
+) -> VideoOverrides:
+    out = VideoOverrides()
+    out.geometry = resolve_geometry(
+        size=size or None,
+        aspect_ratio=aspect_ratio or None,
+        resolution=resolution or None,
+        caps=mode_caps,
+        report_unrecognized=True,
+        aspect_for_size=True,
+    )
+    out.ignored = list(out.geometry.ignored)
+    out.audio, out.watermark = audio, watermark
+    if mode_caps is not None and audio is not None and not mode_caps.get("supports_audio"):
+        out.ignored.append(("audio", audio))
+        out.audio = None
+    if mode_caps is not None and watermark is not None and not mode_caps.get("supports_watermark"):
+        out.ignored.append(("watermark", watermark))
+        out.watermark = None
+    if duration_seconds:
+        supported = supported_durations(mode_caps)
+        applied = select_duration(duration_seconds, supported) if supported else duration_seconds
+        if applied != duration_seconds:
+            listed = "/".join(map(str, supported))
+            out.notes.append(
+                f"durationSeconds {duration_seconds} was made as {applied} (it makes {listed})."
+            )
+        out.duration_seconds = applied
+    for key, (requested, applied, derived) in out.geometry.normalized.items():
+        if derived == "size":
+            out.notes.append(f"aspectRatio {applied} was used for size {size}.")
+        elif derived:
+            out.notes.append(f"{key} {applied} was used for aspectRatio.")
+        else:
+            out.notes.append(f"{key} {requested} was made as {applied}.")
+    if out.ignored:
+        dropped = ", ".join(f"{key}={_shown_value(value)}" for key, value in out.ignored)
+        out.notes.append(f"Ignored, not supported: {dropped}.")
+    return out
+
+
+def _shown_value(value: Any) -> str:
+    return str(value).lower() if isinstance(value, bool) else str(value)
+
+
+def reference_inputs(arguments: Mapping[str, Any], kind: str) -> tuple[list[str], list[str]]:
+    """OpenClaw's `readVideoReferenceInputs`: the singular then the plural, an
+    `@` ignored, repeats kept (a role is by position), too many refused, and the
+    roles beside them - an empty slot leaves a role unset."""
+    single = "audioRef" if kind == "audio" else kind
+    plural = f"{single}s"
+    named = []
+    if isinstance(arguments.get(single), str):
+        named.append(arguments[single])
+    named += [each for each in arguments.get(plural) or () if isinstance(each, str)]
+    found = [each.strip().removeprefix("@").strip() for each in named]
+    found = [each for each in found if each]
+    if len(found) > MAX_REFERENCES[kind]:
+        raise ToolError(
+            f"Too many reference {plural}: {len(found)} provided, "
+            f"maximum is {MAX_REFERENCES[kind]}."
+        )
+    raw_roles = arguments.get(f"{kind}Roles")
+    if raw_roles is None:
+        return found, []
+    if not isinstance(raw_roles, list):
+        raise ToolError(
+            f"{kind}Roles must be a JSON array of role strings, parallel to the reference list."
+        )
+    roles = [each.strip() if isinstance(each, str) else "" for each in raw_roles]
+    if len(roles) > len(found):
+        raise ToolError(
+            f"{kind}Roles has {len(roles)} entries but only {len(found)} reference "
+            f"{kind}{'' if len(found) == 1 else 's'} were provided; extra roles cannot be "
+            "aligned positionally."
+        )
+    return found, roles
+
+
 class VideoGenerate(Tool):
     """OpenClaw's `video_generate`: one tool, three actions - start a video,
-    look at one, list them."""
+    see this session's jobs, list the vendors."""
 
     name = "video_generate"
     untrusted = True
     """When every vendor passes, the result names each one's refusal, and a
     refusal carries a vendor's error code; why a job failed is one too."""
 
-    MAX_WAIT = 600
-
     def __init__(self, runner: Videogen) -> None:
         self.runner = runner
         self.workspace = runner.workspace
 
+    def _audio_references(self) -> bool:
+        """OpenClaw shows the reference-audio fields only when a vendor here
+        takes them. Asked of the builders, never of a built vendor: building
+        one reads its key, and a schema is not a reason to read a key. A
+        backend says so with `reference_audio = True` on its builder."""
+        return any(
+            getattr(builder, "reference_audio", False) is True
+            for builder in self.runner.builders().values()
+        )
+
     @property
     def description(self) -> str:  # type: ignore[override]
+        audio = "; audio refs condition sound" if self._audio_references() else ""
         return (
-            "Make a video, saved in the workspace. Use it when the person asks for a video, a "
-            "clip or an animation. `action: generate` (the default) starts it and returns at "
-            "once with a job id; the video takes one to several minutes and you are told when "
-            "it is saved, so tell the person it is on its way and carry on - do not check on it "
-            "in a loop. Describe the shot in the prompt: subject, action, camera, style, and "
-            "any sound or speech. To animate a picture, name a workspace image as "
-            "`first_frame`; `last_frame` is where the video should end. Not every vendor takes "
-            "every length, shape or frame; one that cannot is passed over. Each call is one "
-            "video and costs money: do not make variations nobody asked for. `action: status` "
-            "with a `job` shows one - running, saved, or failed and why - and `wait` waits up to "
-            "that many seconds for it, only when the person is waiting on it; with no `job` it "
-            "lists this session's jobs. `action: list` shows the vendors and their models."
+            "Create video, incl. image-to-video: image refs take first_frame/last_frame/"
+            f"reference_image roles; video refs condition style{audio}. resolution up to 4K; "
+            "audio/watermark toggles. action=list discovers providers/models. Runs in the "
+            "background: call once per request; you are told when it is saved, so give a short "
+            "ack and carry on - no poll. status shows this session's jobs. Duration may round "
+            "to provider value. Each video costs money: no variations nobody asked for."
         )
 
     @property
     def parameters(self) -> dict[str, Any]:  # type: ignore[override]
-        return {
-            "type": "object",
-            "properties": {
-                "action": {
-                    "type": "string",
-                    "enum": list(ACTIONS),
-                    "description": "generate (the default), status or list.",
-                },
-                "prompt": {
-                    "type": "string",
-                    "description": "What happens in the video. Needed to generate.",
-                },
-                "first_frame": {
-                    "type": "string",
-                    "description": "A workspace PNG, JPEG or WebP the video starts from.",
-                },
-                "last_frame": {
-                    "type": "string",
-                    "description": "A workspace PNG, JPEG or WebP the video ends on.",
-                },
-                "seconds": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "maximum": MAX_SECONDS,
-                    "description": "How long. Leave it out for the vendor's default.",
-                },
-                "aspect": {
-                    "type": "string",
-                    "enum": list(ASPECTS),
-                    "description": "landscape is 16:9, portrait 9:16. Leave it out for the "
-                    "vendor's default.",
-                },
-                "resolution": {
-                    "type": "string",
-                    "enum": list(RESOLUTIONS),
-                    "description": "Leave it out for the vendor's default.",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Where to save it, relative to the workspace. Leave it out "
-                    "for a new file. Never an existing file.",
-                },
-                "model": {
-                    "type": "string",
-                    "description": MODEL_ARGUMENT.format(
-                        vendors=", ".join(self.runner.builders()),
-                        example="google/veo-3.1-generate-preview",
-                    ),
-                },
-                "job": {
-                    "type": "string",
-                    "description": "A job id, vg-... For status; leave it out for all of "
-                    "this session's jobs.",
-                },
-                "wait": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": self.MAX_WAIT,
-                    "description": "Seconds to wait for the job to finish. For status.",
-                },
+        properties: dict[str, Any] = {
+            "action": {
+                "type": "string",
+                "description": '"generate" default, "status" active task, "list" providers/models.',
+            },
+            "prompt": {"type": "string", "description": "Video prompt."},
+            "image": {"type": "string", "description": "One reference image path/URL."},
+            "images": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": f"Reference images; max {MAX_REFERENCES['image']}.",
+            },
+            "imageRoles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "`image` + `images` roles by index. Values: first_frame, "
+                "last_frame, reference_image; empty string leaves unset.",
+            },
+            "video": {"type": "string", "description": "One reference video path/URL."},
+            "videos": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": f"Reference videos; max {MAX_REFERENCES['video']}.",
+            },
+            "videoRoles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "`video` + `videos` roles by index. Value: reference_video; "
+                "empty string leaves unset.",
+            },
+            "audioRef": {
+                "type": "string",
+                "description": "One reference audio path/URL, e.g. music.",
+            },
+            "audioRefs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": f"Reference audios; max {MAX_REFERENCES['audio']}.",
+            },
+            "audioRoles": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "`audioRef` + `audioRefs` roles by index. Value: "
+                "reference_audio; empty string leaves unset.",
+            },
+            "model": {
+                "type": "string",
+                "description": MODEL_ARGUMENT.format(
+                    vendors=", ".join(self.runner.builders()),
+                    example="google/veo-3.1-generate-preview",
+                ),
+            },
+            "filename": {
+                "type": "string",
+                "description": "Output filename hint; basename preserved in managed media dir.",
+            },
+            "size": {"type": "string", "description": "Size hint, e.g. 1280x720, 1920x1080."},
+            "aspectRatio": {
+                "type": "string",
+                "description": 'Aspect ratio: 1:1, 16:9, 9:16, "adaptive", or provider value; '
+                "unsupported normalized/ignored.",
+            },
+            "resolution": {
+                "type": "string",
+                "description": "Resolution: 360P, 480P, 540P, 720P, 768P, 1080P, 4K, or "
+                "provider value; unsupported normalized/ignored.",
+            },
+            "durationSeconds": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Target seconds; may round to nearest supported duration.",
+            },
+            "audio": {"type": "boolean", "description": "Generated-audio toggle."},
+            "watermark": {"type": "boolean", "description": "Watermark toggle."},
+            "providerOptions": {
+                "type": "object",
+                "description": 'Provider JSON options, e.g. {"seed":42}. Keys/types must match '
+                "provider capabilities; mismatch skips candidate. Use action=list for "
+                "accepted keys.",
+            },
+            "timeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Provider timeout ms.",
             },
         }
+        if not self._audio_references():
+            for key in ("audioRef", "audioRefs", "audioRoles"):
+                del properties[key]
+        return {"type": "object", "properties": properties}
 
     def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_arguments(self.parameters, arguments, tool=self.name)
         action = str(checked.get("action", "") or "generate").strip().lower()
         if action not in ACTIONS:
             raise ToolError(f"action must be one of: {', '.join(ACTIONS)}")
-        if action == "list":
+        if action != "generate":
             return {"action": action}
-        if action == "status":
-            job = str(checked.get("job", "") or "").strip()
-            wait = int(checked.get("wait") or 0) if job else 0
-            return {"action": action, "job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
         prompt = str(checked.get("prompt", "") or "").strip()
         if not prompt:
             raise ToolError("generate needs a prompt")
-        first = str(checked.get("first_frame", "") or "").strip()
-        last = str(checked.get("last_frame", "") or "").strip()
-        seconds = int(checked.get("seconds") or 0)
-        if seconds and not 1 <= seconds <= MAX_SECONDS:
-            raise ToolError(f"seconds must be 1 to {MAX_SECONDS}")
-        aspect = str(checked.get("aspect", "") or "").strip().lower()
-        if aspect and aspect not in ASPECTS:
-            raise ToolError(f"aspect must be one of: {', '.join(ASPECTS)}")
-        resolution = str(checked.get("resolution", "") or "").strip().lower()
-        if resolution and resolution not in RESOLUTIONS:
-            raise ToolError(f"resolution must be one of: {', '.join(RESOLUTIONS)}")
-        path = str(checked.get("path", "") or "").strip()
-        for named in (first, last, path):
-            if named:
-                inside(self.workspace, named)
+        references = {kind: reference_inputs(checked, kind) for kind in ("image", "video", "audio")}
+        for kind, (inputs, _) in references.items():
+            for named in inputs:
+                if not _is_url(named) and not named.startswith("data:"):
+                    inside(self.workspace, _local(named, kind))
+        duration = checked.get("durationSeconds")
+        if duration is not None and int(duration) < 1:
+            raise ToolError("durationSeconds must be a positive integer")
+        options = checked.get("providerOptions")
+        if options is not None and not isinstance(options, Mapping):
+            raise ToolError(
+                "providerOptions must be a JSON object keyed by provider-specific option name."
+            )
+        timeout_ms = checked.get("timeoutMs")
+        if timeout_ms is not None and int(timeout_ms) < 1:
+            raise ToolError("timeoutMs must be a positive integer in milliseconds.")
+        provider, model = _choice(checked)
         return {
             "action": action,
             "prompt": prompt,
-            "first_frame": first,
-            "last_frame": last,
-            "seconds": seconds,
-            "aspect": aspect,
-            "resolution": resolution,
-            "path": path,
-            **dict(zip(("provider", "model"), _choice(checked), strict=True)),
+            "references": {kind: [list(a), list(b)] for kind, (a, b) in references.items()},
+            "size": str(checked.get("size", "") or "").strip(),
+            "aspect_ratio": str(checked.get("aspectRatio", "") or "").strip(),
+            "resolution": normalize_resolution(str(checked.get("resolution", "") or "")),
+            "duration_seconds": int(duration) if duration is not None else 0,
+            "audio": checked.get("audio"),
+            "watermark": checked.get("watermark"),
+            "provider_options": dict(options or {}),
+            "timeout_ms": int(timeout_ms) if timeout_ms is not None else 0,
+            "filename": str(checked.get("filename", "") or "").strip(),
+            "provider": provider,
+            "model": model,
         }
 
     async def run(  # type: ignore[override]
         self,
         action: str = "generate",
         prompt: str = "",
-        first_frame: str = "",
-        last_frame: str = "",
-        seconds: int = 0,
-        aspect: str = "",
+        references: Mapping[str, Any] | None = None,
+        size: str = "",
+        aspect_ratio: str = "",
         resolution: str = "",
-        path: str = "",
-        job: str = "",
-        wait: int = 0,
+        duration_seconds: int = 0,
+        audio: bool | None = None,
+        watermark: bool | None = None,
+        provider_options: Mapping[str, Any] | None = None,
+        timeout_ms: int = 0,
+        filename: str = "",
         provider: str = "",
         model: str = "",
     ) -> ToolResult:
@@ -1167,38 +1828,80 @@ class VideoGenerate(Tool):
         if action == "list":
             return self._list()
         if action == "status":
-            return await self._status(job, wait)
-        return await self._generate(
-            prompt, first_frame, last_frame, seconds, aspect, resolution, path, provider, model
-        )
-
-    # -- generate ----------------------------------------------------------------
-
-    async def _generate(
-        self,
-        prompt: str,
-        first_frame: str,
-        last_frame: str,
-        seconds: int,
-        aspect: str,
-        resolution: str,
-        path: str,
-        provider: str = "",
-        model: str = "",
-    ) -> ToolResult:
+            return self._jobs()
         runner = self.runner
         try:
-            first = self._frame(first_frame) if first_frame else None
-            last = self._frame(last_frame) if last_frame else None
-            target = self._target(path, prompt)
+            loaded = {
+                kind: tuple(
+                    [
+                        await self._asset(kind, named, roles[index] if index < len(roles) else "")
+                        for index, named in enumerate(inputs)
+                    ]
+                )
+                for kind, (inputs, roles) in (references or {}).items()
+            }
+            target = self._target(filename, prompt)
         except ToolError as exc:
             return ToolResult.error(str(exc))
-        request = Request(prompt, first, last, seconds, aspect, resolution, runner.timeout())
+        images = loaded.get("image", ())
+        videos = loaded.get("video", ())
+        audios = loaded.get("audio", ())
+        timeout = runner.timeout(timeout_ms)
         passed: list[str] = []
         for vendor in runner.vendors(provider, model):
-            missing = vendor.ready() or vendor.cannot(request)
+            label = f"{vendor.name}/{vendor.model}" if vendor.model else vendor.name
+            missing = vendor.ready()
             if missing:
                 passed.append(f"{vendor.name}: {missing}")
+                continue
+            caps = vendor.capabilities
+            mode_caps = mode_capabilities(caps, len(images), len(videos))
+            declared = (mode_caps or {}).get("provider_options", caps.get("provider_options"))
+            skip = capability_failure(label, caps, images, len(videos), len(audios))
+            skip = skip or options_failure(
+                label, provider_options or {}, declared if isinstance(declared, Mapping) else None
+            )
+            most = (mode_caps or {}).get("max_duration_seconds", caps.get("max_duration_seconds"))
+            if (
+                not skip
+                and duration_seconds
+                and not supported_durations(mode_caps)
+                and isinstance(most, int | float)
+                and duration_seconds > most
+            ):
+                skip = (
+                    f"{label} supports at most {most:g}s per video, {duration_seconds}s "
+                    "requested; skipping"
+                )
+            if skip:
+                passed.append(skip)
+                continue
+            shaped = resolve_video_overrides(
+                mode_caps,
+                size=size,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                duration_seconds=duration_seconds,
+                audio=audio,
+                watermark=watermark,
+            )
+            request = Request(
+                prompt,
+                images,
+                videos,
+                audios,
+                size=shaped.geometry.size or "",
+                aspect_ratio=shaped.geometry.aspect_ratio or "",
+                resolution=shaped.geometry.resolution or "",
+                duration_seconds=shaped.duration_seconds,
+                audio=shaped.audio,
+                watermark=shaped.watermark,
+                provider_options=provider_options,
+                timeout=timeout,
+            )
+            refused = vendor.cannot(request)
+            if refused:
+                passed.append(f"{vendor.name}: {refused}")
                 continue
             assert_active()  # the last moment before money is spent
             started = time.monotonic()
@@ -1211,7 +1914,9 @@ class VideoGenerate(Tool):
             except Exception as exc:  # a refusal; the next vendor is asked
                 error = _said(exc)
             else:
-                return self._submitted(vendor, remote, request, target, passed, started)
+                return self._submitted(
+                    vendor, remote, request, target, passed, started, " ".join(shaped.notes)
+                )
             runner.ctx.audit(
                 "submit",
                 error,
@@ -1231,6 +1936,7 @@ class VideoGenerate(Tool):
         target: str,
         passed: list[str],
         started: float,
+        notes: str = "",
     ) -> ToolResult:
         runner = self.runner
         job = Job(
@@ -1242,6 +1948,7 @@ class VideoGenerate(Tool):
             session=runner.session,
             state="running",
             created=time.time(),
+            notes=notes,
         )
         runner.ctx.audit(
             "submit",
@@ -1257,50 +1964,62 @@ class VideoGenerate(Tool):
         runner.start(job, vendor)
         line = (
             f"Started video {job.id} with {job.made_by()}; it will be saved to {target} "
-            "when it is ready, usually in one to several minutes, and you will be told then. "
-            f"video_generate status {job.id} checks on it or waits for it."
+            "when it is ready, usually in one to several minutes, and you will be told then."
         )
+        if notes:
+            line += f" {notes}"
         if passed:
             line += f" Passed over {'; '.join(passed)}."
         return ToolResult.ok(line)
 
-    def _frame(self, named: str) -> Frame:
-        target = inside(self.workspace, named)
-        try:
-            data = target.read_bytes()
-        except FileNotFoundError:
-            raise ToolError(f"no such file: {named}") from None
-        except (IsADirectoryError, PermissionError):
-            raise ToolError(f"cannot read {named}") from None
-        if len(data) > MAX_FRAME_BYTES:
-            raise ToolError(f"{named} is over {MAX_FRAME_BYTES // (1024 * 1024)} MB")
-        media_type = sniff_frame(data)
-        if media_type not in FRAME_TYPES:
-            raise ToolError(f"{named} is not a PNG, JPEG or WebP picture")
-        return Frame(data, media_type)
+    async def _asset(self, kind: str, named: str, role: str) -> Asset:
+        """A reference: a workspace path, a `file://` URL inside the workspace,
+        a `data:` URL, or an http(s) URL fetched under the operator's address
+        policy - OpenClaw's four. The bytes go to a vendor and never to the
+        model."""
+        most = REFERENCE_MAX_BYTES[kind]
+        url = ""
+        if named.startswith("data:"):
+            data, label = _data_url(named), "data URL"
+        elif _is_url(named):
+            data, label, url = await _fetch(named, most), urlsplit(named).hostname or "URL", named
+        else:
+            target = inside(self.workspace, _local(named, kind))
+            try:
+                data = target.read_bytes()
+            except FileNotFoundError:
+                raise ToolError(f"no such file: {named}") from None
+            except (IsADirectoryError, PermissionError):
+                raise ToolError(f"cannot read {named}") from None
+            label = target.name
+        if len(data) > most:
+            raise ToolError(f"{named} is over {most // (1024 * 1024)} MB")
+        media_type = SNIFF[kind](data)
+        if not media_type or (kind == "image" and media_type not in FRAME_TYPES):
+            raise ToolError(f"{named} is not {KINDS[kind]}")
+        return Asset(data, media_type, role, label, url)
 
-    def _target(self, path: str, prompt: str) -> str:
-        """Where the video will go, decided now so the result can say so. A
-        named path that exists, or that a running job has claimed, is refused
-        before anything is spent."""
+    def _target(self, filename: str, prompt: str) -> str:
+        """Where the video will go, decided now so the result can say so:
+        `output_dir`, under the basename of the `filename` hint (OpenClaw's
+        managed media dir) or a name made from the time and the prompt. A name
+        already taken, or claimed by a running job, gets `-2`, `-3`."""
         reserved = self.runner.reserved()
-        if path:
-            named = inside(self.workspace, path)
-            shown = named.relative_to(self.workspace).as_posix()
-            if named.suffix.lower() not in (".mp4", ".mov", ".webm"):
-                named = named.with_suffix(".mp4")
-                shown = named.relative_to(self.workspace).as_posix()
-            if named.exists() or shown in reserved:
-                raise ToolError(f"{shown} already exists; name a new file")
-            return shown
-        folder = str(self.runner.ctx.setting("output_dir", "videos") or "videos")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40].strip("-") or "video"
-        base = inside(self.workspace, folder) / f"{stamp}-{slug}"
-        target = base.with_suffix(".mp4")
+        folder = inside(
+            self.workspace, str(self.runner.ctx.setting("output_dir", "videos") or "videos")
+        )
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename.replace("\\", "/")).stem)
+        stem = stem.strip(".-")[:80]
+        if not stem:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40].strip("-")
+            stem = f"{stamp}-{slug or 'video'}"
+        # Joined as text, not `with_suffix`: a stem with a dot in it ("v1.2")
+        # would lose its tail, and every `-n` would come back the same name.
+        target = folder / f"{stem}.mp4"
         n = 2
-        while target.exists() or target.relative_to(self.workspace).as_posix() in reserved:
-            target = base.with_name(f"{base.name}-{n}").with_suffix(".mp4")
+        while _taken(target, reserved, self.workspace, VIDEO_SUFFIXES):
+            target = folder / f"{stem}-{n}.mp4"
             n += 1
         return target.relative_to(self.workspace).as_posix()
 
@@ -1316,8 +2035,8 @@ class VideoGenerate(Tool):
         return ToolResult.ok("\n".join(lines))
 
     def _jobs(self) -> ToolResult:
-        """This session's jobs, newest first - `status` with no job, as
-        OpenClaw's `status` is the session's task."""
+        """This session's jobs, newest first - OpenClaw's `status`, the
+        session's task."""
         runner = self.runner
         jobs = runner.mine()[-10:]
         if not jobs:
@@ -1326,20 +2045,63 @@ class VideoGenerate(Tool):
             runner.told(each)
         return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
 
-    async def _status(self, job: str, wait: int) -> ToolResult:
-        if not job:
-            return self._jobs()
-        runner = self.runner
-        found = {each.id: each for each in runner.mine()}.get(job)
-        if found is None:
-            return ToolResult.error(f"no video job {job} in this session")
-        if wait and found.state == "running" and job in runner.tasks:
-            ended = runner.ended.setdefault(job, asyncio.Event())
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(ended.wait()), timeout=wait)
-            found = {each.id: each for each in runner.mine()}.get(job, found)
-        runner.told(found)
-        return ToolResult.ok(_line(found))
+
+def _taken(target: Path, reserved: set[str], workspace: Path, suffixes: tuple[str, ...]) -> bool:
+    """Whether `target`'s name is spoken for under any extension the file
+    could come back as. The extension is the vendor's to decide, so a name is
+    free only when no file and no running job holds it as any of them - else
+    the result would name one file and the save, finding the real extension
+    taken, would write another."""
+    stem = target.name.removesuffix(target.suffix)
+    rel = target.parent.relative_to(workspace).as_posix()
+    for suffix in suffixes:
+        if (target.parent / f"{stem}{suffix}").exists() or f"{rel}/{stem}{suffix}" in reserved:
+            return True
+    return False
+
+
+def _is_url(named: str) -> bool:
+    return named.lower().startswith(("http://", "https://"))
+
+
+def _local(named: str, kind: str) -> str:
+    """A path, or a `file://` URL's path."""
+    if named.lower().startswith("file://"):
+        path = unquote(urlsplit(named).path)
+        # file:///C:/x on Windows is the path C:/x.
+        return path[1:] if re.match(r"^/[A-Za-z]:", path) else path
+    if re.match(r"^[a-z][a-z0-9+.-]*:", named, re.IGNORECASE) and not re.match(
+        r"^[a-z]:[\\/]", named, re.IGNORECASE
+    ):
+        raise ToolError(
+            f"Unsupported {kind} reference: {named}. Use a file path, a file:// URL, a data: "
+            "URL, or an http(s) URL."
+        )
+    return named
+
+
+def _data_url(named: str) -> bytes:
+    head, _, payload = named.partition(",")
+    if not head.endswith(";base64"):
+        raise ToolError("a data: URL reference must be base64")
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        raise ToolError("a data: URL reference is not valid base64") from None
+
+
+async def _fetch(url: str, most: int) -> bytes:
+    from ultron.sdk.web import get
+
+    try:
+        response = await get(url, max_bytes=most, timeout=120.0, user_agent="ultron-videogen")
+    except Exception as exc:  # the address policy, or the network
+        raise ToolError(f"could not fetch {url}: {type(exc).__name__}") from None
+    if response.status >= 400:
+        raise ToolError(f"HTTP {response.status} fetching {url}")
+    if response.truncated:
+        raise ToolError(f"{url} is over {most // (1024 * 1024)} MB")
+    return response.body
 
 
 def _submission(vendor: Vendor, request: Request) -> dict[str, Any]:
@@ -1348,25 +2110,38 @@ def _submission(vendor: Vendor, request: Request) -> dict[str, Any]:
     arguments: dict[str, Any] = {
         "vendor": vendor.name,
         "model": vendor.model,
-        "frames": request.frames,
+        "images": len(request.images),
+        "videos": len(request.videos),
+        "audios": len(request.audios),
     }
-    for key in ("seconds", "aspect", "resolution"):
-        if getattr(request, key):
-            arguments[key] = getattr(request, key)
+    for key, value in (
+        ("size", request.size),
+        ("aspectRatio", request.aspect_ratio),
+        ("resolution", request.resolution),
+        ("durationSeconds", request.duration_seconds),
+        ("audio", request.audio),
+        ("watermark", request.watermark),
+    ):
+        if value or value is False:
+            arguments[key] = value
+    if request.provider_options:
+        arguments["providerOptions"] = sorted(request.provider_options)
     return arguments
 
 
 def _line(job: Job) -> str:
     if job.state == "running":
         age = _age(time.time() - job.created)
-        return f"{job.id}: running for {age} at {job.made_by()}, to be saved to {job.target}"
-    if job.state == "done":
+        line = f"{job.id}: running for {age} at {job.made_by()}, to be saved to {job.target}"
+    elif job.state == "done":
         cost = f", {job.cost}" if job.cost else ""
-        return (
+        line = (
             f"{job.id}: saved to {job.saved} by {job.made_by()} "
             f"({job.media_type}, {_human(job.bytes)}{cost})"
         )
-    return f"{job.id}: failed at {job.made_by()} - {job.error}"
+    else:
+        line = f"{job.id}: failed at {job.made_by()} - {job.error}"
+    return f"{line}. {job.notes}" if job.notes else line
 
 
 # -- the hooks -------------------------------------------------------------------

@@ -262,10 +262,7 @@ def _why(body: bytes) -> str:
 # reads the key when imagegen or videogen reaches xAI, never before.
 
 IMAGES_URL = f"{BASE_URL}/images"
-IMAGE_ASPECTS = {"square": "1:1", "landscape": "16:9", "portrait": "9:16"}
-"""Grok Imagine's ratios run wide; 16:9 and 9:16 are the pair it lists."""
 VIDEOS_URL = f"{BASE_URL}/videos"
-VIDEO_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
 PICTURE_MAX_BYTES = 64 * 1024 * 1024
 """A picture comes back as base64, a third larger than its bytes."""
 VIDEO_MAX_BYTES = 512 * 1024 * 1024
@@ -275,15 +272,27 @@ REMOTE_ID = re.compile(r"[A-Za-z0-9._:/-]{1,300}")
 CODE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-class Made:
-    """A picture, as imagegen reads one: the bytes, the model, a cost."""
+class Pictures:
+    """What imagegen reads back: `images` (each with `data`), the model, a cost.
+    `data` is the first, for an imagegen before 4.0."""
 
-    __slots__ = ("cost", "data", "model")
+    __slots__ = ("cost", "images", "model")
 
-    def __init__(self, data: bytes, model: str = "", cost: str = "") -> None:
-        self.data = data
+    def __init__(self, images: list[bytes], model: str = "", cost: str = "") -> None:
+        self.images = [Picture(data) for data in images]
         self.model = model
         self.cost = cost
+
+    @property
+    def data(self) -> bytes:
+        return self.images[0].data
+
+
+class Picture:
+    __slots__ = ("data",)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
 
 
 class Status:
@@ -305,15 +314,61 @@ class Retry(Exception):
     retry = True
 
 
+XAI_IMAGE_ASPECT_RATIOS = (
+    "1:1",
+    "16:9",
+    "9:16",
+    "4:3",
+    "3:4",
+    "3:2",
+    "2:3",
+    "2:1",
+    "1:2",
+    "19.5:9",
+    "9:19.5",
+    "20:9",
+    "9:20",
+)
+XAI_VIDEO_ASPECT_RATIOS = ("1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3")
+XAI_VIDEO_15_MODELS = (
+    "grok-imagine-video-1.5",
+    "grok-imagine-video-1.5-preview",
+    "grok-imagine-video-1.5-2026-05-30",
+)
+
+
+def _wants(request: Any, name: str, default: Any = "") -> Any:
+    """A field of imagegen's or videogen's request, or its default when an
+    older one sent a request without it."""
+    return getattr(request, name, default)
+
+
 class XAIImages:
     """Grok Imagine pictures: `/images/generations`, and `/images/edits` as
-    JSON with the picture as a data URI, one at a time."""
+    JSON with the pictures as data URIs - OpenClaw's xAI image provider."""
 
     host = "api.x.ai"
+    capabilities = {
+        "generate": {
+            "max_count": 4,
+            "supports_size": False,
+            "supports_aspect_ratio": True,
+            "supports_resolution": True,
+        },
+        "edit": {
+            "enabled": True,
+            "max_count": 4,
+            "max_input_images": 3,
+            "supports_size": False,
+            "supports_aspect_ratio": True,
+            "supports_resolution": True,
+        },
+        "geometry": {"aspect_ratios": XAI_IMAGE_ASPECT_RATIOS, "resolutions": ("1K", "2K")},
+        "output": {},
+    }
     edits = True
-    masks = False
-    max_images = 1
-    """`/images/edits` takes one `image`; nothing documents more."""
+    max_images = 3
+    """What an imagegen before 4.0 read."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -324,61 +379,143 @@ class XAIImages:
     def ready(self) -> str:
         return "" if self._key else "no xai key (ultron auth add xai)"
 
-    async def generate(self, request: Any) -> Made:
+    async def generate(self, request: Any) -> Pictures:
         if not request.prompt.strip():
             raise ValueError("nothing to make: the prompt is empty")
         body: dict[str, Any] = {
             "model": self.model,
             "prompt": request.prompt,
+            "n": max(1, min(4, int(_wants(request, "count", 1) or 1))),
             "response_format": "b64_json",
         }
-        if request.images:
+        aspect = _wants(request, "aspect_ratio")
+        if aspect in XAI_IMAGE_ASPECT_RATIOS:
+            body["aspect_ratio"] = aspect
+        resolution = _wants(request, "resolution")
+        if resolution:
+            body["resolution"] = str(resolution).lower()
+        images = list(request.images)
+        if len(images) > 1:
+            body["images"] = [
+                {"url": _data_uri(image.data, image.media_type), "type": "image_url"}
+                for image in images
+            ]
+        elif images:
             # JSON, not multipart: xAI refuses the form OpenAI's edits take.
-            image = request.images[0]
-            body["image"] = {"url": _data_uri(image.data, image.media_type), "type": "image_url"}
-            url = f"{IMAGES_URL}/edits"
-        else:
-            body["n"] = 1
-            if request.aspect in IMAGE_ASPECTS:
-                body["aspect_ratio"] = IMAGE_ASPECTS[request.aspect]
-            url = f"{IMAGES_URL}/generations"
+            body["image"] = {
+                "url": _data_uri(images[0].data, images[0].media_type),
+                "type": "image_url",
+            }
+        url = f"{IMAGES_URL}/edits" if images else f"{IMAGES_URL}/generations"
         parsed = await _send(
             "POST", url, self._key, request.timeout, body=body, max_bytes=PICTURE_MAX_BYTES
         )
-        return Made(_first_b64(parsed), model=self.model)
+        return Pictures(_all_b64(parsed), model=self.model)
+
+
+def _xai_video_mode(resolutions: tuple[str, ...], most_images: int) -> dict[str, Any]:
+    return {
+        "max_videos": 1,
+        "max_duration_seconds": 15,
+        "aspect_ratios": XAI_VIDEO_ASPECT_RATIOS,
+        "resolutions": resolutions,
+        "supports_aspect_ratio": True,
+        "supports_resolution": True,
+        **({"enabled": True, "max_input_images": most_images} if most_images else {}),
+    }
 
 
 class XAIVideo:
-    """Grok Imagine videos: `/videos/generations`, then `/videos/{id}`."""
+    """Grok Imagine videos: `/videos/generations`, `/videos/edits` and
+    `/videos/extensions`, then `/videos/{id}` - OpenClaw's xAI video provider."""
 
     host = "api.x.ai"
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
     ) -> None:
-        self.model = (model or "grok-imagine-video-1.5").strip()
+        self.model = (model or "grok-imagine-video").strip()
         self._key = api_key or auth_token or ""
+
+    @property
+    def models(self) -> tuple[str, ...]:
+        return ("grok-imagine-video", "grok-imagine-video-1.5")
+
+    @property
+    def latest(self) -> bool:
+        return self.model in XAI_VIDEO_15_MODELS
+
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """OpenClaw's: the classic model makes from words, from a first frame or
+        up to seven reference pictures, and edits or extends a video; 1.5 only
+        animates one first frame, but at up to 1080P."""
+        if self.latest:
+            return {
+                "modes": ("image_to_video",),
+                "image_to_video": _xai_video_mode(("480P", "720P", "1080P"), 1),
+                "video_to_video": {"enabled": False},
+            }
+        return {
+            "generate": _xai_video_mode(("480P", "720P"), 0),
+            "image_to_video": _xai_video_mode(("480P", "720P"), 7),
+            "video_to_video": {
+                "enabled": True,
+                "max_videos": 1,
+                "max_input_videos": 1,
+                "max_duration_seconds": 10,
+                "supports_aspect_ratio": False,
+                "supports_resolution": False,
+            },
+        }
 
     def ready(self) -> str:
         return "" if self._key else "no xai key (ultron auth add xai)"
 
     def cannot(self, request: Any) -> str:
-        if request.last is not None and self.model == "grok-imagine-video":
-            return f"{self.model} takes no last frame"
+        """What OpenClaw's `prepareCreateRequest` refuses before anything is spent."""
+        images = list(getattr(request, "images", ()) or ())
+        videos = list(getattr(request, "videos", ()) or ())
+        references = [image for image in images if getattr(image, "role", "") == "reference_image"]
+        if references and len(references) != len(images):
+            return "reference pictures cannot be mixed with a first frame"
+        if not references and len(images) > 1:
+            return "takes one first-frame picture"
+        if self.latest and any(
+            getattr(image, "role", "") not in ("", "first_frame") for image in images
+        ):
+            return f"{self.model} takes only a first-frame picture"
+        if videos and not getattr(videos[0], "url", ""):
+            return "edits a video only from an http(s) link to it, not a file"
         return ""
 
     async def submit(self, request: Any) -> str:
+        images = list(getattr(request, "images", ()) or ())
+        videos = list(getattr(request, "videos", ()) or ())
+        duration = int(_wants(request, "duration_seconds", 0) or getattr(request, "seconds", 0))
         body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["duration"] = request.seconds
-        if request.aspect in VIDEO_ASPECTS:
-            body["aspect_ratio"] = VIDEO_ASPECTS[request.aspect]
-        if request.resolution:
-            body["resolution"] = request.resolution
-        if request.first is not None:
-            body["image"] = {"url": _data_uri(request.first.data, request.first.media_type)}
-        if request.last is not None:
-            body["last_frame"] = {"url": _data_uri(request.last.data, request.last.media_type)}
+        if videos:
+            body["video"] = {"url": videos[0].url}
+            if duration:
+                body["duration"] = max(2, min(10, duration))
+            endpoint = "extensions" if duration else "edits"
+            parsed = await _send(
+                "POST", f"{VIDEOS_URL}/{endpoint}", self._key, request.timeout, body=body
+            )
+            return _remote(parsed.get("request_id"))
+        references = images and all(getattr(i, "role", "") == "reference_image" for i in images)
+        if references:
+            body["reference_images"] = [{"url": _data_uri(i.data, i.media_type)} for i in images]
+        elif images:
+            body["image"] = {"url": _data_uri(images[0].data, images[0].media_type)}
+        body["duration"] = max(1, min(10 if references else 15, duration)) if duration else 8
+        aspect = _wants(request, "aspect_ratio")
+        if aspect in XAI_VIDEO_ASPECT_RATIOS or not (images and not references):
+            body["aspect_ratio"] = aspect if aspect in XAI_VIDEO_ASPECT_RATIOS else "16:9"
+        resolution = str(_wants(request, "resolution") or "").lower()
+        if resolution == "1080p" and (references or not self.latest):
+            resolution = "720p"
+        body["resolution"] = resolution if resolution in ("480p", "720p", "1080p") else "480p"
         parsed = await _send(
             "POST", f"{VIDEOS_URL}/generations", self._key, request.timeout, body=body
         )
@@ -476,14 +613,17 @@ def _data_uri(data: bytes, media_type: str) -> str:
     return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _first_b64(parsed: Mapping[str, Any]) -> bytes:
-    """The first picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
+def _all_b64(parsed: Mapping[str, Any]) -> list[bytes]:
+    """Every picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
     rows = parsed.get("data")
-    first = rows[0] if isinstance(rows, list) and rows else None
-    encoded = first.get("b64_json") if isinstance(first, Mapping) else None
-    if not encoded:
+    found = [
+        base64.b64decode(str(row["b64_json"]))
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, Mapping) and row.get("b64_json")
+    ]
+    if not found:
         raise RuntimeError("xAI sent no picture")
-    return base64.b64decode(str(encoded))
+    return found
 
 
 def _code(value: Any) -> str:

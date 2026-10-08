@@ -81,26 +81,41 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
 
 
 def picture(**overrides: Any) -> Any:
-    fields = {"prompt": "x", "images": (), "mask": None, "aspect": "", "timeout": 30.0}
-    return SimpleNamespace(**{**fields, **overrides})
-
-
-def video(**overrides: Any) -> Any:
+    """What imagegen's `Request` carries."""
     fields = {
         "prompt": "x",
-        "first": None,
-        "last": None,
-        "seconds": 0,
-        "aspect": "",
+        "images": (),
+        "count": 1,
+        "size": "",
+        "aspect_ratio": "",
         "resolution": "",
         "timeout": 30.0,
     }
     return SimpleNamespace(**{**fields, **overrides})
 
 
-def frame() -> Any:
-    """Only what videogen's contract promises a frame has."""
-    return SimpleNamespace(data=PNG, media_type="image/png")
+def video(**overrides: Any) -> Any:
+    """What videogen's `Request` carries."""
+    fields = {
+        "prompt": "x",
+        "images": (),
+        "videos": (),
+        "audios": (),
+        "size": "",
+        "aspect_ratio": "",
+        "resolution": "",
+        "duration_seconds": 0,
+        "audio": None,
+        "watermark": None,
+        "provider_options": {},
+        "timeout": 30.0,
+    }
+    return SimpleNamespace(**{**fields, **overrides})
+
+
+def frame(role: str = "") -> Any:
+    """Only what videogen's contract promises a reference picture has."""
+    return SimpleNamespace(data=PNG, media_type="image/png", role=role, name="", url="")
 
 
 # -- pictures -------------------------------------------------------------------
@@ -109,7 +124,7 @@ def frame() -> Any:
 async def test_together_takes_pixels_and_answers_base64(wire: Wire) -> None:
     wire.on("POST", IMAGES, Response({"data": [{"b64_json": base64.b64encode(PNG).decode()}]}))
     vendor = plugin.TogetherImages(api_key="tg-k")
-    made = await vendor.generate(picture(aspect="landscape"))
+    made = await vendor.generate(picture(size="1216x832"))
     assert (made.data, made.model, made.cost) == (PNG, "black-forest-labs/FLUX.1-schnell", "")
     [sent] = wire.sent
     assert sent["url"] == IMAGES
@@ -128,8 +143,48 @@ async def test_together_takes_pixels_and_answers_base64(wire: Wire) -> None:
 
 async def test_together_images_declares_it_does_not_edit() -> None:
     vendor = plugin.TogetherImages()
-    assert (vendor.host, vendor.edits, vendor.masks) == ("api.together.ai", False, False)
+    assert (vendor.host, vendor.edits) == ("api.together.ai", False)
     assert vendor.ready() == "no together key (ultron auth add together)"
+    caps = vendor.capabilities
+    assert caps["edit"] == {"enabled": False}
+    assert caps["generate"]["max_count"] == 4
+    assert caps["generate"]["supports_size"] is True
+    assert caps["generate"]["supports_aspect_ratio"] is False
+    assert caps["geometry"]["sizes"] == ("1024x1024", "1216x832", "832x1216")
+
+
+async def test_together_asks_for_several_and_answers_them_all(wire: Wire) -> None:
+    other = PNG + b""
+    wire.on(
+        "POST",
+        IMAGES,
+        Response({"data": [{"b64_json": base64.b64encode(p).decode()} for p in (PNG, other)]}),
+    )
+    made = await plugin.TogetherImages(api_key="k").generate(picture(count=2))
+    assert [image.data for image in made.images] == [PNG, other]
+    assert made.data == PNG
+    body = wire.sent[0]["json"]
+    assert body["n"] == 2
+    assert "width" not in body and "height" not in body
+
+
+async def test_together_clamps_the_count_and_ignores_a_size_it_cannot_read(wire: Wire) -> None:
+    wire.on("POST", IMAGES, Response({"data": [{"b64_json": base64.b64encode(PNG).decode()}]}))
+    vendor = plugin.TogetherImages(api_key="k")
+    await vendor.generate(picture(count=9, size="square"))
+    await vendor.generate(picture(count=0))
+    first, second = (sent["json"] for sent in wire.sent)
+    assert (first["n"], second["n"]) == (4, 1)
+    assert "width" not in first
+
+
+async def test_together_reads_a_request_from_before_count_and_size(wire: Wire) -> None:
+    wire.on("POST", IMAGES, Response({"data": [{"b64_json": base64.b64encode(PNG).decode()}]}))
+    older = SimpleNamespace(prompt="x", images=(), aspect="landscape", mask=None, timeout=30.0)
+    made = await plugin.TogetherImages(api_key="k").generate(older)
+    assert made.data == PNG
+    body = wire.sent[0]["json"]
+    assert body["n"] == 1 and "width" not in body
 
 
 async def test_together_images_refuses_a_picture_to_work_from(wire: Wire) -> None:
@@ -153,7 +208,7 @@ async def test_together_images_names_the_status_and_never_its_prose(wire: Wire) 
 # -- videos ---------------------------------------------------------------------
 
 
-async def test_together_takes_pixels_a_string_of_seconds_and_base64_frames(wire: Wire) -> None:
+async def test_together_takes_pixels_whole_seconds_and_a_data_uri(wire: Wire) -> None:
     wire.on("POST", VIDEOS, Response({"id": "tj1", "status": "in_progress"}))
     wire.on(
         "GET",
@@ -166,17 +221,19 @@ async def test_together_takes_pixels_a_string_of_seconds_and_base64_frames(wire:
         ),
     )
     wire.on("GET", "https://cdn.together.example/", Response(raw=MP4))
-    vendor = plugin.TogetherVideo(api_key="tk")
-    remote = await vendor.submit(video(last=frame(), seconds=6, aspect="portrait"))
+    vendor = plugin.TogetherVideo(model="Wan-AI/Wan2.2-I2V-A14B", api_key="tk")
+    remote = await vendor.submit(
+        video(images=(frame("first_frame"),), duration_seconds=6, size="720x1280")
+    )
     assert remote == "tj1"
     submitted = wire.sent[0]
     assert submitted["json"] == {
-        "model": "minimax/hailuo-02",
+        "model": "Wan-AI/Wan2.2-I2V-A14B",
         "prompt": "x",
-        "seconds": "6",
+        "seconds": 6,
         "width": 720,
         "height": 1280,
-        "frame_images": [{"input_image": base64.b64encode(PNG).decode(), "frame": "last"}],
+        "media": {"reference_images": [f"data:image/png;base64,{base64.b64encode(PNG).decode()}"]},
     }
     assert submitted["headers"] == {"Authorization": "Bearer tk"}
     status = await vendor.status(remote)
@@ -189,12 +246,47 @@ async def test_together_takes_pixels_a_string_of_seconds_and_base64_frames(wire:
     assert wire.sent[2]["headers"] == {}
 
 
-async def test_together_video_sizes_a_resolution_alone_as_landscape(wire: Wire) -> None:
+async def test_together_clamps_seconds_to_one_through_ten(wire: Wire) -> None:
     wire.on("POST", VIDEOS, Response({"id": "tj2"}))
-    await plugin.TogetherVideo(api_key="k").submit(video(resolution="1080p", first=frame()))
+    vendor = plugin.TogetherVideo(api_key="k")
+    for asked in (30, 1, 0):
+        await vendor.submit(video(duration_seconds=asked))
+    sent = [s["json"] for s in wire.sent]
+    assert [body.get("seconds") for body in sent] == [10, 1, None]
+    assert all("width" not in body and "media" not in body for body in sent)
+
+
+async def test_together_sends_only_the_first_picture_and_no_size_it_cannot_read(
+    wire: Wire,
+) -> None:
+    wire.on("POST", VIDEOS, Response({"id": "tj3"}))
+    other = SimpleNamespace(data=b"other", media_type="image/jpeg", role="", name="", url="")
+    await plugin.TogetherVideo(api_key="k").submit(
+        video(images=(frame(), other), size="16:9", resolution="1080P", aspect_ratio="16:9")
+    )
     body = wire.sent[0]["json"]
-    assert (body["width"], body["height"]) == (1920, 1080)
-    assert [f["frame"] for f in body["frame_images"]] == ["first"]
+    assert body["media"] == {
+        "reference_images": [f"data:image/png;base64,{base64.b64encode(PNG).decode()}"]
+    }
+    assert set(body) == {"model", "prompt", "media"}
+
+
+async def test_together_reads_a_request_from_before_duration_seconds(wire: Wire) -> None:
+    wire.on("POST", VIDEOS, Response({"id": "tj4"}))
+    older = SimpleNamespace(prompt="x", seconds=4, timeout=30.0)
+    await plugin.TogetherVideo(api_key="k").submit(older)
+    assert wire.sent[0]["json"] == {"model": "minimax/hailuo-02", "prompt": "x", "seconds": 4}
+
+
+def test_together_video_starts_from_a_picture_only_on_the_wan_model() -> None:
+    wan = plugin.TogetherVideo(model="Wan-AI/Wan2.2-I2V-A14B").capabilities
+    hailuo = plugin.TogetherVideo().capabilities
+    assert wan["image_to_video"]["max_input_images"] == 1
+    assert hailuo["image_to_video"]["max_input_images"] == 0
+    for caps in (wan, hailuo):
+        assert caps["generate"]["max_duration_seconds"] == 10
+        assert caps["generate"]["supports_size"] is True
+        assert caps["video_to_video"] == {"enabled": False}
 
 
 async def test_together_video_without_a_link_or_with_a_failure(wire: Wire) -> None:

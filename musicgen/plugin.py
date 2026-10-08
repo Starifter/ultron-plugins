@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import contextlib
 import contextvars
 import hashlib
@@ -42,18 +43,16 @@ import uuid
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from ultron.sdk.hook import Hook, HookOutcome, HookReturn, PromptEvent
 from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.runtime import ToolError, assert_active
 from ultron.sdk.tool_plugin import Tool, ToolResult, validate_arguments
 
-MIN_SECONDS = 5
-MAX_SECONDS = 600
-"""What any vendor here makes: Lyria's songs run a couple of minutes, and the
-ceiling is ElevenLabs' ten, for a backend that sells it."""
 MAX_IMAGES = 10
-"""Lyria's limit; a backend that takes fewer says so in `cannot`."""
+"""OpenClaw's: reference pictures one call may hand in."""
+FORMATS = ("mp3", "wav")
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
 """A picture is inlined as base64, and every vendor here caps a request well
 below what a larger one would make of it."""
@@ -154,47 +153,147 @@ class Picture:
 
 
 class Request:
-    __slots__ = ("images", "instrumental", "lyrics", "prompt", "seconds", "timeout")
+    """What one vendor is asked for, after its capabilities had their say.
+
+    `seconds` is what a backend written for musicgen 2.x read."""
+
+    __slots__ = (
+        "duration_seconds",
+        "format",
+        "images",
+        "instrumental",
+        "lyrics",
+        "prompt",
+        "timeout",
+    )
 
     def __init__(
         self,
         prompt: str,
         lyrics: str = "",
-        instrumental: bool = False,
-        seconds: int = 0,
+        instrumental: bool | None = None,
+        duration_seconds: int = 0,
         images: tuple[Picture, ...] = (),
         timeout: float = 300.0,
+        format: str = "",
     ) -> None:
         self.prompt = prompt
         self.lyrics = lyrics
         self.instrumental = instrumental
-        self.seconds = seconds
+        self.duration_seconds = duration_seconds
         self.images = images
         self.timeout = timeout
+        self.format = format
+
+    @property
+    def seconds(self) -> int:
+        return self.duration_seconds
 
     @property
     def described(self) -> str:
         """The prompt with every other ask written into it, for a vendor - Lyria -
-        whose only control is the words."""
+        whose only control is the words. OpenClaw's `buildMusicPrompt`, with a
+        length for a vendor that takes one."""
         parts = [self.prompt.rstrip()]
-        if self.seconds:
-            parts.append(f"Length: about {_length(self.seconds)}.")
+        if self.duration_seconds:
+            parts.append(f"Length: about {_length(self.duration_seconds)}.")
         if self.instrumental:
-            parts.append("Instrumental only, no vocals.")
+            parts.append("Instrumental only. No vocals, no sung lyrics, no spoken word.")
         if self.lyrics:
             parts.append(f"Lyrics:\n{self.lyrics.strip()}")
         return "\n\n".join(parts)
 
     def fingerprint(self) -> str:
-        """What makes two requests the same track: everything sent to a vendor,
-        the pictures by their bytes. Not where it is saved - the same music to
+        """What makes two requests the same track: everything asked, the
+        pictures by their bytes. Not where it is saved - the same music to
         another file is still the same music, paid for twice."""
         digest = hashlib.sha256()
-        for part in (self.prompt, self.lyrics, str(self.instrumental), str(self.seconds)):
+        for part in (
+            self.prompt,
+            self.lyrics,
+            str(self.instrumental),
+            str(self.duration_seconds),
+            self.format,
+        ):
             digest.update(part.encode("utf-8") + b"\x00")
         for image in self.images:
             digest.update(hashlib.sha256(image.data).digest())
         return digest.hexdigest()
+
+
+def music_capabilities(vendor: Any) -> dict[str, Any]:
+    """A vendor's `capabilities`, OpenClaw's shape, read defensively. One
+    written before 3.0 declares none and is read as what it did: lyrics, an
+    instrumental and a length written into its prompt, pictures up to ten, and
+    no format - so a format is dropped and reported rather than sent to code
+    that would not read it."""
+    try:
+        said = getattr(vendor, "capabilities", None)
+        if isinstance(said, Mapping):
+            return dict(said)
+    except Exception:
+        pass
+    mode = {"supports_lyrics": True, "supports_instrumental": True, "supports_duration": True}
+    return {
+        "generate": mode,
+        "edit": {"enabled": True, "max_input_images": MAX_IMAGES, **mode},
+    }
+
+
+def music_failure(caps: Mapping[str, Any], images: int) -> str:
+    """OpenClaw's `resolveReferenceImageCapabilityError`: pictures handed in
+    must be taken, or the vendor is passed over."""
+    if not images:
+        return ""
+    edit = caps.get("edit") or {}
+    if not edit.get("enabled"):
+        return "takes no pictures"
+    most = int(edit.get("max_input_images") or 0)
+    if images > most:
+        return f"takes up to {most} picture{'s' if most != 1 else ''}"
+    return ""
+
+
+def resolve_music_overrides(
+    caps: Mapping[str, Any],
+    *,
+    images: int,
+    lyrics: str,
+    instrumental: bool | None,
+    duration_seconds: int,
+    format: str,
+) -> tuple[str, bool | None, int, str, list[str]]:
+    """OpenClaw's `resolveMusicGenerationOverrides`: lyrics, an instrumental, a
+    length or a format the vendor does not take is dropped; a length past its
+    longest is shortened to it. Returns what to send and the result's notes."""
+    mode = caps.get("edit" if images else "generate")
+    notes: list[str] = []
+    if not isinstance(mode, Mapping):
+        return lyrics, instrumental, duration_seconds, format, notes
+    ignored: list[str] = []
+    if lyrics and not mode.get("supports_lyrics"):
+        ignored.append("lyrics")
+        lyrics = ""
+    if instrumental is not None and not mode.get("supports_instrumental"):
+        ignored.append(f"instrumental={str(instrumental).lower()}")
+        instrumental = None
+    if duration_seconds and not mode.get("supports_duration"):
+        ignored.append(f"durationSeconds={duration_seconds}")
+        duration_seconds = 0
+    elif duration_seconds:
+        most = mode.get("max_duration_seconds")
+        if isinstance(most, int | float) and most > 0 and duration_seconds > most:
+            notes.append(f"durationSeconds {duration_seconds} was made as {round(most)}.")
+            duration_seconds = max(1, round(most))
+    if format:
+        offered = mode.get("supported_formats") or ()
+        # An empty list means the vendor checks the format itself.
+        if not mode.get("supports_format") or (offered and format not in offered):
+            ignored.append(f"format={format}")
+            format = ""
+    if ignored:
+        notes.append(f"Ignored, not supported: {', '.join(ignored)}.")
+    return lyrics, instrumental, duration_seconds, format, notes
 
 
 class Made:
@@ -300,7 +399,6 @@ def _failure(parsed: Mapping[str, Any], status: int, where: str) -> str:
 # -- Google ----------------------------------------------------------------------
 
 GOOGLE_URL = "https://generativelanguage.googleapis.com/v1beta"
-CLIP_SECONDS = 30
 
 
 class GoogleMusic:
@@ -309,6 +407,7 @@ class GoogleMusic:
     as text beside it."""
 
     host = GOOGLE_HOST
+    models = ("lyria-3-clip-preview", "lyria-3-pro-preview")
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -319,21 +418,28 @@ class GoogleMusic:
         self._key = api_key or ""
         self._signed_in = bool(auth_token) and not api_key
 
-    @property
-    def clip(self) -> bool:
-        return "clip" in self.model
-
     def ready(self) -> str:
         if self._signed_in:
             return "a Google sign-in cannot make music; add an AI Studio key"
         return "" if self._key else "no google key (ultron auth add google)"
 
-    def cannot(self, request: Request) -> str:
-        if self.clip and request.seconds and request.seconds != CLIP_SECONDS:
-            return f"{self.model} makes {CLIP_SECONDS}-second clips only"
-        if len(request.images) > MAX_IMAGES:
-            return f"takes up to {MAX_IMAGES} pictures"
-        return ""
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """OpenClaw's Google music provider: lyrics and an instrumental in the
+        words, no length, MP3 from a clip model and MP3 or WAV from the pro
+        one; a model OpenClaw does not list checks its format itself."""
+        formats = {
+            "lyria-3-clip-preview": ("mp3",),
+            "lyria-3-pro-preview": ("mp3", "wav"),
+        }.get(self.model, ())
+        mode = {
+            "max_tracks": 1,
+            "supports_lyrics": True,
+            "supports_instrumental": True,
+            "supports_format": True,
+            "supported_formats": formats,
+        }
+        return {"generate": mode, "edit": {"enabled": True, "max_input_images": MAX_IMAGES, **mode}}
 
     async def generate(self, request: Request) -> Made:
         from ultron.sdk.web import WebError, post
@@ -405,6 +511,7 @@ FIELDS = (
     "media_type",
     "cost",
     "notified",
+    "notes",
 )
 
 
@@ -434,6 +541,8 @@ class Job:
         self.media_type = str(values.get("media_type") or "")
         self.cost = str(values.get("cost") or "")
         self.notified = bool(values.get("notified"))
+        self.notes = str(values.get("notes") or "")
+        """What the vendor was sent instead of what was asked - Ultron's words."""
 
     def to_dict(self) -> dict[str, Any]:
         return {name: getattr(self, name) for name in FIELDS}
@@ -519,7 +628,9 @@ class Musicgen:
 
     # -- settings --------------------------------------------------------------
 
-    def timeout(self) -> float:
+    def timeout(self, timeout_ms: int = 0) -> float:
+        if timeout_ms:
+            return max(1.0, min(3600.0, timeout_ms / 1000))
         try:
             value = float(self.ctx.setting("timeout_seconds", 300.0) or 300.0)
         except (TypeError, ValueError):
@@ -599,7 +710,7 @@ class Musicgen:
                     job, error="the session ended while it was being made; it may have been billed"
                 )
 
-    def start(self, job: Job, vendors: list[Vendor], request: Request) -> None:
+    def start(self, job: Job, vendors: list[tuple[Vendor, Request, str]]) -> None:
         """Make `job` in a task of the session's, never of the call's.
 
         An empty context, so the starting call's authority does not ride along:
@@ -607,7 +718,7 @@ class Musicgen:
         moment someone stopped that turn."""
         self.ended.setdefault(job.id, asyncio.Event())
         loop = asyncio.get_running_loop()
-        task = loop.create_task(self._make(job, vendors, request), context=contextvars.Context())
+        task = loop.create_task(self._make(job, vendors), context=contextvars.Context())
         self.tasks[job.id] = task
 
     def close(self) -> None:
@@ -618,11 +729,11 @@ class Musicgen:
         if self.waking is not None:
             self.waking.cancel()
 
-    async def _make(self, job: Job, vendors: list[Vendor], request: Request) -> None:
+    async def _make(self, job: Job, vendors: list[tuple[Vendor, Request, str]]) -> None:
         passed: list[str] = []
         try:
-            for vendor in vendors:
-                job.vendor, job.model = vendor.name, vendor.model
+            for vendor, request, notes in vendors:
+                job.vendor, job.model, job.notes = vendor.name, vendor.model, notes
                 started = time.monotonic()
                 try:
                     made = await asyncio.wait_for(vendor.generate(request), timeout=request.timeout)
@@ -700,8 +811,10 @@ class Musicgen:
     def _write(self, job: Job, data: bytes, media_type: str) -> str:
         ext = EXTENSIONS[media_type]
         named = inside(self.workspace, job.target)
-        base = named.with_suffix("")
-        target = named.with_suffix(f".{ext}")
+        # Joined as text, not `with_suffix`: a name with a dot in it ("v1.2")
+        # would lose its tail.
+        stem = named.name.removesuffix(named.suffix)
+        target = named.parent / f"{stem}.{ext}"
         n = 2
         while True:
             try:
@@ -712,7 +825,7 @@ class Musicgen:
             except FileExistsError:
                 # Something took the name while the track was being made; the
                 # file beside it is the track, and nothing is overwritten.
-                target = base.with_name(f"{base.name}-{n}").with_suffix(f".{ext}")
+                target = named.parent / f"{stem}-{n}.{ext}"
                 n += 1
         return target.relative_to(self.workspace).as_posix()
 
@@ -954,10 +1067,12 @@ def _asked(vendor: Vendor, request: Request) -> dict[str, Any]:
         "images": len(request.images),
         "lyrics": bool(request.lyrics),
     }
-    if request.instrumental:
-        arguments["instrumental"] = True
-    if request.seconds:
-        arguments["seconds"] = request.seconds
+    if request.instrumental is not None:
+        arguments["instrumental"] = request.instrumental
+    if request.duration_seconds:
+        arguments["durationSeconds"] = request.duration_seconds
+    if request.format:
+        arguments["format"] = request.format
     return arguments
 
 
@@ -969,15 +1084,13 @@ ACTIONS = ("generate", "status", "list")
 
 class MusicGenerate(Tool):
     """OpenClaw's `music_generate`: one tool, three actions - start a track,
-    look at one, list them."""
+    see this session's jobs, list the vendors."""
 
     name = "music_generate"
     untrusted = True
     """When every vendor passes, the result names each one's refusal, and a
     refusal can carry a backend's words; why a job failed is a vendor's error
     code, and the lyrics are its words."""
-
-    MAX_WAIT = 900
 
     def __init__(self, runner: Musicgen) -> None:
         self.runner = runner
@@ -986,19 +1099,14 @@ class MusicGenerate(Tool):
     @property
     def description(self) -> str:  # type: ignore[override]
         return (
-            "Make a piece of music - a song, an instrumental, a jingle or a soundtrack - saved "
-            "in the workspace. `action: generate` (the default) starts it and returns at once "
-            "with a job id; the track takes up to a couple of minutes and you are told when it "
-            "is saved, so tell the person it is on its way and carry on - do not check on it in "
-            "a loop. Describe the music in the prompt: genre, mood, tempo, instruments, the "
-            "voice that sings. Give `lyrics` only when the person wrote them or asked you to; "
-            "leave them out and the vendor writes its own. `images` are workspace pictures "
-            "that set the mood. Each track costs money: do not make variations nobody asked "
-            "for. The same request while its track is being made, or within two minutes of it "
-            "being saved, starts nothing and answers with that job. `action: status` with a "
-            "`job` shows one - why it failed, the lyrics the vendor sang - and `wait` waits up "
-            "to that many seconds for it, only when the person is waiting on it; with no `job` "
-            "it lists this session's jobs. `action: list` shows the vendors and their models."
+            "Generate music or audio with lyrics, instrumental, durationSeconds and format. "
+            "Runs in the background: call once per request; you are told when it is saved, so "
+            "give a short ack and carry on - no poll. Describe the music in the prompt: genre, "
+            "mood, tempo, instruments, the voice that sings. A value a vendor cannot take is "
+            "dropped and the result says which. Each track costs money: no variations nobody "
+            "asked for; the same request while it is being made, or within two minutes of it "
+            "being saved, starts nothing. status shows this session's jobs and the lyrics a "
+            "vendor sang; list shows the vendors."
         )
 
     @property
@@ -1008,37 +1116,30 @@ class MusicGenerate(Tool):
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": list(ACTIONS),
-                    "description": "generate (the default), status or list.",
+                    "description": '"generate" default, "status" active task, "list" '
+                    "providers/models.",
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "What the music should be. Needed to generate.",
+                    "description": "Music prompt: style, genre, mood, purpose.",
                 },
                 "lyrics": {
                     "type": "string",
-                    "description": "Words to sing. Leave it out for the vendor's own.",
+                    "description": "Exact sung lyrics only when the user supplies lyrics or asks "
+                    "for vocal words. For song/style requests, use prompt instead.",
                 },
                 "instrumental": {
                     "type": "boolean",
-                    "description": "True for no vocals. Not with lyrics.",
+                    "description": "Instrumental-only toggle.",
                 },
-                "seconds": {
-                    "type": "integer",
-                    "minimum": MIN_SECONDS,
-                    "maximum": MAX_SECONDS,
-                    "description": "About how long. Leave it out for the vendor's default.",
+                "image": {
+                    "type": "string",
+                    "description": "One reference image path/URL.",
                 },
                 "images": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "maxItems": MAX_IMAGES,
-                    "description": "Workspace PNG, JPEG or WebP pictures to set the mood.",
-                },
-                "path": {
-                    "type": "string",
-                    "description": "Where to save it, relative to the workspace. Leave it out "
-                    "for a new file. Never an existing file.",
+                    "description": f"Reference images; max {MAX_IMAGES}.",
                 },
                 "model": {
                     "type": "string",
@@ -1047,16 +1148,19 @@ class MusicGenerate(Tool):
                         example="google/lyria-3-pro-preview",
                     ),
                 },
-                "job": {
-                    "type": "string",
-                    "description": "A job id, mg-... For status; leave it out for all of "
-                    "this session's jobs.",
-                },
-                "wait": {
+                "durationSeconds": {
                     "type": "integer",
-                    "minimum": 0,
-                    "maximum": self.MAX_WAIT,
-                    "description": "Seconds to wait for the job to finish. For status.",
+                    "minimum": 1,
+                    "description": "Target seconds; provider may clamp.",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": list(FORMATS),
+                    "description": "Output format: mp3, wav.",
+                },
+                "filename": {
+                    "type": "string",
+                    "description": "Output filename hint; basename preserved in managed media dir.",
                 },
             },
         }
@@ -1066,40 +1170,43 @@ class MusicGenerate(Tool):
         action = str(checked.get("action", "") or "generate").strip().lower()
         if action not in ACTIONS:
             raise ToolError(f"action must be one of: {', '.join(ACTIONS)}")
-        if action == "list":
+        if action != "generate":
             return {"action": action}
-        if action == "status":
-            job = str(checked.get("job", "") or "").strip()
-            wait = int(checked.get("wait") or 0) if job else 0
-            return {"action": action, "job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
         prompt = str(checked.get("prompt", "") or "").strip()
         if not prompt:
             raise ToolError("generate needs a prompt")
         lyrics = str(checked.get("lyrics", "") or "").strip()
         if len(lyrics) > MAX_LYRICS:
             raise ToolError(f"lyrics are over {MAX_LYRICS} characters")
-        instrumental = bool(checked.get("instrumental"))
-        if instrumental and lyrics:
-            raise ToolError("an instrumental has no lyrics; give one or the other")
-        seconds = int(checked.get("seconds") or 0)
-        if seconds and not MIN_SECONDS <= seconds <= MAX_SECONDS:
-            raise ToolError(f"seconds must be {MIN_SECONDS} to {MAX_SECONDS}")
-        images = [str(each or "").strip() for each in checked.get("images") or ()]
+        duration = checked.get("durationSeconds")
+        if duration is not None and int(duration) < 1:
+            raise ToolError("durationSeconds must be a positive integer")
+        format = str(checked.get("format", "") or "").strip().lower()
+        if format and format not in FORMATS:
+            raise ToolError('format must be one of "mp3" or "wav"')
+        named = []
+        if isinstance(checked.get("image"), str):
+            named.append(checked["image"])
+        named += [each for each in checked.get("images") or () if isinstance(each, str)]
+        images = list(dict.fromkeys(e.strip().removeprefix("@").strip() for e in named if e))
         images = [each for each in images if each]
         if len(images) > MAX_IMAGES:
-            raise ToolError(f"at most {MAX_IMAGES} images")
-        path = str(checked.get("path", "") or "").strip()
-        for named in (*images, path):
-            if named:
-                inside(self.workspace, named)
+            raise ToolError(
+                f"Too many reference images: {len(images)} provided, maximum is {MAX_IMAGES}."
+            )
+        for each in images:
+            if not _is_url(each) and not each.startswith("data:"):
+                inside(self.workspace, _local(each))
+        instrumental = checked.get("instrumental")
         return {
             "action": action,
             "prompt": prompt,
             "lyrics": lyrics,
-            "instrumental": instrumental,
-            "seconds": seconds,
+            "instrumental": instrumental if isinstance(instrumental, bool) else None,
+            "duration_seconds": int(duration) if duration is not None else 0,
+            "format": format,
             "images": images,
-            "path": path,
+            "filename": str(checked.get("filename", "") or "").strip(),
             **dict(zip(("provider", "model"), _choice(checked), strict=True)),
         }
 
@@ -1108,12 +1215,11 @@ class MusicGenerate(Tool):
         action: str = "generate",
         prompt: str = "",
         lyrics: str = "",
-        instrumental: bool = False,
-        seconds: int = 0,
+        instrumental: bool | None = None,
+        duration_seconds: int = 0,
+        format: str = "",
         images: list[str] | None = None,
-        path: str = "",
-        job: str = "",
-        wait: int = 0,
+        filename: str = "",
         provider: str = "",
         model: str = "",
     ) -> ToolResult:
@@ -1121,52 +1227,57 @@ class MusicGenerate(Tool):
         if action == "list":
             return self._list()
         if action == "status":
-            return await self._status(job, wait)
-        return self._generate(
-            prompt, lyrics, instrumental, seconds, images or [], path, provider, model
-        )
-
-    # -- generate ----------------------------------------------------------------
-
-    def _generate(
-        self,
-        prompt: str,
-        lyrics: str,
-        instrumental: bool,
-        seconds: int,
-        images: list[str],
-        path: str,
-        provider: str = "",
-        model: str = "",
-    ) -> ToolResult:
+            return self._jobs()
         runner = self.runner
         try:
-            pictures = tuple(self._picture(named) for named in images)
+            pictures = tuple([await self._picture(named) for named in images or ()])
         except ToolError as exc:
             return ToolResult.error(str(exc))
-        request = Request(prompt, lyrics, instrumental, seconds, pictures, runner.timeout())
+        asked = Request(
+            prompt, lyrics, instrumental, duration_seconds, pictures, runner.timeout(), format
+        )
         # The same music from another vendor or model is not the same track.
-        fingerprint = f"{request.fingerprint()}:{provider}:{model}"
+        fingerprint = f"{asked.fingerprint()}:{provider}:{model}"
         duplicate = runner.duplicate(fingerprint)
         if duplicate is not None:
             return ToolResult.ok(_duplicate(duplicate))
-        try:
-            target = self._target(path, prompt)
-        except ToolError as exc:
-            return ToolResult.error(str(exc))
-        able: list[Vendor] = []
+        target = self._target(filename, prompt, format)
+        able: list[tuple[Vendor, Request, str]] = []
         passed: list[str] = []
         for vendor in runner.vendors(provider, model):
-            missing = vendor.ready() or vendor.cannot(request)
+            missing = vendor.ready()
+            caps = music_capabilities(vendor.impl) if not missing else {}
+            missing = missing or music_failure(caps, len(pictures))
             if missing:
                 passed.append(f"{vendor.name}: {missing}")
-            else:
-                able.append(vendor)
+                continue
+            sent_lyrics, sent_instrumental, seconds, sent_format, notes = resolve_music_overrides(
+                caps,
+                images=len(pictures),
+                lyrics=lyrics,
+                instrumental=instrumental,
+                duration_seconds=duration_seconds,
+                format=format,
+            )
+            request = Request(
+                prompt,
+                sent_lyrics,
+                sent_instrumental,
+                seconds,
+                pictures,
+                asked.timeout,
+                sent_format,
+            )
+            refused = vendor.cannot(request)
+            if refused:
+                passed.append(f"{vendor.name}: {refused}")
+                continue
+            able.append((vendor, request, " ".join(notes)))
         if not able:
             failure = "; ".join(passed) or "no vendor is configured"
             return ToolResult.error(f"no music started: {failure}")
         assert_active()  # the last moment before money is spent
-        first = able[0]
+        first, _, notes = able[0]
         made = Job(
             id=f"mg-{uuid.uuid4().hex[:6]}",
             vendor=first.name,
@@ -1175,6 +1286,7 @@ class MusicGenerate(Tool):
             session=runner.session,
             state="running",
             created=time.time(),
+            notes=notes,
         )
         try:
             runner.file.save(made)
@@ -1182,26 +1294,35 @@ class MusicGenerate(Tool):
             # Made anyway: it only will not be listed in a later session.
             passed.append(f"not kept for a later session: {type(exc).__name__}")
         runner.asked[made.id] = fingerprint
-        runner.start(made, able, request)
+        runner.start(made, able)
         line = (
             f"Started music {made.id} with {first.made_by()}; it will be saved to {target} "
-            "when it is ready, usually within a couple of minutes, and you will be told then. "
-            f"music_generate status {made.id} checks on it or waits for it."
+            "when it is ready, usually within a couple of minutes, and you will be told then."
         )
+        if notes:
+            line += f" {notes}"
         if len(able) > 1:
-            line += f" If {first.name} fails, {', '.join(v.name for v in able[1:])} is next."
+            line += f" If {first.name} fails, {', '.join(v.name for v, _, _ in able[1:])} is next."
         if passed:
             line += f" Passed over {'; '.join(passed)}."
         return ToolResult.ok(line)
 
-    def _picture(self, named: str) -> Picture:
-        target = inside(self.workspace, named)
-        try:
-            data = target.read_bytes()
-        except FileNotFoundError:
-            raise ToolError(f"no such file: {named}") from None
-        except (IsADirectoryError, PermissionError):
-            raise ToolError(f"cannot read {named}") from None
+    async def _picture(self, named: str) -> Picture:
+        """A reference picture: a workspace path, a `file://` URL inside the
+        workspace, a `data:` URL, or an http(s) URL fetched under the
+        operator's address policy - OpenClaw's four."""
+        if named.startswith("data:"):
+            data = _data_url(named)
+        elif _is_url(named):
+            data = await _fetch(named)
+        else:
+            target = inside(self.workspace, _local(named))
+            try:
+                data = target.read_bytes()
+            except FileNotFoundError:
+                raise ToolError(f"no such file: {named}") from None
+            except (IsADirectoryError, PermissionError):
+                raise ToolError(f"cannot read {named}") from None
         if len(data) > MAX_IMAGE_BYTES:
             raise ToolError(f"{named} is over {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
         media_type = sniff_image(data)
@@ -1209,27 +1330,29 @@ class MusicGenerate(Tool):
             raise ToolError(f"{named} is not a PNG, JPEG or WebP picture")
         return Picture(data, media_type)
 
-    def _target(self, path: str, prompt: str) -> str:
-        """Where the track will go, decided now so the result can say so. A
-        named path that exists, or that a running job has claimed, is refused
-        before anything is spent."""
+    def _target(self, filename: str, prompt: str, format: str = "") -> str:
+        """Where the track will go, decided now so the result can say so:
+        `output_dir`, under the basename of the `filename` hint (OpenClaw's
+        managed media dir) or a name made from the time and the prompt. A name
+        already taken, or claimed by a running job, gets `-2`, `-3`. The real
+        extension is the audio's own, set when it is saved."""
         reserved = self.runner.reserved()
-        if path:
-            named = inside(self.workspace, path)
-            if named.suffix.lower() not in SUFFIXES:
-                named = named.with_suffix(".mp3")
-            shown = named.relative_to(self.workspace).as_posix()
-            if named.exists() or shown in reserved:
-                raise ToolError(f"{shown} already exists; name a new file")
-            return shown
-        folder = str(self.runner.ctx.setting("output_dir", "music") or "music")
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40].strip("-") or "music"
-        base = inside(self.workspace, folder) / f"{stamp}-{slug}"
-        target = base.with_suffix(".mp3")
+        folder = inside(
+            self.workspace, str(self.runner.ctx.setting("output_dir", "music") or "music")
+        )
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename.replace("\\", "/")).stem)
+        stem = stem.strip(".-")[:80]
+        if not stem:
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40].strip("-")
+            stem = f"{stamp}-{slug or 'music'}"
+        suffix = f".{format or 'mp3'}"
+        # Joined as text, not `with_suffix`: a stem with a dot in it ("v1.2")
+        # would lose its tail, and every `-n` would come back the same name.
+        target = folder / f"{stem}{suffix}"
         n = 2
-        while target.exists() or target.relative_to(self.workspace).as_posix() in reserved:
-            target = base.with_name(f"{base.name}-{n}").with_suffix(".mp3")
+        while _taken(target, reserved, self.workspace):
+            target = folder / f"{stem}-{n}{suffix}"
             n += 1
         return target.relative_to(self.workspace).as_posix()
 
@@ -1245,48 +1368,97 @@ class MusicGenerate(Tool):
         return ToolResult.ok("\n".join(lines))
 
     def _jobs(self) -> ToolResult:
-        """This session's jobs, newest first - `status` with no job, as
-        OpenClaw's `status` is the session's task."""
+        """This session's jobs, newest first, with the lyrics a vendor sang -
+        OpenClaw's `status`, the session's task."""
         runner = self.runner
         jobs = runner.mine()[-10:]
         if not jobs:
             return ToolResult.ok("No music jobs in this session.")
-        for each in jobs:
+        lines = []
+        for each in reversed(jobs):
             runner.told(each)
-        return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
+            line = _line(each)
+            lyrics = runner.lyrics.get(each.id, "")
+            if lyrics:
+                shown = lyrics[:LYRICS_SHOWN] + ("\n[...]" if len(lyrics) > LYRICS_SHOWN else "")
+                line += f"\nWhat {each.vendor} said with it:\n{shown}"
+            lines.append(line)
+        return ToolResult.ok("\n".join(lines))
 
-    async def _status(self, job: str, wait: int) -> ToolResult:
-        if not job:
-            return self._jobs()
-        runner = self.runner
-        found = {each.id: each for each in runner.mine()}.get(job)
-        if found is None:
-            return ToolResult.error(f"no music job {job} in this session")
-        if wait and found.state == "running" and job in runner.tasks:
-            ended = runner.ended.setdefault(job, asyncio.Event())
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(ended.wait()), timeout=wait)
-            found = {each.id: each for each in runner.mine()}.get(job, found)
-        runner.told(found)
-        line = _line(found)
-        lyrics = runner.lyrics.get(job, "")
-        if lyrics:
-            shown = lyrics[:LYRICS_SHOWN] + ("\n[...]" if len(lyrics) > LYRICS_SHOWN else "")
-            line += f"\nWhat {found.vendor} said with it:\n{shown}"
-        return ToolResult.ok(line)
+
+def _taken(target: Path, reserved: set[str], workspace: Path) -> bool:
+    """Whether `target`'s name is spoken for under any extension the track
+    could come back as. The format is the vendor's to decide, so a name is
+    free only when no file and no running job holds it as any of them - else
+    the result would name one file and the save, finding the real extension
+    taken, would write another."""
+    stem = target.name.removesuffix(target.suffix)
+    rel = target.parent.relative_to(workspace).as_posix()
+    for suffix in SUFFIXES:
+        if (target.parent / f"{stem}{suffix}").exists() or f"{rel}/{stem}{suffix}" in reserved:
+            return True
+    return False
+
+
+def _is_url(named: str) -> bool:
+    return named.lower().startswith(("http://", "https://"))
+
+
+def _local(named: str) -> str:
+    """A path, or a `file://` URL's path."""
+    if named.lower().startswith("file://"):
+        path = unquote(urlsplit(named).path)
+        # file:///C:/x on Windows is the path C:/x.
+        return path[1:] if re.match(r"^/[A-Za-z]:", path) else path
+    if re.match(r"^[a-z][a-z0-9+.-]*:", named, re.IGNORECASE) and not re.match(
+        r"^[a-z]:[\\/]", named, re.IGNORECASE
+    ):
+        raise ToolError(
+            f"Unsupported image reference: {named}. Use a file path, a file:// URL, a data: "
+            "URL, or an http(s) URL."
+        )
+    return named
+
+
+def _data_url(named: str) -> bytes:
+    head, _, payload = named.partition(",")
+    if not head.endswith(";base64"):
+        raise ToolError("a data: URL reference must be base64")
+    try:
+        return base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError):
+        raise ToolError("a data: URL reference is not valid base64") from None
+
+
+async def _fetch(url: str) -> bytes:
+    from ultron.sdk.web import get
+
+    try:
+        response = await get(
+            url, max_bytes=MAX_IMAGE_BYTES, timeout=60.0, user_agent="ultron-musicgen"
+        )
+    except Exception as exc:  # the address policy, or the network
+        raise ToolError(f"could not fetch {url}: {type(exc).__name__}") from None
+    if response.status >= 400:
+        raise ToolError(f"HTTP {response.status} fetching {url}")
+    if response.truncated:
+        raise ToolError(f"{url} is over {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
+    return response.body
 
 
 def _line(job: Job) -> str:
     if job.state == "running":
         age = _age(time.time() - job.created)
-        return f"{job.id}: running for {age} at {job.made_by()}, to be saved to {job.target}"
-    if job.state == "done":
+        line = f"{job.id}: running for {age} at {job.made_by()}, to be saved to {job.target}"
+    elif job.state == "done":
         cost = f", {job.cost}" if job.cost else ""
-        return (
+        line = (
             f"{job.id}: saved to {job.saved} by {job.made_by()} "
             f"({job.media_type}, {_human(job.bytes)}{cost})"
         )
-    return f"{job.id}: failed at {job.made_by()} - {job.error}"
+    else:
+        line = f"{job.id}: failed at {job.made_by()} - {job.error}"
+    return f"{line}. {job.notes}" if job.notes else line
 
 
 # -- the hooks -------------------------------------------------------------------

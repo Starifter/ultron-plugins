@@ -1,7 +1,7 @@
 ---
 name: xai
 description: The xAI model provider - Grok, at xAI - with Grok speech-to-text for voice notes, and Grok Imagine for imagegen and videogen.
-version: "1.3.0"
+version: "1.4.0"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, audio, media]
 logo: logo.svg
@@ -20,8 +20,8 @@ config_schema:
     description: "The Grok Imagine image model imagegen makes pictures with."
   video_model:
     type: str
-    default: grok-imagine-video-1.5
-    description: "The Grok Imagine video model videogen makes videos with. The classic grok-imagine-video takes no last frame."
+    default: grok-imagine-video
+    description: "The Grok Imagine video model videogen makes videos with. grok-imagine-video-1.5 only animates a first frame."
 providers:
   xai:
     api_key_env_vars: [XAI_API_KEY]
@@ -79,11 +79,17 @@ Imagine is one of their vendors: the plugin registers itself into `imagegen.back
 `videogen.backend` (SDK 1.39; an older Ultron gets the provider and the transcriber only).
 Neither plugin needs a setting for it, and this one does not depend on them.
 
-- **Pictures** (`image_model`, default `grok-imagine-image-2.0`): generates, and edits one
-  picture at a time, no mask.
-- **Videos** (`video_model`, default `grok-imagine-video-1.5`): 1 to 15 seconds, any shape,
-  480p to 1080p, a first and a last frame. The classic `grok-imagine-video` takes no last
-  frame.
+Each says what it takes in imagegen's and videogen's `capabilities` - OpenClaw's xAI
+providers, value for value - so a shape, a resolution or a length it cannot make is moved to
+the nearest one it can, and a request it cannot take passes to the next vendor:
+
+- **Pictures** (`image_model`, default `grok-imagine-image-2.0`): up to four at once, edits of
+  up to three pictures, thirteen shapes from 1:1 to 20:9, 1K or 2K.
+- **Videos** (`video_model`, default `grok-imagine-video`): up to 15 seconds, seven shapes,
+  480P or 720P; from words, from one first frame, or from up to seven `reference_image`
+  pictures (up to 10 seconds); and a video edited, or extended when a length is given, from an
+  http(s) link to it - xAI takes no uploaded video. `grok-imagine-video-1.5` only animates one
+  first frame, at up to 1080P. No last frame on either.
 
 Both spend the provider's key, read with `ctx.credential` - which is why the manifest lists
 `xai` under `vendor_credentials` - and only when imagegen or videogen reaches xAI. Each read

@@ -299,12 +299,17 @@ async def test_a_job_returns_at_once_and_writes_every_ask_into_lyrias_prompt(
 ) -> None:
     it = install(tmp_path)
     result = await call(
-        it.generate, prompt="A Sea Shanty, Rowdy!", lyrics="Heave ho\nblow", seconds=95
+        it.generate,
+        prompt="A Sea Shanty, Rowdy!",
+        lyrics="Heave ho\nblow",
+        instrumental=False,
+        durationSeconds=95,
     )
     assert not result.is_error, result.content
     job = job_id(result)
     assert "with google (lyria-3.5)" in result.content
     assert "-a-sea-shanty-rowdy.mp3 when it is ready" in result.content
+    assert result.content.endswith("Ignored, not supported: durationSeconds=95.")
     [kept] = it.jobs()
     assert kept["id"] == job and kept["session"] == "main" and kept["state"] == "running"
     await it.settle()
@@ -313,12 +318,13 @@ async def test_a_job_returns_at_once_and_writes_every_ask_into_lyrias_prompt(
     assert sent["headers"] == {"x-goog-api-key": "AIza-g"}
     assert sent["json"] == {
         "model": "lyria-3.5",
-        "input": "A Sea Shanty, Rowdy!\n\nLength: about 1 minute 35 seconds.\n\n"
-        "Lyrics:\nHeave ho\nblow",
+        "input": "A Sea Shanty, Rowdy!\n\nLyrics:\nHeave ho\nblow",
     }
     [attempt] = it.events("generate")
     assert attempt.outcome == "ok" and attempt.arguments["lyrics"] is True
-    assert attempt.arguments["seconds"] == 95 and attempt.arguments["bytes"] == len(MP3)
+    assert attempt.arguments["instrumental"] is False
+    assert "durationSeconds" not in attempt.arguments
+    assert attempt.arguments["bytes"] == len(MP3)
     recorded = json.dumps([r.arguments for r in it.auditor.entries if r.kind == "plugin"])
     assert "Shanty" not in recorded and "Heave" not in recorded
     assert "Shanty" not in json.dumps(it.jobs()) and "Heave" not in json.dumps(it.jobs())
@@ -326,10 +332,23 @@ async def test_a_job_returns_at_once_and_writes_every_ask_into_lyrias_prompt(
 
 async def test_an_instrumental_is_asked_for_in_words(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
-    await call(it.generate, prompt="ambient pads", instrumental=True, seconds=30)
+    await call(it.generate, prompt="ambient pads", instrumental=True)
     await it.settle()
     assert wire.to("POST", GOOGLE)[0]["json"]["input"] == (
-        "ambient pads\n\nLength: about 30 seconds.\n\nInstrumental only, no vocals."
+        "ambient pads\n\nInstrumental only. No vocals, no sung lyrics, no spoken word."
+    )
+
+
+async def test_lyrics_and_an_instrumental_together_are_both_sent(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """OpenClaw refuses neither, and neither does musicgen: the vendor decides."""
+    it = install(tmp_path)
+    result = await call(it.generate, prompt="hum", lyrics="la la", instrumental=True)
+    assert not result.is_error, result.content
+    await it.settle()
+    assert wire.to("POST", GOOGLE)[0]["json"]["input"] == (
+        "hum\n\nInstrumental only. No vocals, no sung lyrics, no spoken word.\n\nLyrics:\nla la"
     )
 
 
@@ -352,7 +371,7 @@ async def test_the_track_is_saved_audited_and_told_once_and_the_lyrics_held(
     )
     assert "sun on the water" not in notice
     assert it.runner.notices() == "", "told once"
-    status = await call(it.status, job=job)
+    status = await call(it.status)
     assert status.content.startswith(f"{job}: saved to music/{saved.name}")
     assert "What google said with it:\n[Verse]\nsun on the water" in status.content
     assert "sun on the water" not in json.dumps(it.jobs()), "lyrics never reach the disk"
@@ -401,39 +420,119 @@ async def test_the_job_runs_outside_the_starting_calls_authority(
     assert it.events("music")[0].outcome == "ok"
 
 
-async def test_a_named_path_is_used_and_takes_the_real_extension(
+async def test_a_filename_hint_keeps_its_basename_and_takes_the_real_extension(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
     wire.on("POST", INTERACTIONS, lyria(WAV, text=""))
-    result = await call(it.generate, prompt="x", path="songs/theme.mp3")
-    assert "saved to songs/theme.mp3 when" in result.content
+    result = await call(it.generate, prompt="x", filename="songs/theme.mp3")
+    assert "saved to music/theme.mp3 when" in result.content
     await it.settle()
-    assert (it.workspace / "songs" / "theme.wav").read_bytes() == WAV
+    assert (it.workspace / "music" / "theme.wav").read_bytes() == WAV
+    assert not (it.workspace / "songs").exists()
     assert "has the lyrics" not in it.runner.notices()
+
+
+async def test_a_filename_hint_is_never_refused(tmp_path: Path, wire: Wire) -> None:
+    """OpenClaw's managed media dir: the basename under `output_dir`, a taken
+    name numbered, the suffix the format's or .mp3."""
+    it = install(tmp_path)
+    (it.workspace / "music").mkdir()
+    (it.workspace / "music" / "taken.mp3").write_bytes(b"x")
+    for arguments, target in (
+        ({"filename": "taken"}, "music/taken-2.mp3"),
+        ({"filename": "/etc/song.mp3", "prompt": "a"}, "music/song.mp3"),
+        ({"filename": "..\\..\\escape.wav", "prompt": "b"}, "music/escape.mp3"),
+        ({"filename": "theme", "format": "wav", "prompt": "c"}, "music/theme.wav"),
+    ):
+        result = await call(it.generate, **{"prompt": "x", **arguments})
+        assert not result.is_error, result.content
+        assert f"saved to {target} when" in result.content, result.content
+        await it.settle()
+    assert (it.workspace / "music" / "taken.mp3").read_bytes() == b"x"
+    assert not (tmp_path / "escape.mp3").exists()
 
 
 async def test_something_taking_the_name_meanwhile_is_never_overwritten(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
-    await call(it.generate, prompt="x", path="song.mp3")
-    (it.workspace / "song.mp3").write_bytes(b"mine")
+    await call(it.generate, prompt="x", filename="song.mp3")
+    (it.workspace / "music").mkdir(exist_ok=True)
+    (it.workspace / "music" / "song.mp3").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "song.mp3").read_bytes() == b"mine"
-    assert (it.workspace / "song-2.mp3").read_bytes() == MP3
+    assert (it.workspace / "music" / "song.mp3").read_bytes() == b"mine"
+    assert (it.workspace / "music" / "song-2.mp3").read_bytes() == MP3
+
+
+async def test_a_name_taken_under_another_extension_is_not_offered(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """The vendor decides the format, so a name is free only when no file
+    holds it as any audio type - else the result names theme.mp3 and the save,
+    finding theme.wav taken, writes theme-2.wav."""
+    it = install(tmp_path)
+    (it.workspace / "music").mkdir()
+    (it.workspace / "music" / "theme.wav").write_bytes(b"mine")
+    wire.on("POST", INTERACTIONS, lyria(WAV, text=""))
+    result = await call(it.generate, prompt="x", filename="theme")
+    assert "saved to music/theme-2.mp3 when" in result.content
+    await it.settle()
+    assert (it.workspace / "music" / "theme-2.wav").read_bytes() == WAV
+    assert (it.workspace / "music" / "theme.wav").read_bytes() == b"mine"
+
+
+async def test_a_dotted_name_keeps_its_dots_when_saved(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    await call(it.generate, prompt="x", filename="mix.v1.2.mp3")
+    (it.workspace / "music").mkdir(exist_ok=True)
+    (it.workspace / "music" / "mix.v1.2.mp3").write_bytes(b"mine")
+    await it.settle()
+    assert (it.workspace / "music" / "mix.v1.2-2.mp3").read_bytes() == MP3
 
 
 async def test_pictures_go_to_google_inline(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
+    other = png_of((200, 10, 10))
     (it.workspace / "a.png").write_bytes(PNG)
-    await call(it.generate, prompt="x", images=["a.png", "a.png"])
+    (it.workspace / "b.png").write_bytes(other)
+    await call(it.generate, prompt="x", image="a.png", images=["a.png", "@b.png"])
     await it.settle()
     text, *images = wire.to("POST", GOOGLE)[0]["json"]["input"]
     assert text == {"type": "text", "text": "x"}
-    encoded = base64.b64encode(PNG).decode()
-    assert images == [{"type": "image", "mime_type": "image/png", "data": encoded}] * 2
+    assert images == [
+        {"type": "image", "mime_type": "image/png", "data": base64.b64encode(each).decode()}
+        for each in (PNG, other)
+    ], "image and images together, the same one once"
     assert it.events("generate")[0].arguments["images"] == 2
+
+
+async def test_a_data_url_and_a_file_url_are_pictures_too(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    other = png_of((0, 200, 0))
+    (it.workspace / "b.png").write_bytes(other)
+    data_url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+    file_url = (it.workspace / "b.png").resolve().as_uri()
+    result = await call(it.generate, prompt="x", images=[data_url, file_url])
+    assert not result.is_error, result.content
+    await it.settle()
+    _, *images = wire.to("POST", GOOGLE)[0]["json"]["input"]
+    assert [each["data"] for each in images] == [
+        base64.b64encode(PNG).decode(),
+        base64.b64encode(other).decode(),
+    ]
+
+
+async def test_an_http_picture_is_fetched_through_the_web_client(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    wire.on("GET", "https://example.com/", Response(raw=PNG))
+    await call(it.generate, prompt="x", images=["https://example.com/a.png"])
+    await it.settle()
+    assert [s["url"] for s in wire.to("GET", "https://")] == ["https://example.com/a.png"]
+    _, image = wire.to("POST", GOOGLE)[0]["json"]["input"]
+    assert image["data"] == base64.b64encode(PNG).decode()
 
 
 async def test_the_older_outputs_shape_is_read_too(tmp_path: Path, wire: Wire) -> None:
@@ -465,9 +564,9 @@ class Made:
 
 class AcmeMusic:
     model = "acme-m"
-
+{extra}
     def cannot(self, request):
-        return "takes no pictures" if request.images else ""
+        {cannot}
 
     async def generate(self, request):
         assert isinstance(request.described, str)
@@ -482,26 +581,111 @@ class Acme(Plugin):
 """
 
 
-def backend(root: Path, *, generate: str = "return Made(MP3, cost='$0.05')") -> None:
+def backend(
+    root: Path,
+    *,
+    generate: str = "return Made(MP3, cost='$0.05')",
+    cannot: str = "return 'takes no pictures' if request.images else ''",
+    extra: str = "",
+) -> None:
     directory = root / "acme"
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "PLUGIN.md").write_text(
         "---\nname: acme\ndescription: A test vendor.\n---\n", encoding="utf-8"
     )
-    module = BACKEND.format(mp3=MP3, generate=generate)
+    module = BACKEND.format(mp3=MP3, generate=generate, cannot=cannot, extra=extra)
     (directory / "plugin.py").write_text(module, encoding="utf-8")
 
 
-async def test_a_clip_model_is_passed_over_for_a_length_it_cannot_make(
+def capable(**generate: Any) -> str:
+    """A class attribute declaring OpenClaw's capabilities, for `backend`:
+    everything, and no pictures."""
+    mode = {
+        "supports_lyrics": True,
+        "supports_instrumental": True,
+        "supports_duration": True,
+        "supports_format": True,
+        "supported_formats": ["mp3", "wav"],
+        **generate,
+    }
+    edit = {"enabled": False}
+    return f"    capabilities = {{'generate': {mode!r}, 'edit': {edit!r}}}\n"
+
+
+async def test_google_takes_no_length_so_it_is_dropped_and_said(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    result = await call(it.generate, prompt="x", durationSeconds=60)
+    assert "with google (lyria-3.5)" in result.content
+    assert "Ignored, not supported: durationSeconds=60." in result.content
+    await it.settle()
+    [sent] = wire.to("POST", GOOGLE)
+    assert sent["json"]["input"] == "x"
+    assert "durationSeconds" not in it.events("generate")[0].arguments
+
+
+@pytest.mark.parametrize(
+    ("model", "kept"),
+    [("lyria-3-clip-preview", False), ("lyria-3-pro-preview", True), ("lyria-3.5", True)],
+)
+async def test_a_wav_is_asked_of_the_google_model_that_makes_one(
+    tmp_path: Path, wire: Wire, model: str, kept: bool
+) -> None:
+    """The clip model makes MP3 only; the pro model MP3 or WAV; a model
+    OpenClaw does not list checks the format itself, so it is sent."""
+    it = install(tmp_path, settings={"google_model": model})
+    result = await call(it.generate, prompt="x", format="wav")
+    assert ("Ignored, not supported: format=wav." in result.content) is not kept
+    assert ".wav when it is ready" in result.content
+    await it.settle()
+    assert it.events("generate")[0].arguments.get("format") == ("wav" if kept else None)
+
+
+async def test_a_length_past_a_vendors_longest_is_made_as_its_longest(
     tmp_path: Path, wire: Wire
 ) -> None:
-    backend(tmp_path / "plugins")
-    it = session(tmp_path, "acme", settings={"google_model": "lyria-3-clip-preview"})
-    result = await call(it.generate, prompt="x", seconds=60)
+    backend(tmp_path / "plugins", extra=capable(max_duration_seconds=180))
+    it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
+    result = await call(it.generate, prompt="x", durationSeconds=300)
     assert "with acme (acme-m)" in result.content
-    assert "Passed over google: lyria-3-clip-preview makes 30-second clips only." in result.content
+    assert "durationSeconds 300 was made as 180." in result.content
     await it.settle()
-    assert not wire.sent
+    assert it.events("generate")[0].arguments["durationSeconds"] == 180
+    assert "durationSeconds 300 was made as 180." in (await call(it.status)).content
+
+
+async def test_a_backend_that_takes_no_pictures_is_passed_over_for_them(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """Its `capabilities` say so; its own `cannot` is never reached."""
+    backend(tmp_path / "plugins", extra=capable(), cannot="return ''")
+    it = session(tmp_path, "acme", settings={"provider": "acme"})
+    (it.workspace / "a.png").write_bytes(PNG)
+    result = await call(it.generate, prompt="x", images=["a.png"])
+    assert "with google (lyria-3.5)" in result.content
+    assert "Passed over acme: takes no pictures." in result.content
+    await it.settle()
+    assert [r.arguments["vendor"] for r in it.events("generate")] == ["google"]
+
+
+async def test_a_backend_written_before_capabilities_takes_no_format(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """Read as what it did: lyrics, an instrumental and a length in its prompt,
+    and no format - which is dropped and said rather than sent to code that
+    would not read it."""
+    backend(
+        tmp_path / "plugins",
+        generate="return Made(MP3, lyrics=request.described + '|' + str(request.seconds))",
+    )
+    it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
+    result = await call(
+        it.generate, prompt="x", lyrics="la", durationSeconds=30, format="wav", instrumental=True
+    )
+    assert "be told then. Ignored, not supported: format=wav. Passed over" in result.content
+    await it.settle()
+    status = (await call(it.status)).content
+    assert "Length: about 30 seconds." in status and "Lyrics:\nla|30" in status
+    assert "format" not in it.events("generate")[0].arguments
 
 
 async def test_a_vendor_that_fails_passes_to_the_next_and_both_are_audited(
@@ -541,7 +725,7 @@ async def test_every_vendor_failing_is_one_failure_without_the_vendors_words(
     assert it.runner.notices() == (
         f"Note: music {job} from google failed; music_generate status {job} says why."
     )
-    status = await call(it.status, job=job)
+    status = await call(it.status)
     assert "failed at google (lyria-3.5)" in status.content
     assert "HTTP 403 from Google (PERMISSION_DENIED)" in status.content
     assert "obey me" not in status.content
@@ -554,9 +738,9 @@ async def test_a_timeout_is_not_passed_on_because_it_may_have_been_billed(
     backend(tmp_path / "plugins", generate="await asyncio.sleep(5)")
     it = session(tmp_path, "acme", settings={"provider": "acme"})
     it.runner.timeout = lambda: 0.05  # type: ignore[method-assign]
-    job = job_id(await call(it.generate, prompt="x"))
+    await call(it.generate, prompt="x")
     await it.settle()
-    status = await call(it.status, job=job)
+    status = await call(it.status)
     assert "acme: timed out after 0.05s; it may have been billed" in status.content
     assert not wire.sent, "google was never asked"
 
@@ -585,9 +769,9 @@ async def test_bytes_that_are_not_audio_are_refused_and_not_passed_on(
     backend(tmp_path / "plugins")
     it = session(tmp_path, "acme")
     wire.on("POST", INTERACTIONS, lyria(b"<html>nope</html>"))
-    job = job_id(await call(it.generate, prompt="x"))
+    await call(it.generate, prompt="x")
     await it.settle()
-    status = await call(it.status, job=job)
+    status = await call(it.status)
     assert "not MP3, WAV, FLAC, Ogg or M4A audio" in status.content
     assert [r.arguments["vendor"] for r in it.events("generate")] == ["google"]
     assert not (it.workspace / "music").exists()
@@ -611,7 +795,9 @@ async def test_openrouter_makes_the_track_through_musicgen_backend(
     assert "with openrouter (google/lyria-3-pro-preview)" in result.content
     await it.settle()
     [sent] = wire.to("POST", CHAT)
-    assert sent["json"]["messages"][0]["content"] == "lofi\n\nInstrumental only, no vocals."
+    assert sent["json"]["messages"][0]["content"] == (
+        "lofi\n\nInstrumental only. No vocals, no sung lyrics, no spoken word."
+    )
     [job] = it.jobs()
     assert job["vendor"] == "openrouter" and job["state"] == "done"
     assert (it.workspace / job["saved"]).read_bytes() == MP3
@@ -654,7 +840,8 @@ async def test_a_job_an_earlier_session_left_running_is_ended_by_the_next(
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"jobs": [job, {**job, "id": "mg-def456", "session": "dm:1"}]}))
     second = install(tmp_path)
-    status = await call(second.status, job="mg-abc123")
+    status = await call(second.status)
+    assert status.content.startswith("mg-abc123: failed at google")
     assert "failed at google" in status.content and "may have been billed" in status.content
     assert {j["id"]: j["state"] for j in second.jobs()} == {
         "mg-abc123": "failed",
@@ -670,14 +857,37 @@ async def test_another_sessions_job_is_not_shown(tmp_path: Path, wire: Wire) -> 
     assert (await call(mine.status)).content == "No music jobs in this session."
 
 
-async def test_music_status_waits_for_a_job_and_then_no_notice_repeats_it(
+async def test_status_tells_the_job_so_no_notice_repeats_it(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    job = job_id(await call(it.generate, prompt="x"))
+    await it.settle()
+    status = await call(it.status)
+    assert status.content.startswith(f"{job}: saved to music/")
+    assert it.runner.notices() == ""
+
+
+async def test_status_shows_what_the_vendor_was_sent_instead_and_the_lyrics(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
-    job = job_id(await call(it.generate, prompt="x"))
-    status = await call(it.status, job=job, wait=30)
-    assert status.content.startswith(f"{job}: saved to music/")
-    assert it.runner.notices() == ""
+    job = job_id(await call(it.generate, prompt="x", durationSeconds=45))
+    await it.settle()
+    status = (await call(it.status)).content
+    first = status.splitlines()[0]
+    assert first.startswith(f"{job}: saved to music/")
+    assert first.endswith(". Ignored, not supported: durationSeconds=45.")
+    assert status.endswith("What google said with it:\n[Verse]\nsun on the water")
+    [kept] = it.jobs()
+    assert kept["notes"] == "Ignored, not supported: durationSeconds=45."
+
+
+async def test_status_cuts_long_lyrics(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    wire.on("POST", INTERACTIONS, lyria(text="a" * 5000))
+    await call(it.generate, prompt="x")
+    await it.settle()
+    status = (await call(it.status)).content
+    assert status.endswith("\n" + "a" * 4000 + "\n[...]")
 
 
 async def test_music_status_lists_running_jobs_newest_first(tmp_path: Path, wire: Wire) -> None:
@@ -784,14 +994,21 @@ async def test_the_same_request_while_it_runs_answers_with_that_job(
     backend(tmp_path / "plugins", generate="await asyncio.Event().wait()")
     it = session(tmp_path, "acme", settings={"provider": "acme"})
     job = job_id(await call(it.generate, prompt="sea shanty", lyrics="heave ho"))
-    again = await call(it.generate, prompt="sea shanty", lyrics="heave ho", path="other.mp3")
+    again = await call(it.generate, prompt="sea shanty", lyrics="heave ho", filename="other")
     assert not again.is_error
     assert again.content.startswith(f"Not started again: music {job} is the same request")
     assert len(it.jobs()) == 1 and len(it.runner.tasks) == 1
-    for different in ({"lyrics": "heave"}, {"instrumental": True, "lyrics": ""}, {"seconds": 60}):
+    for different in (
+        {"lyrics": "heave"},
+        {"instrumental": True, "lyrics": ""},
+        {"durationSeconds": 60},
+        {"format": "wav"},
+    ):
         arguments = {"prompt": "sea shanty", "lyrics": "heave ho", **different}
         assert "Started music" in (await call(it.generate, **arguments)).content
-    assert len(it.jobs()) == 4
+    assert len(it.jobs()) == 5
+    wav = await call(it.generate, prompt="sea shanty", lyrics="heave ho", format="wav")
+    assert wav.content.startswith("Not started again"), "the format is in the fingerprint"
     assert "sea shanty" not in json.dumps(it.jobs())
     it.runner.close()
     await asyncio.sleep(0)
@@ -843,28 +1060,34 @@ async def test_a_failed_job_is_retried_rather_than_returned(tmp_path: Path, wire
 
 async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
-    (it.workspace / "taken.mp3").write_bytes(b"x")
     (it.workspace / "notes.txt").write_text("hi")
     for arguments, said in (
         ({"prompt": "  "}, "needs a prompt"),
-        ({"prompt": "x", "lyrics": "la", "instrumental": True}, "no lyrics"),
         ({"prompt": "x", "images": ["../out.png"]}, "outside the workspace"),
-        ({"prompt": "x", "path": "/etc/song.mp3"}, "outside the workspace"),
-        ({"prompt": "x", "seconds": 2}, "seconds"),
+        ({"prompt": "x", "image": "file:///etc/out.png"}, "outside the workspace"),
+        ({"prompt": "x", "images": ["ftp://host/a.png"]}, "Unsupported image reference"),
+        ({"prompt": "x", "images": [f"{n}.png" for n in range(11)]}, "maximum is 10"),
+        ({"prompt": "x", "durationSeconds": 0}, "positive integer"),
+        ({"prompt": "x", "format": "flac"}, "format must be one of"),
         ({"prompt": "x", "lyrics": "a" * 5001}, "over 5000 characters"),
+        ({"prompt": "x", "seconds": 30}, "unknown argument"),
+        ({"prompt": "x", "path": "a.mp3"}, "unknown argument"),
     ):
         with pytest.raises(ToolError, match=said):
             it.generate.validate(arguments)
+    with pytest.raises(ToolError, match="action must be one of"):
+        it.generate.tool.validate({"action": "make", "prompt": "x"})
     for arguments, said in (
-        ({"prompt": "x", "path": "taken.mp3"}, "taken.mp3 already exists"),
-        ({"prompt": "x", "path": "taken"}, "taken.mp3 already exists"),
         ({"prompt": "x", "images": ["notes.txt"]}, "not a PNG, JPEG or WebP"),
         ({"prompt": "x", "images": ["missing.png"]}, "no such file"),
+        ({"prompt": "x", "images": ["data:image/png,raw"]}, "must be base64"),
+        ({"prompt": "x", "images": ["data:image/png;base64,@@@"]}, "not valid base64"),
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    # No job is this session's jobs, as OpenClaw's status is; a wait needs a job to wait on.
-    assert it.status.validate({"wait": 5}) == {"action": "status", "job": "", "wait": 0}
+    # status and list take nothing else; what they were handed is set aside.
+    assert it.status.validate({"prompt": "x"}) == {"action": "status"}
+    assert it.generate.tool.validate({"prompt": "x"})["action"] == "generate"
     assert not wire.sent and not it.runner.mine()
 
 
@@ -906,9 +1129,9 @@ async def test_what_a_backend_returns_is_checked(
 ) -> None:
     backend(tmp_path / "plugins", generate=generate)
     it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
-    job = job_id(await call(it.generate, prompt="x"))
+    await call(it.generate, prompt="x")
     await it.settle()
-    status = await call(it.status, job=job)
+    status = await call(it.status)
     assert said in status.content, status.content
 
 
@@ -983,6 +1206,8 @@ def test_the_model_is_checked_before_anything_runs(tmp_path: Path) -> None:
 
 async def test_list_shows_the_vendors_and_status_the_jobs(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
-    assert (await call(it.list)).content.splitlines()[1:] == ["- google/lyria-3.5: ready"]
+    assert (await call(it.list)).content.splitlines()[1:] == [
+        "- google/lyria-3.5: ready; also google/lyria-3-clip-preview, google/lyria-3-pro-preview"
+    ]
     assert (await call(it.status)).content == "No music jobs in this session."
     assert wire.sent == []

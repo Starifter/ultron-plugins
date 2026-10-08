@@ -64,14 +64,22 @@ def wired(monkeypatch: pytest.MonkeyPatch, answer: Response) -> Wire:
 
 
 def picture(**overrides: Any) -> Any:
-    fields = {"prompt": "x", "images": (), "mask": None, "aspect": "", "timeout": 30.0}
+    fields = {
+        "prompt": "x",
+        "images": (),
+        "count": 1,
+        "size": "",
+        "aspect_ratio": "",
+        "resolution": "",
+        "timeout": 30.0,
+    }
     return SimpleNamespace(**{**fields, **overrides})
 
 
 async def test_fireworks_answers_with_the_picture_itself(monkeypatch: pytest.MonkeyPatch) -> None:
     wire = wired(monkeypatch, Response(PNG))
     vendor = plugin.FireworksImages(model="flux-1-dev-fp8", api_key="fw-k")
-    made = await vendor.generate(picture(aspect="square"))
+    made = await vendor.generate(picture(aspect_ratio="1:1"))
     assert (made.data, made.model, made.cost) == (PNG, "flux-1-dev-fp8", "")
     [sent] = wire.sent
     assert sent["url"] == f"{WORKFLOWS}/accounts/fireworks/models/flux-1-dev-fp8/text_to_image"
@@ -83,7 +91,7 @@ async def test_fireworks_answers_with_the_picture_itself(monkeypatch: pytest.Mon
 async def test_fireworks_takes_a_full_id_as_written(monkeypatch: pytest.MonkeyPatch) -> None:
     wire = wired(monkeypatch, Response(PNG))
     vendor = plugin.FireworksImages(model="accounts/me/models/my-flux", auth_token="t")
-    made = await vendor.generate(picture(aspect="portrait"))
+    made = await vendor.generate(picture(aspect_ratio="2:3"))
     assert made.model == "my-flux"
     assert wire.sent[0]["url"] == f"{WORKFLOWS}/accounts/me/models/my-flux/text_to_image"
     assert wire.sent[0]["json"]["aspect_ratio"] == "2:3"
@@ -118,6 +126,40 @@ async def test_fireworks_refuses_a_picture_to_work_from_and_an_empty_reply(
     assert not wire.sent
     with pytest.raises(RuntimeError, match="Fireworks sent no picture"):
         await plugin.FireworksImages(api_key="k").generate(picture())
+
+
+async def test_fireworks_sends_only_a_shape_the_workflow_lists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire = wired(monkeypatch, Response(PNG))
+    vendor = plugin.FireworksImages(api_key="k")
+    await vendor.generate(picture(aspect_ratio="21:9", size="1024x1024", resolution="2K"))
+    await vendor.generate(picture(aspect_ratio="4:3"))
+    assert [sent["json"] for sent in wire.sent] == [
+        {"prompt": "x", "aspect_ratio": "21:9"},
+        {"prompt": "x"},
+    ]
+
+
+async def test_fireworks_reads_a_request_from_before_aspect_ratio(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wire = wired(monkeypatch, Response(PNG))
+    older = SimpleNamespace(prompt="x", images=(), aspect="square", timeout=30.0)
+    made = await plugin.FireworksImages(api_key="k").generate(older)
+    assert made.data == PNG
+    assert wire.sent[0]["json"] == {"prompt": "x"}
+
+
+def test_fireworks_declares_one_picture_a_call_shaped_by_aspect_ratio() -> None:
+    caps = plugin.FireworksImages.capabilities
+    assert caps["generate"]["max_count"] == 1
+    assert caps["generate"]["supports_aspect_ratio"] is True
+    assert caps["generate"]["supports_size"] is False
+    assert caps["generate"]["supports_resolution"] is False
+    assert caps["edit"] == {"enabled": False}
+    assert "16:9" in caps["geometry"]["aspect_ratios"]
+    assert "4:3" not in caps["geometry"]["aspect_ratios"]
 
 
 def test_register_puts_the_backend_into_imagegens_point() -> None:

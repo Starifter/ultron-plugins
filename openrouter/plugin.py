@@ -506,9 +506,10 @@ def _entry_of(item: Mapping[str, Any]) -> ModelEntry | None:
 # `openrouter:oauth` sign-in, either of which OpenRouter takes as a bearer.
 
 IMAGES_URL = f"{BASE_URL}/images"
-IMAGE_ASPECTS = {"square": "1:1", "landscape": "3:2", "portrait": "2:3"}
+IMAGE_ASPECT_RATIOS = ("1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9")
+"""OpenClaw's: the shapes OpenRouter's image models share."""
 VIDEOS_URL = f"{BASE_URL}/videos"
-VIDEO_ASPECTS = {"landscape": "16:9", "portrait": "9:16", "square": "1:1"}
+VIDEO_DURATIONS = (4, 6, 8)
 CHAT_URL = f"{BASE_URL}/chat/completions"
 MUSIC_REPLY_MAX_BYTES = 96 * 1024 * 1024
 """A streamed track: base64 in JSON chunks, well over a third larger than its bytes."""
@@ -526,15 +527,27 @@ CODE = re.compile(r"[^A-Za-z0-9_.-]+")
 USER_AGENT = "ultron-openrouter"
 
 
-class Made:
-    """A picture, as imagegen reads one: the bytes, the model, a cost."""
+class Pictures:
+    """What imagegen reads back: `images` (each with `data`), the model, a cost.
+    `data` is the first, for an imagegen before 4.0."""
 
-    __slots__ = ("cost", "data", "model")
+    __slots__ = ("cost", "images", "model")
 
-    def __init__(self, data: bytes, model: str = "", cost: str = "") -> None:
-        self.data = data
+    def __init__(self, images: list[bytes], model: str = "", cost: str = "") -> None:
+        self.images = [Picture(data) for data in images]
         self.model = model
         self.cost = cost
+
+    @property
+    def data(self) -> bytes:
+        return self.images[0].data
+
+
+class Picture:
+    __slots__ = ("data",)
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
 
 
 class Status:
@@ -556,13 +569,39 @@ class Retry(Exception):
     retry = True
 
 
+def _wants(request: Any, name: str, default: Any = "") -> Any:
+    """A field of imagegen's, videogen's or musicgen's request, or its default
+    when an older one sent a request without it."""
+    return getattr(request, name, default)
+
+
 class OpenRouterImages:
-    """OpenRouter's Images API, pictures to work from as `input_references`."""
+    """OpenRouter's Images API, pictures to work from as `input_references` -
+    OpenClaw's OpenRouter image provider."""
 
     name = "openrouter"
     host = "openrouter.ai"
+    capabilities = {
+        "generate": {
+            "max_count": 4,
+            "supports_size": False,
+            "supports_aspect_ratio": True,
+            "supports_resolution": True,
+        },
+        "edit": {
+            "enabled": True,
+            "max_count": 4,
+            "max_input_images": 5,
+            "supports_size": False,
+            "supports_aspect_ratio": True,
+            "supports_resolution": True,
+        },
+        "geometry": {"aspect_ratios": IMAGE_ASPECT_RATIOS, "resolutions": ("1K", "2K", "4K")},
+        "output": {},
+    }
     edits = True
-    masks = False
+    max_images = 5
+    """What an imagegen before 4.0 read."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -573,12 +612,20 @@ class OpenRouterImages:
     def ready(self) -> str:
         return "" if self._key else "no openrouter key (ultron auth add openrouter)"
 
-    async def generate(self, request: Any) -> Made:
+    async def generate(self, request: Any) -> Pictures:
         if not request.prompt.strip():
             raise ValueError("nothing to make: the prompt is empty")
-        body: dict[str, Any] = {"model": self.model, "prompt": request.prompt, "n": 1}
-        if request.aspect in IMAGE_ASPECTS:
-            body["aspect_ratio"] = IMAGE_ASPECTS[request.aspect]
+        body: dict[str, Any] = {
+            "model": self.model,
+            "prompt": request.prompt,
+            "n": max(1, min(4, int(_wants(request, "count", 1) or 1))),
+        }
+        aspect = _wants(request, "aspect_ratio")
+        if aspect:
+            body["aspect_ratio"] = aspect
+        resolution = _wants(request, "resolution")
+        if resolution:
+            body["resolution"] = resolution
         if request.images:
             body["input_references"] = [
                 {"type": "image_url", "image_url": {"url": _data_uri(image.data, image.media_type)}}
@@ -589,15 +636,39 @@ class OpenRouterImages:
         cost = ""
         if isinstance(usage, Mapping) and isinstance(usage.get("cost"), int | float):
             cost = f"${usage['cost']:g}"
-        return Made(_first_b64(parsed), model=self.model, cost=cost)
+        return Pictures(_all_b64(parsed), model=self.model, cost=cost)
+
+
+def _openrouter_video_mode(most_images: int) -> dict[str, Any]:
+    return {
+        "max_videos": 1,
+        "supported_duration_seconds": VIDEO_DURATIONS,
+        "supports_aspect_ratio": True,
+        "supports_resolution": True,
+        "supports_size": True,
+        "supports_audio": True,
+        "aspect_ratios": ("16:9", "9:16"),
+        "resolutions": ("720P", "1080P"),
+        **({"enabled": True, "max_input_images": most_images} if most_images else {}),
+    }
 
 
 class OpenRouterVideo:
     """OpenRouter's Videos API: `POST /videos`, then `/videos/{id}`, then the content
-    from a URL this code builds rather than one the reply names."""
+    from a URL this code builds rather than one the reply names - OpenClaw's
+    OpenRouter video provider."""
 
     name = "openrouter"
     host = "openrouter.ai"
+    capabilities = {
+        "provider_options": {"seed": "number"},
+        "generate": _openrouter_video_mode(0),
+        "image_to_video": _openrouter_video_mode(4),
+        "video_to_video": {"enabled": False},
+    }
+    """OpenClaw's also declares `callback_url`, which has OpenRouter post to an
+    address the model chose; that would be a request no address policy sees,
+    so it is not taken here."""
 
     def __init__(
         self, *, model: str = "", api_key: str | None = None, auth_token: str | None = None
@@ -609,27 +680,36 @@ class OpenRouterVideo:
         return "" if self._key else "no openrouter key (ultron auth add openrouter)"
 
     def cannot(self, request: Any) -> str:
+        seed = _wants(request, "provider_options", {}).get("seed")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            return "providerOptions.seed must be an integer"
         return ""
 
     async def submit(self, request: Any) -> str:
         body: dict[str, Any] = {"model": self.model, "prompt": request.prompt}
-        if request.seconds:
-            body["duration"] = request.seconds
-        if request.aspect in VIDEO_ASPECTS:
-            body["aspect_ratio"] = VIDEO_ASPECTS[request.aspect]
-        if request.resolution:
-            body["resolution"] = request.resolution
-        frames = [
-            {
-                "type": "image_url",
-                "image_url": {"url": _data_uri(frame.data, frame.media_type)},
-                "frame_type": kind,
-            }
-            for kind, frame in (("first_frame", request.first), ("last_frame", request.last))
-            if frame is not None
-        ]
+        duration = int(_wants(request, "duration_seconds", 0) or getattr(request, "seconds", 0))
+        if duration:
+            body["duration"] = min(VIDEO_DURATIONS, key=lambda d: (abs(d - duration), -d))
+        resolution = str(_wants(request, "resolution") or "").lower()
+        if resolution:
+            body["resolution"] = resolution
+        aspect = _wants(request, "aspect_ratio")
+        if aspect:
+            body["aspect_ratio"] = aspect
+        size = _wants(request, "size")
+        if size:
+            body["size"] = size
+        audio = _wants(request, "audio", None)
+        if isinstance(audio, bool):
+            body["generate_audio"] = audio
+        frames, references = _video_images(list(getattr(request, "images", ()) or ()))
         if frames:
             body["frame_images"] = frames
+        if references:
+            body["input_references"] = references
+        seed = _wants(request, "provider_options", {}).get("seed")
+        if isinstance(seed, int) and not isinstance(seed, bool):
+            body["seed"] = seed
         parsed = await _call(
             "POST", VIDEOS_URL, headers=self._headers(), timeout=request.timeout, body=body
         )
@@ -693,11 +773,24 @@ class OpenRouterMusic:
     def ready(self) -> str:
         return "" if self._key else "no openrouter key (ultron auth add openrouter)"
 
+    @property
+    def capabilities(self) -> dict[str, Any]:
+        """OpenClaw's OpenRouter music provider: lyrics, an instrumental, up to
+        three minutes and MP3 or WAV, with one picture to set the mood."""
+        mode = {
+            "max_tracks": 1,
+            "max_duration_seconds": 180,
+            "supports_lyrics": True,
+            "supports_instrumental": True,
+            "supports_duration": True,
+            "supports_format": True,
+            "supported_formats": ("mp3", "wav"),
+        }
+        return {"generate": mode, "edit": {"enabled": True, "max_input_images": 1, **mode}}
+
     def cannot(self, request: Any) -> str:
         if len(request.images) > 1:
             return "takes one picture at most"
-        if "clip" in self.model and request.seconds and request.seconds != 30:
-            return f"{self.model} makes 30-second clips only"
         return ""
 
     async def generate(self, request: Any) -> Track:
@@ -720,7 +813,7 @@ class OpenRouterMusic:
             "model": self.model,
             "messages": [{"role": "user", "content": content}],
             "modalities": ["text", "audio"],
-            "audio": {"format": "mp3"},
+            "audio": {"format": _wants(request, "format") or "wav"},
             "stream": True,
         }
         try:
@@ -880,14 +973,40 @@ def _data_uri(data: bytes, media_type: str) -> str:
     return f"data:{media_type};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-def _first_b64(parsed: Mapping[str, Any]) -> bytes:
-    """The first picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
+def _all_b64(parsed: Mapping[str, Any]) -> list[bytes]:
+    """Every picture of an OpenAI-shaped `data: [{b64_json}]` reply."""
     rows = parsed.get("data")
-    first = rows[0] if isinstance(rows, list) and rows else None
-    encoded = first.get("b64_json") if isinstance(first, Mapping) else None
-    if not encoded:
+    found = [
+        base64.b64decode(str(row["b64_json"]))
+        for row in (rows if isinstance(rows, list) else ())
+        if isinstance(row, Mapping) and row.get("b64_json")
+    ]
+    if not found:
         raise RuntimeError("OpenRouter sent no picture")
-    return base64.b64decode(str(encoded))
+    return found
+
+
+def _video_images(images: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """OpenClaw's `buildImageInputs`: a reference picture is an input
+    reference; the first and last frames by role, or in order for pictures
+    with none; a second of either is a reference too."""
+    frames: list[dict[str, Any]] = []
+    references: list[dict[str, Any]] = []
+    taken: set[str] = set()
+    for image in images:
+        part = {"type": "image_url", "image_url": {"url": _data_uri(image.data, image.media_type)}}
+        role = str(getattr(image, "role", "") or "")
+        if role == "reference_image":
+            references.append(part)
+            continue
+        if role not in ("first_frame", "last_frame"):
+            role = "last_frame" if "first_frame" in taken else "first_frame"
+        if role in taken:
+            references.append(part)
+            continue
+        frames.append({**part, "frame_type": role})
+        taken.add(role)
+    return frames, references
 
 
 def _code(value: Any) -> str:
