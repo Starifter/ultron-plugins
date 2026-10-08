@@ -16,12 +16,14 @@ does not know musicgen exists. Whichever vendor it is, `Vendor` is how this
 module sees it, so a backend's object is touched in one place.
 
 videogen's shape with imagegen's vendor: every music API answers in one request,
-but that request takes a minute or two, so `generate_music` starts a job and
+but that request takes a minute or two, so `music_generate` starts a job and
 returns. The job belongs to the session, not to the call that started it - like
 a backgrounded `exec` - so the task runs in a context of its own, where an abort
-of the turn that started it cannot reach. A `before_prompt` hook tells the model
-on the session's next turn. There is nothing at a vendor to pick back up, so a
-session that ends mid-track ends the job, and the next session says so.
+of the turn that started it cannot reach. When it ends the agent is woken
+(`ctx.wake`, SDK 1.40) to tell the person, and where that cannot happen a
+`before_prompt` hook tells the model on the session's next turn. There is
+nothing at a vendor to pick back up, so a session that ends mid-track ends the
+job, and the next session says so.
 """
 
 from __future__ import annotations
@@ -60,7 +62,7 @@ AUDIO_MAX_BYTES = 64 * 1024 * 1024
 REPLY_MAX_BYTES = 96 * 1024 * 1024
 """A reply carries the track as base64, a third bigger than the track."""
 LYRICS_SHOWN = 4000
-"""What `music_status` shows of a vendor's lyrics."""
+"""What `music_generate status` shows of a vendor's lyrics."""
 KEEP = 200
 """Finished jobs kept in the file; the oldest past this are dropped."""
 DUPLICATE_SECONDS = 120
@@ -487,6 +489,10 @@ class Musicgen:
         is not the prompt, but it is no business of `jobs.json` either."""
         self.vendors: Callable[[], Iterator[Vendor]] = self._vendors
         self.swept = False
+        self.waking: asyncio.Task[None] | None = None
+        """The wake on its way, if one is (`announce`)."""
+        self.closed = False
+        """The session has ended: nothing more is woken."""
 
     # -- settings --------------------------------------------------------------
 
@@ -577,9 +583,12 @@ class Musicgen:
         self.tasks[job.id] = task
 
     def close(self) -> None:
+        self.closed = True
         for task in self.tasks.values():
             task.cancel()
         self.tasks.clear()
+        if self.waking is not None:
+            self.waking.cancel()
 
     async def _make(self, job: Job, vendors: list[Vendor], request: Request) -> None:
         passed: list[str] = []
@@ -710,14 +719,66 @@ class Musicgen:
             duration_ms=max(0.0, job.finished - job.created) * 1000,
         )
         self.ended.setdefault(job.id, asyncio.Event()).set()
+        self.announce()
 
     # -- telling ---------------------------------------------------------------
+
+    def wakes(self) -> bool:
+        """Whether a finished job wakes the agent: `announce: wake` (the
+        default) on an Ultron that has `ctx.wake` (SDK 1.40). Whether this
+        session has anybody to wake is the core's answer, at the wake."""
+        announce = str(self.ctx.setting("announce", "wake") or "wake").strip().lower()
+        return announce == "wake" and hasattr(self.ctx, "wake") and not self.closed
+
+    def announce(self) -> None:
+        """Wake the agent about what finished, unless a wake is already on its
+        way - that one says everything finished by the time it is sent."""
+        if not self.wakes() or (self.waking is not None and not self.waking.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.waking = loop.create_task(self._wake(), context=contextvars.Context())
+
+    async def _wake(self) -> None:
+        """OpenClaw's completion event: a turn of the session's own that says
+        which jobs finished, so the agent tells the person without waiting for
+        them to speak. The jobs are marked told *before* the wake, so the woken
+        turn's own `before_prompt` does not say them a second time; a wake that
+        did not run - a busy lane, nobody there, the operator's no - unmarks
+        them, and the next turn is told instead."""
+        while True:
+            jobs = [job for job in self.mine() if job.state != "running" and not job.notified]
+            if not jobs:
+                return
+            for job in jobs:
+                job.notified = True
+                with contextlib.suppress(OSError):
+                    self.file.save(job)
+            lines = [_notice(job, job.id in self.lyrics) for job in jobs]
+            lines.append("Tell the person, briefly, and say where to find it.")
+            try:
+                woke = bool(await self.ctx.wake("\n".join(lines)))
+            except asyncio.CancelledError:
+                woke = False
+                raise
+            except Exception:  # an Ultron that refuses the wake still tells the next turn
+                woke = False
+            finally:
+                if not woke:
+                    for job in jobs:
+                        job.notified = False
+                        with contextlib.suppress(OSError):
+                            self.file.save(job)
+            if not woke:
+                return
 
     def notices(self) -> str:
         """One line per job finished since the model was last told. Facts this
         plugin worked out - a path, a size, a vendor's name - and never a word
         a vendor wrote; why one failed, and the lyrics, are behind
-        `music_status`."""
+        `music_generate status`."""
         lines = []
         for job in self.mine():
             if job.state == "running" or job.notified:
@@ -729,7 +790,7 @@ class Musicgen:
         return "\n".join(lines)
 
     def told(self, job: Job) -> None:
-        """`music_status` said how it ended, so no notice says it again."""
+        """`music_generate status` said how it ended, so no notice says it again."""
         if job.state != "running" and not job.notified:
             job.notified = True
             with contextlib.suppress(OSError):
@@ -743,9 +804,11 @@ def _notice(job: Job, lyrics: bool) -> str:
             f"({job.made_by()}, {job.media_type}, {_human(job.bytes)})."
         )
         if lyrics:
-            line += f" music_status {job.id} has the lyrics."
+            line += f" music_generate status {job.id} has the lyrics."
         return line
-    return f"Note: music {job.id} from {job.vendor} failed; music_status {job.id} says why."
+    return (
+        f"Note: music {job.id} from {job.vendor} failed; music_generate status {job.id} says why."
+    )
 
 
 def _duplicate(job: Job) -> str:
@@ -812,11 +875,20 @@ def _asked(vendor: Vendor, request: Request) -> dict[str, Any]:
 # -- the tools -------------------------------------------------------------------
 
 
-class GenerateMusic(Tool):
-    name = "generate_music"
+ACTIONS = ("generate", "status", "list")
+
+
+class MusicGenerate(Tool):
+    """OpenClaw's `music_generate`: one tool, three actions - start a track,
+    look at one, list them."""
+
+    name = "music_generate"
     untrusted = True
     """When every vendor passes, the result names each one's refusal, and a
-    refusal can carry a backend's words."""
+    refusal can carry a backend's words; why a job failed is a vendor's error
+    code, and the lyrics are its words."""
+
+    MAX_WAIT = 900
 
     def __init__(self, runner: Musicgen) -> None:
         self.runner = runner
@@ -825,17 +897,19 @@ class GenerateMusic(Tool):
     @property
     def description(self) -> str:  # type: ignore[override]
         return (
-            "Start making a piece of music - a song, an instrumental, a jingle or a "
-            "soundtrack - saved in the workspace when it is ready. It returns at once with a "
-            "job id; the track takes up to a couple of minutes, and you are told on a later "
-            "turn when it is saved, so tell the person it is on its way and carry on - do not "
-            "call music_status in a loop. Describe the music in the prompt: genre, mood, "
-            "tempo, instruments, the voice that sings. Give `lyrics` only when the person "
-            "wrote them or asked you to; leave them out and the vendor writes its own. "
-            "`images` are workspace pictures that set the mood. Each call is one track and "
-            "costs money: do not make variations nobody asked for. The same request while "
-            "its track is being made, or within two minutes of it being saved, starts "
-            "nothing and answers with that job."
+            "Make a piece of music - a song, an instrumental, a jingle or a soundtrack - saved "
+            "in the workspace. `action: generate` (the default) starts it and returns at once "
+            "with a job id; the track takes up to a couple of minutes and you are told when it "
+            "is saved, so tell the person it is on its way and carry on - do not check on it in "
+            "a loop. Describe the music in the prompt: genre, mood, tempo, instruments, the "
+            "voice that sings. Give `lyrics` only when the person wrote them or asked you to; "
+            "leave them out and the vendor writes its own. `images` are workspace pictures "
+            "that set the mood. Each track costs money: do not make variations nobody asked "
+            "for. The same request while its track is being made, or within two minutes of it "
+            "being saved, starts nothing and answers with that job. `action: status` with a "
+            "`job` shows one - why it failed, the lyrics the vendor sang - and `wait` waits up "
+            "to that many seconds for it, only when the person is waiting on it. "
+            "`action: list` lists this session's jobs."
         )
 
     @property
@@ -843,7 +917,15 @@ class GenerateMusic(Tool):
         return {
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "What the music should be."},
+                "action": {
+                    "type": "string",
+                    "enum": list(ACTIONS),
+                    "description": "generate (the default), status or list.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "What the music should be. Needed to generate.",
+                },
                 "lyrics": {
                     "type": "string",
                     "description": "Words to sing. Leave it out for the vendor's own.",
@@ -869,15 +951,32 @@ class GenerateMusic(Tool):
                     "description": "Where to save it, relative to the workspace. Leave it out "
                     "for a new file. Never an existing file.",
                 },
+                "job": {"type": "string", "description": "A job id, mg-... For status."},
+                "wait": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": self.MAX_WAIT,
+                    "description": "Seconds to wait for the job to finish. For status.",
+                },
             },
-            "required": ["prompt"],
         }
 
     def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_arguments(self.parameters, arguments, tool=self.name)
+        action = str(checked.get("action", "") or "generate").strip().lower()
+        if action not in ACTIONS:
+            raise ToolError(f"action must be one of: {', '.join(ACTIONS)}")
+        if action == "list":
+            return {"action": action}
+        if action == "status":
+            job = str(checked.get("job", "") or "").strip()
+            if not job:
+                raise ToolError("status needs a job; list shows them all")
+            wait = int(checked.get("wait") or 0)
+            return {"action": action, "job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
         prompt = str(checked.get("prompt", "") or "").strip()
         if not prompt:
-            raise ToolError("generate_music needs a prompt")
+            raise ToolError("generate needs a prompt")
         lyrics = str(checked.get("lyrics", "") or "").strip()
         if len(lyrics) > MAX_LYRICS:
             raise ToolError(f"lyrics are over {MAX_LYRICS} characters")
@@ -896,6 +995,7 @@ class GenerateMusic(Tool):
             if named:
                 inside(self.workspace, named)
         return {
+            "action": action,
             "prompt": prompt,
             "lyrics": lyrics,
             "instrumental": instrumental,
@@ -906,17 +1006,37 @@ class GenerateMusic(Tool):
 
     async def run(  # type: ignore[override]
         self,
-        prompt: str,
+        action: str = "generate",
+        prompt: str = "",
         lyrics: str = "",
         instrumental: bool = False,
         seconds: int = 0,
         images: list[str] | None = None,
         path: str = "",
+        job: str = "",
+        wait: int = 0,
+    ) -> ToolResult:
+        self.runner.sweep()
+        if action == "list":
+            return self._list()
+        if action == "status":
+            return await self._status(job, wait)
+        return self._generate(prompt, lyrics, instrumental, seconds, images or [], path)
+
+    # -- generate ----------------------------------------------------------------
+
+    def _generate(
+        self,
+        prompt: str,
+        lyrics: str,
+        instrumental: bool,
+        seconds: int,
+        images: list[str],
+        path: str,
     ) -> ToolResult:
         runner = self.runner
-        runner.sweep()
         try:
-            pictures = tuple(self._picture(named) for named in images or ())
+            pictures = tuple(self._picture(named) for named in images)
         except ToolError as exc:
             return ToolResult.error(str(exc))
         request = Request(prompt, lyrics, instrumental, seconds, pictures, runner.timeout())
@@ -941,7 +1061,7 @@ class GenerateMusic(Tool):
             return ToolResult.error(f"no music started: {failure}")
         assert_active()  # the last moment before money is spent
         first = able[0]
-        job = Job(
+        made = Job(
             id=f"mg-{uuid.uuid4().hex[:6]}",
             vendor=first.name,
             model=first.model,
@@ -951,16 +1071,16 @@ class GenerateMusic(Tool):
             created=time.time(),
         )
         try:
-            runner.file.save(job)
+            runner.file.save(made)
         except OSError as exc:
             # Made anyway: it only will not be listed in a later session.
             passed.append(f"not kept for a later session: {type(exc).__name__}")
-        runner.asked[job.id] = fingerprint
-        runner.start(job, able, request)
+        runner.asked[made.id] = fingerprint
+        runner.start(made, able, request)
         line = (
-            f"Started music {job.id} with {first.made_by()}; it will be saved to {target} "
-            "when it is ready, usually within a couple of minutes. You will be told on a "
-            "later turn; music_status checks on it or waits for it."
+            f"Started music {made.id} with {first.made_by()}; it will be saved to {target} "
+            "when it is ready, usually within a couple of minutes, and you will be told then. "
+            f"music_generate status {made.id} checks on it or waits for it."
         )
         if len(able) > 1:
             line += f" If {first.name} fails, {', '.join(v.name for v in able[1:])} is next."
@@ -1007,59 +1127,19 @@ class GenerateMusic(Tool):
             n += 1
         return target.relative_to(self.workspace).as_posix()
 
+    # -- status and list ---------------------------------------------------------
 
-class MusicStatus(Tool):
-    name = "music_status"
-    untrusted = True
-    """Why a job failed is a vendor's error code, and the lyrics are its words."""
-
-    MAX_WAIT = 900
-
-    def __init__(self, runner: Musicgen) -> None:
-        self.runner = runner
-
-    @property
-    def description(self) -> str:  # type: ignore[override]
-        return (
-            "This session's music jobs from generate_music: running, saved, or failed and "
-            "why. Name a `job` to see one, with the lyrics the vendor sang when it said them; "
-            "give `wait` to wait up to that many seconds for it to finish - only when the "
-            "person is waiting on it, since you are told when a job finishes anyway."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:  # type: ignore[override]
-        return {
-            "type": "object",
-            "properties": {
-                "job": {"type": "string", "description": "A job id, mg-..."},
-                "wait": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": self.MAX_WAIT,
-                    "description": "Seconds to wait for the job to finish. Needs `job`.",
-                },
-            },
-        }
-
-    def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        checked = validate_arguments(self.parameters, arguments, tool=self.name)
-        job = str(checked.get("job", "") or "").strip()
-        wait = int(checked.get("wait") or 0)
-        if wait and not job:
-            raise ToolError("wait needs a job to wait for")
-        return {"job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
-
-    async def run(self, job: str = "", wait: int = 0) -> ToolResult:  # type: ignore[override]
+    def _list(self) -> ToolResult:
         runner = self.runner
-        runner.sweep()
-        if not job:
-            jobs = runner.mine()[-10:]
-            if not jobs:
-                return ToolResult.ok("No music jobs in this session.")
-            for each in jobs:
-                runner.told(each)
-            return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
+        jobs = runner.mine()[-10:]
+        if not jobs:
+            return ToolResult.ok("No music jobs in this session.")
+        for each in jobs:
+            runner.told(each)
+        return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
+
+    async def _status(self, job: str, wait: int) -> ToolResult:
+        runner = self.runner
         found = {each.id: each for each in runner.mine()}.get(job)
         if found is None:
             return ToolResult.error(f"no music job {job} in this session")
@@ -1124,9 +1204,8 @@ class MusicgenPlugin(Plugin):
 
     def register(self, ctx: PluginContext) -> None:
         runner = Musicgen(ctx)
-        ctx.register_tool(GenerateMusic(runner))
-        ctx.register_tool(MusicStatus(runner))
+        ctx.register_tool(MusicGenerate(runner))
         # A session with no hook registry still makes music; it is told by
-        # `music_status` rather than on its next turn.
+        # `music_generate status` rather than on its next turn.
         if ctx.accepts_hooks:
             ctx.register_hook(Notifier(runner))

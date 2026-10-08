@@ -16,10 +16,11 @@ videogen exists; its key comes from `ctx.credential`, and a backend reads its
 own with its own plugin's. Whichever it is, `Vendor` is how this module sees
 it, so a backend's object is touched in one place.
 
-A video takes minutes, so nothing waits for one. `generate_video` submits and
+A video takes minutes, so nothing waits for one. `video_generate` submits and
 returns a job id; a task the plugin owns follows the job, downloads the video
-and writes it into the workspace; a `before_prompt` hook tells the model on the
-session's next turn. The job belongs to the session, not to the call that
+and writes it into the workspace; the agent is woken to tell the person
+(`ctx.wake`, SDK 1.40), and where that cannot happen a `before_prompt` hook
+tells the model on the session's next turn. The job belongs to the session, not to the call that
 started it - like a backgrounded `exec` - so the task runs in a context of its
 own, where an abort of the turn that submitted it cannot reach. Jobs are kept in
 `.ultron/videogen/jobs.json` so the next session picks up one this session did
@@ -569,6 +570,10 @@ class Videogen:
         self.vendors: Callable[[], Iterator[Vendor]] = self._vendors
         self.interval = self._clamped("poll_seconds", 10.0, 2.0, 120.0)
         self.resumed = False
+        self.waking: asyncio.Task[None] | None = None
+        """The wake on its way, if one is (`announce`)."""
+        self.closed = False
+        """The session has ended: nothing more is woken."""
 
     # -- settings --------------------------------------------------------------
 
@@ -668,9 +673,12 @@ class Videogen:
             self.start(job, vendor)
 
     def close(self) -> None:
+        self.closed = True
         for task in self.tasks.values():
             task.cancel()
         self.tasks.clear()
+        if self.waking is not None:
+            self.waking.cancel()
 
     async def _follow(self, job: Job, vendor: Vendor) -> None:
         began = time.monotonic()
@@ -791,13 +799,65 @@ class Videogen:
             duration_ms=max(0.0, job.finished - job.created) * 1000,
         )
         self.ended.setdefault(job.id, asyncio.Event()).set()
+        self.announce()
 
     # -- telling ---------------------------------------------------------------
+
+    def wakes(self) -> bool:
+        """Whether a finished job wakes the agent: `announce: wake` (the
+        default) on an Ultron that has `ctx.wake` (SDK 1.40). Whether this
+        session has anybody to wake is the core's answer, at the wake."""
+        announce = str(self.ctx.setting("announce", "wake") or "wake").strip().lower()
+        return announce == "wake" and hasattr(self.ctx, "wake") and not self.closed
+
+    def announce(self) -> None:
+        """Wake the agent about what finished, unless a wake is already on its
+        way - that one says everything finished by the time it is sent."""
+        if not self.wakes() or (self.waking is not None and not self.waking.done()):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self.waking = loop.create_task(self._wake(), context=contextvars.Context())
+
+    async def _wake(self) -> None:
+        """OpenClaw's completion event: a turn of the session's own that says
+        which jobs finished, so the agent tells the person without waiting for
+        them to speak. The jobs are marked told *before* the wake, so the woken
+        turn's own `before_prompt` does not say them a second time; a wake that
+        did not run - a busy lane, nobody there, the operator's no - unmarks
+        them, and the next turn is told instead."""
+        while True:
+            jobs = [job for job in self.mine() if job.state != "running" and not job.notified]
+            if not jobs:
+                return
+            for job in jobs:
+                job.notified = True
+                with contextlib.suppress(OSError):
+                    self.file.save(job)
+            lines = [_notice(job) for job in jobs]
+            lines.append("Tell the person, briefly, and say where to find it.")
+            woke = False
+            try:
+                woke = bool(await self.ctx.wake("\n".join(lines)))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # an Ultron that refuses the wake still tells the next turn
+                woke = False
+            finally:
+                if not woke:
+                    for job in jobs:
+                        job.notified = False
+                        with contextlib.suppress(OSError):
+                            self.file.save(job)
+            if not woke:
+                return
 
     def notices(self) -> str:
         """One line per job finished since the model was last told. Facts this
         plugin worked out - a path, a size, a vendor's name - and never a word
-        a vendor wrote; why one failed is behind `video_status`."""
+        a vendor wrote; why one failed is behind `video_generate status`."""
         lines = []
         for job in self.mine():
             if job.state == "running" or job.notified:
@@ -809,7 +869,7 @@ class Videogen:
         return "\n".join(lines)
 
     def told(self, job: Job) -> None:
-        """`video_status` said how it ended, so no notice says it again."""
+        """`video_generate status` said how it ended, so no notice says it again."""
         if job.state != "running" and not job.notified:
             job.notified = True
             with contextlib.suppress(OSError):
@@ -822,7 +882,9 @@ def _notice(job: Job) -> str:
             f"Note: video {job.id} is ready - saved to {job.saved} "
             f"({job.made_by()}, {job.media_type}, {_human(job.bytes)})."
         )
-    return f"Note: video {job.id} from {job.vendor} failed; video_status {job.id} says why."
+    return (
+        f"Note: video {job.id} from {job.vendor} failed; video_generate status {job.id} says why."
+    )
 
 
 def _said(exc: BaseException) -> str:
@@ -849,11 +911,19 @@ def _age(seconds: float) -> str:
 # -- the tools -------------------------------------------------------------------
 
 
-class GenerateVideo(Tool):
-    name = "generate_video"
+ACTIONS = ("generate", "status", "list")
+
+
+class VideoGenerate(Tool):
+    """OpenClaw's `video_generate`: one tool, three actions - start a video,
+    look at one, list them."""
+
+    name = "video_generate"
     untrusted = True
     """When every vendor passes, the result names each one's refusal, and a
-    refusal carries a vendor's error code."""
+    refusal carries a vendor's error code; why a job failed is one too."""
+
+    MAX_WAIT = 600
 
     def __init__(self, runner: Videogen) -> None:
         self.runner = runner
@@ -862,15 +932,18 @@ class GenerateVideo(Tool):
     @property
     def description(self) -> str:  # type: ignore[override]
         return (
-            "Start making a video, saved in the workspace when it is ready. Use it when the "
-            "person asks for a video, a clip or an animation. It returns at once with a job "
-            "id; the video takes one to several minutes, and you are told on a later turn "
-            "when it is saved, so tell the person it is on its way and carry on - do not "
-            "call video_status in a loop. Describe the shot in the prompt: subject, action, "
-            "camera, style, and any sound or speech. To animate a picture, name a workspace "
-            "image as `first_frame`; `last_frame` is where the video should end. Not every "
-            "vendor takes every length, shape or frame; one that cannot is passed over. "
-            "Each call is one video and costs money: do not make variations nobody asked for."
+            "Make a video, saved in the workspace. Use it when the person asks for a video, a "
+            "clip or an animation. `action: generate` (the default) starts it and returns at "
+            "once with a job id; the video takes one to several minutes and you are told when "
+            "it is saved, so tell the person it is on its way and carry on - do not check on it "
+            "in a loop. Describe the shot in the prompt: subject, action, camera, style, and "
+            "any sound or speech. To animate a picture, name a workspace image as "
+            "`first_frame`; `last_frame` is where the video should end. Not every vendor takes "
+            "every length, shape or frame; one that cannot is passed over. Each call is one "
+            "video and costs money: do not make variations nobody asked for. `action: status` "
+            "with a `job` shows one - running, saved, or failed and why - and `wait` waits up to "
+            "that many seconds for it, only when the person is waiting on it. `action: list` "
+            "lists this session's jobs."
         )
 
     @property
@@ -878,7 +951,15 @@ class GenerateVideo(Tool):
         return {
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "What happens in the video."},
+                "action": {
+                    "type": "string",
+                    "enum": list(ACTIONS),
+                    "description": "generate (the default), status or list.",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "What happens in the video. Needed to generate.",
+                },
                 "first_frame": {
                     "type": "string",
                     "description": "A workspace PNG, JPEG or WebP the video starts from.",
@@ -909,15 +990,32 @@ class GenerateVideo(Tool):
                     "description": "Where to save it, relative to the workspace. Leave it out "
                     "for a new file. Never an existing file.",
                 },
+                "job": {"type": "string", "description": "A job id, vg-... For status."},
+                "wait": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": self.MAX_WAIT,
+                    "description": "Seconds to wait for the job to finish. For status.",
+                },
             },
-            "required": ["prompt"],
         }
 
     def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
         checked = validate_arguments(self.parameters, arguments, tool=self.name)
+        action = str(checked.get("action", "") or "generate").strip().lower()
+        if action not in ACTIONS:
+            raise ToolError(f"action must be one of: {', '.join(ACTIONS)}")
+        if action == "list":
+            return {"action": action}
+        if action == "status":
+            job = str(checked.get("job", "") or "").strip()
+            if not job:
+                raise ToolError("status needs a job; list shows them all")
+            wait = int(checked.get("wait") or 0)
+            return {"action": action, "job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
         prompt = str(checked.get("prompt", "") or "").strip()
         if not prompt:
-            raise ToolError("generate_video needs a prompt")
+            raise ToolError("generate needs a prompt")
         first = str(checked.get("first_frame", "") or "").strip()
         last = str(checked.get("last_frame", "") or "").strip()
         seconds = int(checked.get("seconds") or 0)
@@ -934,6 +1032,7 @@ class GenerateVideo(Tool):
             if named:
                 inside(self.workspace, named)
         return {
+            "action": action,
             "prompt": prompt,
             "first_frame": first,
             "last_frame": last,
@@ -945,16 +1044,39 @@ class GenerateVideo(Tool):
 
     async def run(  # type: ignore[override]
         self,
-        prompt: str,
+        action: str = "generate",
+        prompt: str = "",
         first_frame: str = "",
         last_frame: str = "",
         seconds: int = 0,
         aspect: str = "",
         resolution: str = "",
         path: str = "",
+        job: str = "",
+        wait: int = 0,
+    ) -> ToolResult:
+        self.runner.resume()
+        if action == "list":
+            return self._list()
+        if action == "status":
+            return await self._status(job, wait)
+        return await self._generate(
+            prompt, first_frame, last_frame, seconds, aspect, resolution, path
+        )
+
+    # -- generate ----------------------------------------------------------------
+
+    async def _generate(
+        self,
+        prompt: str,
+        first_frame: str,
+        last_frame: str,
+        seconds: int,
+        aspect: str,
+        resolution: str,
+        path: str,
     ) -> ToolResult:
         runner = self.runner
-        runner.resume()
         try:
             first = self._frame(first_frame) if first_frame else None
             last = self._frame(last_frame) if last_frame else None
@@ -1025,8 +1147,8 @@ class GenerateVideo(Tool):
         runner.start(job, vendor)
         line = (
             f"Started video {job.id} with {job.made_by()}; it will be saved to {target} "
-            "when it is ready, usually in one to several minutes. You will be told on a "
-            "later turn; video_status checks on it or waits for it."
+            "when it is ready, usually in one to several minutes, and you will be told then. "
+            f"video_generate status {job.id} checks on it or waits for it."
         )
         if passed:
             line += f" Passed over {'; '.join(passed)}."
@@ -1072,6 +1194,30 @@ class GenerateVideo(Tool):
             n += 1
         return target.relative_to(self.workspace).as_posix()
 
+    # -- status and list ---------------------------------------------------------
+
+    def _list(self) -> ToolResult:
+        runner = self.runner
+        jobs = runner.mine()[-10:]
+        if not jobs:
+            return ToolResult.ok("No video jobs in this session.")
+        for each in jobs:
+            runner.told(each)
+        return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
+
+    async def _status(self, job: str, wait: int) -> ToolResult:
+        runner = self.runner
+        found = {each.id: each for each in runner.mine()}.get(job)
+        if found is None:
+            return ToolResult.error(f"no video job {job} in this session")
+        if wait and found.state == "running" and job in runner.tasks:
+            ended = runner.ended.setdefault(job, asyncio.Event())
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(ended.wait()), timeout=wait)
+            found = {each.id: each for each in runner.mine()}.get(job, found)
+        runner.told(found)
+        return ToolResult.ok(_line(found))
+
 
 def _submission(vendor: Vendor, request: Request) -> dict[str, Any]:
     """What a submission record says. Never the prompt: it is the tool call's
@@ -1085,70 +1231,6 @@ def _submission(vendor: Vendor, request: Request) -> dict[str, Any]:
         if getattr(request, key):
             arguments[key] = getattr(request, key)
     return arguments
-
-
-class VideoStatus(Tool):
-    name = "video_status"
-    untrusted = True
-    """Why a job failed is a vendor's error code."""
-
-    MAX_WAIT = 600
-
-    def __init__(self, runner: Videogen) -> None:
-        self.runner = runner
-
-    @property
-    def description(self) -> str:  # type: ignore[override]
-        return (
-            "This session's video jobs from generate_video: running, saved, or failed and "
-            "why. Name a `job` to see one; give `wait` to wait up to that many seconds for "
-            "it to finish - only when the person is waiting on it, since you are told when a "
-            "job finishes anyway."
-        )
-
-    @property
-    def parameters(self) -> dict[str, Any]:  # type: ignore[override]
-        return {
-            "type": "object",
-            "properties": {
-                "job": {"type": "string", "description": "A job id, vg-..."},
-                "wait": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": self.MAX_WAIT,
-                    "description": "Seconds to wait for the job to finish. Needs `job`.",
-                },
-            },
-        }
-
-    def validate(self, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        checked = validate_arguments(self.parameters, arguments, tool=self.name)
-        job = str(checked.get("job", "") or "").strip()
-        wait = int(checked.get("wait") or 0)
-        if wait and not job:
-            raise ToolError("wait needs a job to wait for")
-        return {"job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
-
-    async def run(self, job: str = "", wait: int = 0) -> ToolResult:  # type: ignore[override]
-        runner = self.runner
-        runner.resume()
-        if not job:
-            jobs = runner.mine()[-10:]
-            if not jobs:
-                return ToolResult.ok("No video jobs in this session.")
-            for each in jobs:
-                runner.told(each)
-            return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
-        found = {each.id: each for each in runner.mine()}.get(job)
-        if found is None:
-            return ToolResult.error(f"no video job {job} in this session")
-        if wait and found.state == "running" and job in runner.tasks:
-            ended = runner.ended.setdefault(job, asyncio.Event())
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(asyncio.shield(ended.wait()), timeout=wait)
-            found = {each.id: each for each in runner.mine()}.get(job, found)
-        runner.told(found)
-        return ToolResult.ok(_line(found))
 
 
 def _line(job: Job) -> str:
@@ -1199,10 +1281,9 @@ class VideogenPlugin(Plugin):
 
     def register(self, ctx: PluginContext) -> None:
         runner = Videogen(ctx)
-        ctx.register_tool(GenerateVideo(runner))
-        ctx.register_tool(VideoStatus(runner))
+        ctx.register_tool(VideoGenerate(runner))
         # A session with no hook registry still makes videos; it is told by
-        # `video_status` rather than on its next turn, and picks up an earlier
+        # `video_generate status` rather than on its next turn, and picks up an earlier
         # session's jobs the first time a tool is called.
         if ctx.accepts_hooks:
             ctx.register_hook(Notifier(runner))

@@ -2,12 +2,17 @@
 name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
-version: "1.0.0"
+version: "2.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
+wakes: true
 contracts:
-  tools: [generate_music, music_status]
+  tools: [music_generate]
 config_schema:
+  announce:
+    type: str
+    default: wake
+    description: "How a finished job is told: wake (the agent is woken to tell the person, SDK 1.40) or notice (a line on the next turn)."
   provider:
     type: str
     default: ""
@@ -28,15 +33,18 @@ config_schema:
 
 # musicgen
 
-Two tools. `generate_music` hands a prompt, and optionally lyrics, a length and pictures
-from the workspace to set the mood, to a music vendor and returns at once with a job id.
-The track is made in the background and saved in the workspace when it is ready, usually in
-under two minutes. `music_status` lists this session's jobs, or checks one and can wait for
-it.
+One tool, OpenClaw's `music_generate`, with three actions. `generate` (the default) hands a
+prompt, and optionally lyrics, a length and pictures from the workspace to set the mood, to a
+music vendor and returns at once with a job id. The track is made in the background and saved
+in the workspace when it is ready, usually in under two minutes, and the agent is woken to
+tell you. `status` checks one job and can wait for it; `list` lists this session's jobs.
 
 ```
 /plugins install musicgen
 ```
+
+**From 1.x:** `generate_music` and `music_status` are now `music_generate` with
+`action: generate`, `action: status` and `action: list`.
 
 ## Keys
 
@@ -108,7 +116,7 @@ that.
 
 ## How a job runs
 
-1. **Start.** `generate_music` checks the pictures and the path, finds the vendors that can
+1. **Start.** `music_generate` checks the pictures and the path, finds the vendors that can
    make it, and returns the job id (`mg-1a2b3c`), the first vendor it will ask, and the file
    the track will be written to.
 2. **Make.** The call to the vendor runs in a task of the session's, never of the turn's - a
@@ -116,33 +124,41 @@ that.
 3. **Save.** The track is written to `music/<time>-<prompt>.mp3`, or the `path` the model
    named, with the extension of what actually came back (MP3, WAV, FLAC, Ogg or M4A) - never
    over an existing file.
-4. **Tell.** On the session's next turn the model is given one line: which job finished,
-   where it is, who made it, how big it is. The line carries what the plugin worked out and
-   never a word a vendor wrote; why a job failed, and the lyrics the vendor sang, are behind
-   `music_status`, whose result arrives inside an untrusted envelope. A notice never starts a
-   turn by itself.
+4. **Tell.** The agent is woken - OpenClaw's completion event, `ctx.wake` (SDK 1.40) - with
+   one line per finished job: which job, where it is, who made it, how big it is. It runs as a
+   turn of the session's own after whatever is running, never inside a person's turn, and its
+   reply goes where the session's replies go: a song asked for in a Telegram DM is announced in
+   that DM. Several jobs that finish together are one wake. Where the agent cannot be woken -
+   `announce: notice`, an Ultron before 1.40, a `cron` or group session, a lane busy past the
+   core's wait, `plugins_no_wake` - the same line rides the session's next turn instead. The
+   line carries what the plugin worked out and never a word a vendor wrote; why a job failed,
+   and the lyrics the vendor sang, are behind `music_generate status`, whose result arrives
+   inside an untrusted envelope.
 
 **The same request twice** starts nothing, as OpenClaw's music tool does: while a job in
 this session is being made from the same prompt, lyrics, length, instrumental switch and
-pictures, or for two minutes after it was saved, `generate_music` answers with that job
+pictures, or for two minutes after it was saved, `music_generate` answers with that job
 instead. Where it is to be saved does not count - the same music to another file is still the
 same music paid for twice. A job that failed does not count either, so asking again after a
 failure is a retry. A different request is a new job, however many are running. The match is
 a hash of the request, held in memory for the session and never written down.
 
-Jobs are kept in `<workspace>/.ultron/musicgen/jobs.json`, so `music_status` still lists them
-in a later session. Lyrics are not: they are a vendor's words, and a file in the workspace is
-one `read_file` would hand the model without its envelope, so they are held in memory for the
-session that made the track and are gone with it. Every vendor here answers in one long
-request, so there is nothing to pick back up: a session that ends while a track is being made
-stops it, and the job says so - the vendor may still have billed it.
+Jobs are kept in `<workspace>/.ultron/musicgen/jobs.json`, so `music_generate list` still
+lists them in a later session. Lyrics are not: they are a vendor's words, and a file in the
+workspace is one `read_file` would hand the model without its envelope, so they are held in
+memory for the session that made the track and are gone with it. Every vendor here answers in
+one long request, so there is nothing to pick back up: a session that ends while a track is
+being made stops it, and the job says so - the vendor may still have billed it.
 
 Each attempt at a vendor is a `plugin` record with `event: generate` - vendor, model, how many
 pictures went, and the hash and size of what came back or why it did not - and each ending is
-`event: music`. The prompt and the lyrics are only in the tool call's own record.
+`event: music`. Each wake is the core's own `event: wake` record. The prompt and the lyrics
+are only in the tool call's own record.
 
 Every track is a paid request, and every picture handed in is sent to that vendor with the
-prompt.
+prompt. So is every wake: one model turn the person did not type. That is why the manifest
+says `wakes: true` - `/plugins` shows `may start turns` before you install it - and why
+`announce: notice`, or `plugins_no_wake: [musicgen]` in `config.json`, turns it off.
 
 ## Not built
 

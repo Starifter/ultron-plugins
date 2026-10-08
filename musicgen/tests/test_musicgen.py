@@ -121,10 +121,33 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
     return found
 
 
+class Action:
+    """One action of `music_generate`, called the way the model calls it. A
+    `status` with no job is a `list`, as the old `music_status` was."""
+
+    def __init__(self, tool: Any, action: str) -> None:
+        self.tool = tool
+        self.action = action
+        self.untrusted = tool.untrusted
+
+    def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        action = self.action
+        if action == "status" and "job" not in arguments and "wait" not in arguments:
+            action = "list"
+        return dict(self.tool.validate({"action": action, **arguments}))
+
+    async def run(self, **arguments: Any) -> Any:
+        return await self.tool.run(**arguments)
+
+    @property
+    def runner(self) -> Any:
+        return self.tool.runner
+
+
 class Installed:
     def __init__(self, tools: ToolRegistry, auditor: MemoryAuditor, workspace: Path) -> None:
-        self.generate = tools.get("generate_music")
-        self.status = tools.get("music_status")
+        self.generate = Action(tools.get("music_generate"), "generate")
+        self.status = Action(tools.get("music_generate"), "status")
         self.runner = self.generate.runner
         self.auditor = auditor
         self.workspace = workspace
@@ -154,6 +177,7 @@ def install(
     settings: dict[str, Any] | None = None,
     hooks: HookRegistry | None = None,
     session_key: str = "main",
+    waker: Any = None,
 ) -> Installed:
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
@@ -171,9 +195,33 @@ def install(
         auditor=auditor,
         session_key=session_key,
         credentials=lambda vendor: keys.get(vendor, {}),
+        waker=waker,
     )
     assert provision.ok, provision.error
     return Installed(tools, auditor, workspace)
+
+
+class Waker:
+    """What the core's `PluginWaker` is to the plugin: a plugin name and a text
+    in, whether the turn ran out. `hold` keeps a wake waiting."""
+
+    def __init__(self, answer: bool = True) -> None:
+        self.answer = answer
+        self.texts: list[tuple[str, str]] = []
+        self.hold: asyncio.Event | None = None
+
+    async def __call__(self, plugin: str, text: str) -> bool:
+        self.texts.append((plugin, text))
+        if self.hold is not None:
+            await self.hold.wait()
+        return self.answer
+
+
+async def woken(it: Installed) -> None:
+    """The jobs, then the wake that follows them."""
+    await it.settle()
+    while it.runner.waking is not None and not it.runner.waking.done():
+        await it.runner.waking
 
 
 def session(
@@ -226,7 +274,7 @@ def job_id(result: Any) -> str:
 
 def test_the_manifest_declares_both_tools_and_only_its_own_vendor() -> None:
     assert not MANIFEST.warnings, MANIFEST.warnings
-    assert MANIFEST.tools == ("generate_music", "music_status")
+    assert MANIFEST.tools == ("music_generate",)
     assert MANIFEST.vendor_credentials == ("google",)
 
 
@@ -299,7 +347,8 @@ async def test_the_track_is_saved_audited_and_told_once_and_the_lyrics_held(
     notice = it.runner.notices()
     assert notice == (
         f"Note: music {job} is ready - saved to music/{saved.name} "
-        f"(google (lyria-3.5), audio/mpeg, {len(MP3)} B). music_status {job} has the lyrics."
+        f"(google (lyria-3.5), audio/mpeg, {len(MP3)} B). "
+        f"music_generate status {job} has the lyrics."
     )
     assert "sun on the water" not in notice
     assert it.runner.notices() == "", "told once"
@@ -344,7 +393,7 @@ async def test_the_job_runs_outside_the_starting_calls_authority(
 
     it.runner._google = build
     stop = asyncio.Event()
-    with granted(CallAuthority("generate_music", "c1", stop)):
+    with granted(CallAuthority("music_generate", "c1", stop)):
         await call(it.generate, prompt="waves")
         stop.set()
     await it.settle()
@@ -489,8 +538,8 @@ async def test_every_vendor_failing_is_one_failure_without_the_vendors_words(
     )
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
-    assert (
-        it.runner.notices() == f"Note: music {job} from google failed; music_status {job} says why."
+    assert it.runner.notices() == (
+        f"Note: music {job} from google failed; music_generate status {job} says why."
     )
     status = await call(it.status, job=job)
     assert "failed at google (lyria-3.5)" in status.content
@@ -643,6 +692,76 @@ async def test_music_status_lists_running_jobs_newest_first(tmp_path: Path, wire
     await asyncio.sleep(0)
 
 
+# -- waking (ctx.wake, SDK 1.40) --------------------------------------------------
+
+
+async def test_a_finished_track_wakes_the_agent_with_facts_only(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    job = job_id(await call(it.generate, prompt="waves"))
+    await woken(it)
+    [(plugin, text)] = waker.texts
+    assert plugin == "musicgen"
+    assert text.startswith(f"Note: music {job} is ready - saved to music/")
+    assert "music_generate status" in text and "sun on the water" not in text
+    assert text.endswith("Tell the person, briefly, and say where to find it.")
+    assert it.runner.notices() == "", "the woken turn is not told again"
+
+
+async def test_a_wake_that_did_not_run_leaves_it_for_the_next_turn(
+    tmp_path: Path, wire: Wire
+) -> None:
+    waker = Waker(answer=False)
+    it = install(tmp_path, waker=waker)
+    job = job_id(await call(it.generate, prompt="waves"))
+    await woken(it)
+    assert len(waker.texts) == 1
+    assert f"music {job} is ready" in it.runner.notices()
+
+
+async def test_announce_notice_never_wakes(tmp_path: Path, wire: Wire) -> None:
+    waker = Waker()
+    it = install(tmp_path, waker=waker, settings={"announce": "notice"})
+    job = job_id(await call(it.generate, prompt="waves"))
+    await woken(it)
+    assert waker.texts == []
+    assert f"music {job} is ready" in it.runner.notices()
+
+
+async def test_tracks_that_finish_while_a_wake_waits_are_the_next_wake(
+    tmp_path: Path, wire: Wire
+) -> None:
+    waker = Waker()
+    waker.hold = asyncio.Event()
+    it = install(tmp_path, waker=waker)
+    one = job_id(await call(it.generate, prompt="one"))
+    await it.settle()
+    await asyncio.sleep(0)
+    two = job_id(await call(it.generate, prompt="two"))
+    three = job_id(await call(it.generate, prompt="three"))
+    await it.settle()
+    assert [one in text for _, text in waker.texts] == [True], "one wake in flight"
+    waker.hold.set()
+    await woken(it)
+    assert len(waker.texts) == 2
+    later = waker.texts[1][1]
+    assert two in later and three in later and one not in later
+
+
+async def test_the_session_ending_wakes_nobody(tmp_path: Path, wire: Wire) -> None:
+    backend(tmp_path / "plugins", generate="await asyncio.Event().wait()")
+    it = session(tmp_path, "acme", settings={"provider": "acme"})
+    waker = Waker()
+    it.runner.ctx._waker = waker
+    it.runner.ctx._wakes = True
+    await call(it.generate, prompt="x")
+    await asyncio.sleep(0)
+    it.runner.close()
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert waker.texts == []
+
+
 # -- the same request twice -----------------------------------------------------
 
 
@@ -731,7 +850,7 @@ async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire:
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    with pytest.raises(ToolError, match="wait needs a job"):
+    with pytest.raises(ToolError, match="status needs a job"):
         it.status.validate({"wait": 5})
     assert not wire.sent and not it.runner.mine()
 
