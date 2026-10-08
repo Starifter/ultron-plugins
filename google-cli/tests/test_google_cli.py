@@ -18,7 +18,9 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load() -> Any:
-    spec = importlib.util.spec_from_file_location("ultron_plugin_gog", HERE.parent / "plugin.py")
+    spec = importlib.util.spec_from_file_location(
+        "ultron_plugin_google_cli", HERE.parent / "plugin.py"
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -211,7 +213,7 @@ def test_register_reads_the_settings(tmp_path: Path) -> None:
         setting=lambda key, default=None: settings.get(key, default),
         register_tool=tools.append,
     )
-    plugin.GogPlugin().register(ctx)  # type: ignore[arg-type]
+    plugin.GoogleCliPlugin().register(ctx)  # type: ignore[arg-type]
     (tool,) = tools
     assert tool.account == "me@example.com"
     assert tool.readonly is True

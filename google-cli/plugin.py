@@ -1,4 +1,4 @@
-"""gog: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and the rest - through `gog`.
+"""google-cli: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and the rest - through `gog`.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings one
 tool, `gog`, that runs the `gog` command-line client (github.com/openclaw/gogcli)
@@ -96,7 +96,7 @@ INSTALL_HINT = (
     "gog is not installed, or not where the plugin looks. Install it from "
     "https://github.com/openclaw/gogcli (Windows: the release ZIP; macOS/Linux: "
     "`brew install openclaw/tap/gogcli`), put it on PATH or set "
-    "plugins_settings.gog.executable, then start a new session. Tell the person; "
+    "plugins_settings.google-cli.executable, then start a new session. Tell the person; "
     "installing it is theirs to do."
 )
 AUTH_HINT = (
@@ -240,7 +240,7 @@ class Gog(Tool):
             return ToolResult.error(refused)
         if write and self.readonly:
             return ToolResult.error(
-                "gog is set read-only (plugins_settings.gog.readonly): nothing that changes "
+                "gog is set read-only (plugins_settings.google-cli.readonly): nothing that changes "
                 "the account runs from here. Tell the person what you would have done."
             )
         program = shutil.which(self.executable)
@@ -309,8 +309,8 @@ class Gog(Tool):
         return ToolResult(content="\n".join(lines), is_error=failed, wrapped=True)
 
 
-class GogPlugin(Plugin):
-    name = "gog"
+class GoogleCliPlugin(Plugin):
+    name = "google-cli"
     description = "Google Workspace through the gog CLI."
 
     def register(self, ctx: PluginContext) -> None:

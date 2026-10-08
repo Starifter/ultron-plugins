@@ -1,5 +1,5 @@
 ---
-name: gog
+name: google-cli
 description: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and more - through the gog CLI; reads run read-only, every change is a card you approve.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.41,<2"
@@ -33,7 +33,7 @@ config_schema:
     description: The most of gog's output the model is handed per call; the rest is cut with a note.
 ---
 
-# gog
+# google-cli
 
 Google Workspace for Ultron, the way OpenClaw does it: through
 [`gog`](https://github.com/openclaw/gogcli), one command-line client for Gmail, Calendar,
@@ -42,7 +42,7 @@ plugin adds one tool, `gog`. The model gives it the command after `gog`, the plu
 it, and the model reads the JSON that comes back.
 
 ```
-/plugins install gog
+/plugins install google-cli
 ```
 
 OpenClaw gives its model the same CLI as a skill and lets it run `gog` from the shell.
@@ -57,7 +57,7 @@ These steps are yours to do at a terminal, once. The tool never signs in for you
 1. **Install gog.**
    - Windows: download `gogcli_<version>_windows_amd64.zip` from the
      [releases](https://github.com/openclaw/gogcli/releases) and put `gog.exe` on `PATH`.
-     Alternatively, set `plugins_settings.gog.executable` to its full path.
+     Alternatively, set `plugins_settings.google-cli.executable` to its full path.
    - macOS/Linux: `brew install openclaw/tap/gogcli`.
    - Anywhere with Go: `go install github.com/openclaw/gogcli/cmd/gog@latest`.
 2. **Make a Google OAuth client.**
@@ -73,7 +73,7 @@ These steps are yours to do at a terminal, once. The tool never signs in for you
    ```
    Authorize only the services you want Ultron to see. `gog auth add --readonly` asks Google
    for read-only scopes where they exist, and that is a stronger line than any setting here.
-4. **Optional:** set `plugins_settings.gog.account` to that email. This matters if you have
+4. **Optional:** set `plugins_settings.google-cli.account` to that email. This matters if you have
    more than one account signed in.
 
 The token stays in gog's store, which is your OS keyring by default. It never reaches
@@ -111,7 +111,7 @@ required*, and you run `gog auth add` again.
 
 ## Settings
 
-Under `plugins_settings.gog` in `config.json`; `/plugins gog` shows them.
+Under `plugins_settings.google-cli` in `config.json`; `/plugins google-cli` shows them.
 
 | Setting | Default | What it does |
 |---|---|---|
