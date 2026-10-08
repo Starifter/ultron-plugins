@@ -1,4 +1,4 @@
-"""The gog plugin, driven the way Ultron drives it: a fake `gog` on the far side of
+"""The google-cli plugin, driven the way Ultron drives it: a fake `gog` on the far side of
 `run_program`, recording each argv and answering with gog's documented exit codes.
 
 Run from a checkout of Ultron (`uv run pytest path/to/gog/tests`).
@@ -125,7 +125,7 @@ def test_a_read_is_not_gated_and_a_write_is_a_card_naming_the_command(tmp_path: 
     assert tool.subject({"args": ["calendar", "events"]}) is None
     card = tool.subject({"args": ["calendar", "delete", "primary", "abc"], "write": True})
     assert card is not None
-    assert card.tool == "gog"
+    assert card.tool == "google"
     assert card.command == "gog calendar delete primary abc"
     assert "me@example.com" in card.summary
     assert "gog calendar delete primary abc" in card.summary

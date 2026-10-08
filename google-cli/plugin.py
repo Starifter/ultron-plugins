@@ -1,7 +1,7 @@
 """google-cli: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and the rest - through `gog`.
 
 A directory plugin written against `ultron.sdk` and nothing else. It brings one
-tool, `gog`, that runs the `gog` command-line client (github.com/openclaw/gogcli)
+tool, `google`, that runs the `gog` command-line client (github.com/openclaw/gogcli)
 the person installed and signed in, and hands the model what it printed.
 
 What a call may do is decided by `gog` itself, not by a list kept here. A read -
@@ -138,7 +138,7 @@ def command_line(args: Sequence[str]) -> str:
 
 
 class Gog(Tool):
-    name = "gog"
+    name = "google"
     untrusted = False
     """The result wraps gog's output itself and says so with `wrapped`; the exit
     code and the plugin's own hints are Ultron's words and stay outside."""

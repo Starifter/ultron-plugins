@@ -5,7 +5,7 @@ version: "1.0.0"
 requires_ultron_sdk: ">=1.41,<2"
 categories: [productivity, google]
 contracts:
-  tools: [gog]
+  tools: [google]
 config_schema:
   executable:
     type: str
@@ -38,7 +38,7 @@ config_schema:
 Google Workspace for Ultron, the way OpenClaw does it: through
 [`gog`](https://github.com/openclaw/gogcli), one command-line client for Gmail, Calendar,
 Drive, Docs, Sheets, Slides, Contacts, Tasks, Forms, Meet, Chat, YouTube and the rest. The
-plugin adds one tool, `gog`. The model gives it the command after `gog`, the plugin runs
+plugin adds one tool, `google`. The model gives it the command after `gog`, the plugin runs
 it, and the model reads the JSON that comes back.
 
 ```
