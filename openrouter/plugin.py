@@ -935,24 +935,24 @@ class OpenRouterPlugin(Plugin):
             ctx.register_extension(
                 "imagegen.backend",
                 "openrouter",
-                lambda: OpenRouterImages(
-                    model=str(ctx.setting("image_model", "") or ""),
+                lambda model="": OpenRouterImages(
+                    model=model or str(ctx.setting("image_model", "") or ""),
                     **_key_only(ctx.credential("openrouter")),
                 ),
             )
             ctx.register_extension(
                 "videogen.backend",
                 "openrouter",
-                lambda: OpenRouterVideo(
-                    model=str(ctx.setting("video_model", "") or ""),
+                lambda model="": OpenRouterVideo(
+                    model=model or str(ctx.setting("video_model", "") or ""),
                     **_key_only(ctx.credential("openrouter")),
                 ),
             )
             ctx.register_extension(
                 "musicgen.backend",
                 "openrouter",
-                lambda: OpenRouterMusic(
-                    model=str(ctx.setting("music_model", "") or ""),
+                lambda model="": OpenRouterMusic(
+                    model=model or str(ctx.setting("music_model", "") or ""),
                     **_key_only(ctx.credential("openrouter")),
                 ),
             )

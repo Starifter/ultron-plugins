@@ -116,7 +116,7 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
 
 class Action:
     """One action of `video_generate`, called the way the model calls it. A
-    `status` with no job is a `list`, as the old `video_status` was."""
+    `status` with no job lists this session's jobs, as OpenClaw's does."""
 
     def __init__(self, tool: Any, action: str) -> None:
         self.tool = tool
@@ -124,10 +124,7 @@ class Action:
         self.untrusted = tool.untrusted
 
     def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        action = self.action
-        if action == "status" and "job" not in arguments and "wait" not in arguments:
-            action = "list"
-        return dict(self.tool.validate({"action": action, **arguments}))
+        return dict(self.tool.validate({"action": self.action, **arguments}))
 
     async def run(self, **arguments: Any) -> Any:
         return await self.tool.run(**arguments)
@@ -159,6 +156,7 @@ class Installed:
     def __init__(self, tools: ToolRegistry, auditor: MemoryAuditor, workspace: Path) -> None:
         self.generate = Action(tools.get("video_generate"), "generate")
         self.status = Action(tools.get("video_generate"), "status")
+        self.list = Action(tools.get("video_generate"), "list")
         self.runner = self.generate.runner
         self.runner.interval = 0
         self.auditor = auditor
@@ -777,8 +775,8 @@ async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire:
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    with pytest.raises(ToolError, match="status needs a job"):
-        it.status.validate({"wait": 5})
+    # No job is this session's jobs, as OpenClaw's status is; a wait needs a job to wait on.
+    assert it.status.validate({"wait": 5}) == {"action": "status", "job": "", "wait": 0}
     assert not wire.sent
 
 
@@ -938,3 +936,79 @@ async def test_a_backend_enabled_mid_session_is_asked_at_once(tmp_path: Path, wi
     plugins.install_late("acme", report, workspace=it.workspace, tools=tools)
     assert "with acme" in (await call(it.generate, prompt="x")).content
     await it.settle()
+
+
+# -- the model's choice of vendor and model -------------------------------------
+
+
+async def test_the_model_names_the_vendor_and_its_model_and_the_job_keeps_it(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    result = await call(it.generate, prompt="waves", model="google/veo-3.1-generate-preview")
+    assert "with google (veo-3.1-generate-preview)" in result.content
+    [sent] = wire.to("POST", GOOGLE)
+    assert sent["url"] == f"{GOOGLE}/models/veo-3.1-generate-preview:predictLongRunning"
+    await it.settle()
+    assert it.jobs()[0]["model"] == "veo-3.1-generate-preview"
+
+
+async def test_a_job_picked_up_again_is_rebuilt_on_the_model_it_was_started_on(
+    tmp_path: Path, wire: Wire
+) -> None:
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
+    first = install(tmp_path)
+    await call(first.generate, prompt="waves", model="google/veo-3.1-generate-preview")
+    first.runner.close()
+    await asyncio.sleep(0)
+
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", google_done())
+    second = install(tmp_path)
+    built: list[Any] = []
+    build = second.runner.build
+    second.runner.build = lambda name, model="": built.append(build(name, model)) or built[-1]
+    second.runner.resume()
+    await second.settle()
+    assert [v.model for v in built] == ["veo-3.1-generate-preview"]
+    assert second.jobs()[0]["state"] == "done"
+
+
+async def test_a_backend_that_cannot_take_a_model_is_passed_over_and_the_next_asked(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins")
+    it = session(tmp_path, "acme")
+    result = await call(it.generate, prompt="x", model="acme/acme-2")
+    assert "with google (veo-3.1-fast-generate-preview)" in result.content
+    assert "acme: its plugin cannot be asked for acme-2; update it" in result.content
+    await it.settle()
+
+
+async def test_the_model_is_checked_and_the_schema_names_the_vendors(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    for model, match in (
+        ("veo 3", "not provider/model"),
+        ("google/../files/x", "not a model id"),
+    ):
+        with pytest.raises(ToolError, match=match):
+            it.generate.validate({"prompt": "x", "model": model})
+    described = it.generate.tool.parameters["properties"]["model"]["description"]
+    assert "The providers here: google;" in described
+    unknown = await call(it.generate, prompt="x", model="sora/sora-2")
+    assert "Passed over sora: not here - the vendors are google." in unknown.content
+    await it.settle()
+
+
+async def test_list_shows_the_vendors_and_status_the_jobs(tmp_path: Path, wire: Wire) -> None:
+    backend(tmp_path / "plugins")
+    it = session(tmp_path, "acme", keys={}, settings={"provider": "acme"})
+    listed = (await call(it.list)).content.splitlines()
+    assert listed[1:] == [
+        "- acme/acme-v: ready",
+        "- google/veo-3.1-fast-generate-preview: cannot be asked - no google key "
+        "(ultron auth add google)",
+    ]
+    assert (await call(it.status)).content == "No video jobs in this session."
+    assert wire.sent == []

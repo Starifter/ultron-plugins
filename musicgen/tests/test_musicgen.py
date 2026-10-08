@@ -123,7 +123,7 @@ def wire(monkeypatch: pytest.MonkeyPatch) -> Wire:
 
 class Action:
     """One action of `music_generate`, called the way the model calls it. A
-    `status` with no job is a `list`, as the old `music_status` was."""
+    `status` with no job lists this session's jobs, as OpenClaw's does."""
 
     def __init__(self, tool: Any, action: str) -> None:
         self.tool = tool
@@ -131,10 +131,7 @@ class Action:
         self.untrusted = tool.untrusted
 
     def validate(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        action = self.action
-        if action == "status" and "job" not in arguments and "wait" not in arguments:
-            action = "list"
-        return dict(self.tool.validate({"action": action, **arguments}))
+        return dict(self.tool.validate({"action": self.action, **arguments}))
 
     async def run(self, **arguments: Any) -> Any:
         return await self.tool.run(**arguments)
@@ -148,6 +145,7 @@ class Installed:
     def __init__(self, tools: ToolRegistry, auditor: MemoryAuditor, workspace: Path) -> None:
         self.generate = Action(tools.get("music_generate"), "generate")
         self.status = Action(tools.get("music_generate"), "status")
+        self.list = Action(tools.get("music_generate"), "list")
         self.runner = self.generate.runner
         self.auditor = auditor
         self.workspace = workspace
@@ -865,8 +863,8 @@ async def test_validation_refuses_before_anything_is_spent(tmp_path: Path, wire:
     ):
         result = await call(it.generate, **arguments)
         assert result.is_error and said in result.content
-    with pytest.raises(ToolError, match="status needs a job"):
-        it.status.validate({"wait": 5})
+    # No job is this session's jobs, as OpenClaw's status is; a wait needs a job to wait on.
+    assert it.status.validate({"wait": 5}) == {"action": "status", "job": "", "wait": 0}
     assert not wire.sent and not it.runner.mine()
 
 
@@ -922,3 +920,69 @@ async def test_a_backend_enabled_mid_session_is_asked_at_once(tmp_path: Path, wi
     plugins.install_late("acme", report, workspace=it.workspace, tools=tools)
     assert "with acme" in (await call(it.generate, prompt="x")).content
     await it.settle()
+
+
+# -- the model's choice of vendor and model -------------------------------------
+
+
+async def test_the_model_names_the_vendor_and_its_model(tmp_path: Path, wire: Wire) -> None:
+    chunk = {"choices": [{"delta": {"audio": {"data": base64.b64encode(MP3).decode()}}}]}
+    wire.on("POST", CHAT, Response(raw=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n".encode()))
+    it = session(
+        tmp_path,
+        "openrouter",
+        keys={"google": {"api_key": "AIza-g"}, "openrouter": {"api_key": "or-k"}},
+    )
+    result = await call(it.generate, prompt="lofi", model="openrouter/google/lyria-3-clip-preview")
+    assert "with openrouter (google/lyria-3-clip-preview)" in result.content
+    await it.settle()
+    [sent] = wire.to("POST", CHAT)
+    assert sent["json"]["model"] == "google/lyria-3-clip-preview"
+    assert not wire.to("POST", GOOGLE)
+
+
+async def test_a_chosen_vendor_that_fails_falls_back_on_the_next_ones_own_model(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins")
+    it = session(tmp_path, "acme")
+    wire.on("POST", INTERACTIONS, Response({"error": {"status": "NOT_FOUND"}}, 404))
+    result = await call(it.generate, prompt="x", model="google/lyria-nope")
+    assert "with google (lyria-nope)" in result.content
+    assert "If google fails, acme is next." in result.content
+    await it.settle()
+    [job] = it.jobs()
+    assert (job["vendor"], job["model"], job["state"]) == ("acme", "acme-m", "done")
+
+
+async def test_the_same_music_from_another_vendor_or_model_is_not_a_duplicate(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins", generate="await asyncio.Event().wait()")
+    it = session(tmp_path, "acme", settings={"provider": "acme"})
+    await call(it.generate, prompt="sea shanty")
+    for model in ("google", "google/lyria-3-pro"):
+        assert (
+            "Started music" in (await call(it.generate, prompt="sea shanty", model=model)).content
+        )
+    again = await call(it.generate, prompt="sea shanty", model="google/lyria-3-pro")
+    assert again.content.startswith("Not started again")
+    it.runner.close()
+    await asyncio.sleep(0)
+
+
+def test_the_model_is_checked_before_anything_runs(tmp_path: Path) -> None:
+    it = install(tmp_path)
+    for model, match in (
+        ("lyria 3", "not provider/model"),
+        ("google/lyria 3", "not a model id"),
+    ):
+        with pytest.raises(ToolError, match=match):
+            it.generate.validate({"prompt": "x", "model": model})
+
+
+async def test_list_shows_the_vendors_and_status_the_jobs(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    assert (await call(it.list)).content.splitlines()[1:] == ["- google/lyria-3.5: ready"]
+    assert (await call(it.status)).content == "No music jobs in this session."
+    assert wire.sent == []

@@ -417,16 +417,16 @@ class TogetherPlugin(Plugin):
             ctx.register_extension(
                 "imagegen.backend",
                 "together",
-                lambda: TogetherImages(
-                    model=str(ctx.setting("image_model", "") or ""),
+                lambda model="": TogetherImages(
+                    model=model or str(ctx.setting("image_model", "") or ""),
                     **_key_only(ctx.credential("together")),
                 ),
             )
             ctx.register_extension(
                 "videogen.backend",
                 "together",
-                lambda: TogetherVideo(
-                    model=str(ctx.setting("video_model", "") or ""),
+                lambda model="": TogetherVideo(
+                    model=model or str(ctx.setting("video_model", "") or ""),
                     **_key_only(ctx.credential("together")),
                 ),
             )

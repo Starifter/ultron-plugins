@@ -163,8 +163,8 @@ class FireworksPlugin(Plugin):
             ctx.register_extension(
                 "imagegen.backend",
                 "fireworks",
-                lambda: FireworksImages(
-                    model=str(ctx.setting("image_model", "") or ""),
+                lambda model="": FireworksImages(
+                    model=model or str(ctx.setting("image_model", "") or ""),
                     **_key_only(ctx.credential("fireworks")),
                 ),
             )

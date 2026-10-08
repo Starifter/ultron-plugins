@@ -2,7 +2,7 @@
 name: videogen
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
-version: "3.1.0"
+version: "3.2.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
 wakes: true
@@ -49,7 +49,8 @@ One tool, OpenClaw's `video_generate`, with three actions. `generate` (the defau
 prompt, and optionally a first and a last frame from the workspace, to a video vendor and
 returns at once with a job id; the video is made in the background - one to several minutes -
 saved in the workspace when it is ready, and the agent is woken to tell you. `status` checks
-one job and can wait for it; `list` lists this session's jobs.
+one job and can wait for it, or with no job lists this session's jobs; `list` shows the
+vendors and their models. That is OpenClaw's split.
 
 ```
 /plugins install videogen
@@ -57,6 +58,9 @@ one job and can wait for it; `list` lists this session's jobs.
 
 **From 2.x:** `generate_video` and `video_status` are now `video_generate` with
 `action: generate`, `action: status` and `action: list`.
+
+**From 3.1:** `action: list` listed this session's jobs; it lists the vendors now, and
+`action: status` with no `job` lists the jobs - OpenClaw's meaning of each.
 
 ## Keys
 
@@ -98,6 +102,28 @@ settings are gone - `/plugins videogen` warns about any still set - and each ven
 needs its own plugin enabled, with its model in that plugin's `video_model`. A job a 1.x
 session left running is still collected, as long as its vendor's plugin is enabled.
 
+## The model's choice
+
+The model may name the vendor and model itself, as `model: "google/veo-3.1-generate-preview"` - the provider, a
+slash, and the id as that vendor writes it. Only the first slash splits, so
+`openrouter/google/lyria-3-pro-preview` is OpenRouter's `google/lyria-3-pro-preview`. A
+provider alone, `model: "xai"`, is that vendor's configured model. The vendor named is
+asked first, before `provider`. If it is not installed, cannot do what was asked, or fails,
+the others are tried on their own configured models - an id means something only at its
+own vendor - and the result names each one passed over. There is no allow list: any
+installed vendor and any id may be named, and the call costs money at whichever vendor
+answers. The id goes into a vendor's URL, so one with `..`, `//`, `?`, `#`, `%` or a space
+is refused before anything is spent.
+
+A job keeps the model it was started on, and a later session that picks it up asks the
+vendor on that model again.
+
+`action: list` shows every vendor in the order it would be asked, as `model` takes it -
+`google/veo-3.1-fast-generate-preview: ready` - and why one cannot be asked.
+Asking each vendor whether it is ready reads its key (an `auth` record each); nothing is
+sent anywhere. A vendor whose plugin names further ids lists them too. None of the vendors
+here fetches its vendor's whole catalogue, so an id the list does not show may still work.
+
 ## Adding a vendor
 
 A plugin adds a vendor by putting a builder into `videogen.backend` (SDK 1.39):
@@ -112,7 +138,7 @@ It needs nothing from videogen, and videogen needs no change. The name is what `
 takes, what the job file records, and how a job is found again in a later session - so keep
 it stable. A backend registered under `google` stands in for the built-in one.
 
-**The builder** takes no arguments and returns a vendor. It is called when videogen reaches
+**The builder** takes an optional `model` keyword - the id the model named, or nothing for your configured one - and returns a vendor: `lambda model="": AcmeX(model=model or configured)`. A builder that takes no arguments still works; when the model names one of its models, it is passed over with "update it" rather than built on the wrong model. It is called when videogen reaches
 that vendor and again when it resumes one of its jobs, so read the key there.
 
 **The vendor** is any object with:
@@ -120,6 +146,7 @@ that vendor and again when it resumes one of its jobs, so read the key there.
 | | |
 |---|---|
 | `model` | The model it will use, for the job record and the result. Optional. |
+| `models` | Further ids it takes, for `action: list`. Optional; at most 20 are shown. |
 | `host` | Where the video comes from. Optional. |
 | `ready()` | `""` when it can be asked, or why not. Optional. |
 | `cannot(request)` | `""` when it can make this, or why not - `"makes 16:9 and 9:16 only"`. Optional. |

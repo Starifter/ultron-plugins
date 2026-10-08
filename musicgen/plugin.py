@@ -33,6 +33,7 @@ import base64
 import contextlib
 import contextvars
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -83,6 +84,22 @@ EXTENSIONS = {
 }
 SUFFIXES = tuple(f".{ext}" for ext in EXTENSIONS.values())
 CODE = re.compile(r"[^A-Za-z0-9_.-]+")
+MODEL_ARGUMENT = (
+    "Which vendor and model to ask first, as provider/model - {example} - or a provider "
+    "alone for the model the person configured there. The providers here: {vendors}; "
+    "`action: list` shows each one's model. Leave it out for the person's choice. If it "
+    "fails or cannot do what is asked, the others are tried on their own models and the "
+    "result says so."
+)
+LISTED_MODELS = 20
+"""The most extra model ids one vendor's line names."""
+VENDOR_NAME = re.compile(r"[a-z0-9_-]{1,64}")
+"""What `provider` may say: an extension's name is lower case, letters,
+digits, `_` and `-`."""
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}")
+"""What `model` may say. The model chose it and it goes into a vendor's URL
+path or request - so nothing that steps out of a path
+segment or starts a query: no `..`, `//`, `?`, `#`, `%` or space."""
 
 
 def sniff_image(data: bytes) -> str:
@@ -209,9 +226,15 @@ class Vendor:
         self.why = why
 
     @classmethod
-    def built(cls, name: str, builder: Callable[[], Any]) -> Vendor:
+    def built(cls, name: str, builder: Callable[..., Any], model: str = "") -> Vendor:
+        """`name`'s vendor, on `model` when one is named. A builder written
+        before the model could choose takes no arguments, and building it would
+        be the configured model under the name of the one asked for - so it is
+        a vendor that cannot, and the next is asked."""
+        if model and not _takes_model(builder):
+            return cls(name, None, f"its plugin cannot be asked for {model}; update it")
         try:
-            return cls(name, builder())
+            return cls(name, builder(model=model) if model else builder())
         except Exception as exc:  # another plugin's code fails as a vendor fails
             return cls(name, None, f"could not be built: {_said(exc)}")
 
@@ -487,7 +510,7 @@ class Musicgen:
         self.asked: dict[str, str] = {}
         """Each job's request fingerprint, in memory only: a hash of the prompt
         is not the prompt, but it is no business of `jobs.json` either."""
-        self.vendors: Callable[[], Iterator[Vendor]] = self._vendors
+        self.vendors: Callable[[str, str], Iterator[Vendor]] = self._vendors
         self.swept = False
         self.waking: asyncio.Task[None] | None = None
         """The wake on its way, if one is (`announce`)."""
@@ -505,29 +528,34 @@ class Musicgen:
 
     # -- vendors ---------------------------------------------------------------
 
-    def builders(self) -> dict[str, Callable[[], Any]]:
+    def builders(self) -> dict[str, Callable[..., Any]]:
         """Every vendor's builder by name: the built-in, then the backends other
         plugins registered, in their install order. Read now rather than at
         `register`, so a plugin enabled since is in and one disabled since is
         out. A backend registered under `google` stands in for it."""
-        found: dict[str, Callable[[], Any]] = {"google": self._google}
+        found: dict[str, Callable[..., Any]] = {"google": self._google}
         found.update(self.ctx.extensions_in(POINT))
         return found
 
-    def _vendors(self) -> Iterator[Vendor]:
-        """Every vendor, the preferred one first, each built with the key it
-        holds now only when it is reached."""
+    def _vendors(self, provider: str = "", model: str = "") -> Iterator[Vendor]:
+        """Every vendor: the one the model named, then the one the person
+        configured, then the rest - each built with the key it holds now only
+        when it is reached. `model` goes to the vendor the model named and to no
+        other: an id means something only at its own vendor. A named vendor
+        that is not here is passed over like one with no key."""
         builders = self.builders()
-        first = str(self.ctx.setting("provider", "") or "").strip().lower()
-        order = [first] if first in builders else []
+        configured = str(self.ctx.setting("provider", "") or "").strip().lower()
+        if provider and provider not in builders:
+            yield Vendor(provider, None, f"not here - the vendors are {', '.join(builders)}")
+        order = [name for name in dict.fromkeys((provider, configured)) if name in builders]
         order += [name for name in builders if name not in order]
         for name in order:
-            yield Vendor.built(name, builders[name])
+            yield Vendor.built(name, builders[name], model if name == provider else "")
 
-    def _google(self) -> GoogleMusic:
+    def _google(self, model: str = "") -> GoogleMusic:
         credential = self.ctx.credential("google")
         key = {k: v for k, v in credential.items() if k in ("api_key", "auth_token")}
-        return GoogleMusic(model=str(self.ctx.setting("google_model", "") or ""), **key)
+        return GoogleMusic(model=model or str(self.ctx.setting("google_model", "") or ""), **key)
 
     # -- the lifecycle ---------------------------------------------------------
 
@@ -836,6 +864,58 @@ def _duplicate(job: Job) -> str:
     )
 
 
+def _choice(checked: Mapping[str, Any]) -> tuple[str, str]:
+    """`model` as the model wrote it, split at its first `/` into a vendor's
+    name and that vendor's own id - which may hold more slashes, as
+    `openrouter/google/veo-3.1` does. A vendor alone is its configured model."""
+    named = str(checked.get("model", "") or "").strip()
+    provider, _, model = named.partition("/")
+    provider = provider.strip().lower()
+    if named and not VENDOR_NAME.fullmatch(provider):
+        raise ToolError(f"model {named!r} is not provider/model - google/lyria-3-pro-preview, say")
+    if model and (not MODEL_ID.fullmatch(model) or ".." in model or "//" in model):
+        raise ToolError(f"{model!r} is not a model id")
+    return provider, model
+
+
+def _listed(vendor: Vendor) -> str:
+    """One vendor's line for `action: list`: `model` as it would take it,
+    whether it can be asked, and any further ids it names (`models`, optional).
+    Facts the vendors' plugins hold - asking each `ready()` reads its key, and
+    nothing is sent anywhere."""
+    model = vendor.model
+    line = f"- {vendor.name}/{model}" if model else f"- {vendor.name}"
+    missing = vendor.ready()
+    line += f": cannot be asked - {missing}" if missing else ": ready"
+    others = [f"{vendor.name}/{each}" for each in _models(vendor.impl) if each != model]
+    if others:
+        line += f"; also {', '.join(others)}"
+    return line
+
+
+def _models(impl: Any) -> list[str]:
+    """The ids a vendor says it also takes, checked as `model` would check
+    them, at most `LISTED_MODELS`. Another plugin's code: one that is not a list
+    of ids, or that raises, names none."""
+    try:
+        said = list(getattr(impl, "models", ()) or ())
+    except Exception:
+        return []
+    ids = [str(each).strip() for each in said if isinstance(each, str)]
+    ids = [each for each in ids if MODEL_ID.fullmatch(each) and ".." not in each]
+    return list(dict.fromkeys(ids))[:LISTED_MODELS]
+
+
+def _takes_model(builder: Callable[..., Any]) -> bool:
+    """Whether a builder takes `model=` - one written before the model could
+    choose takes no arguments."""
+    try:
+        parameters = inspect.signature(builder).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "model" or p.kind is p.VAR_KEYWORD for p in parameters)
+
+
 def _said(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
@@ -917,8 +997,8 @@ class MusicGenerate(Tool):
             "for. The same request while its track is being made, or within two minutes of it "
             "being saved, starts nothing and answers with that job. `action: status` with a "
             "`job` shows one - why it failed, the lyrics the vendor sang - and `wait` waits up "
-            "to that many seconds for it, only when the person is waiting on it. "
-            "`action: list` lists this session's jobs."
+            "to that many seconds for it, only when the person is waiting on it; with no `job` "
+            "it lists this session's jobs. `action: list` shows the vendors and their models."
         )
 
     @property
@@ -960,7 +1040,18 @@ class MusicGenerate(Tool):
                     "description": "Where to save it, relative to the workspace. Leave it out "
                     "for a new file. Never an existing file.",
                 },
-                "job": {"type": "string", "description": "A job id, mg-... For status."},
+                "model": {
+                    "type": "string",
+                    "description": MODEL_ARGUMENT.format(
+                        vendors=", ".join(self.runner.builders()),
+                        example="google/lyria-3-pro-preview",
+                    ),
+                },
+                "job": {
+                    "type": "string",
+                    "description": "A job id, mg-... For status; leave it out for all of "
+                    "this session's jobs.",
+                },
                 "wait": {
                     "type": "integer",
                     "minimum": 0,
@@ -979,9 +1070,7 @@ class MusicGenerate(Tool):
             return {"action": action}
         if action == "status":
             job = str(checked.get("job", "") or "").strip()
-            if not job:
-                raise ToolError("status needs a job; list shows them all")
-            wait = int(checked.get("wait") or 0)
+            wait = int(checked.get("wait") or 0) if job else 0
             return {"action": action, "job": job, "wait": max(0, min(self.MAX_WAIT, wait))}
         prompt = str(checked.get("prompt", "") or "").strip()
         if not prompt:
@@ -1011,6 +1100,7 @@ class MusicGenerate(Tool):
             "seconds": seconds,
             "images": images,
             "path": path,
+            **dict(zip(("provider", "model"), _choice(checked), strict=True)),
         }
 
     async def run(  # type: ignore[override]
@@ -1024,13 +1114,17 @@ class MusicGenerate(Tool):
         path: str = "",
         job: str = "",
         wait: int = 0,
+        provider: str = "",
+        model: str = "",
     ) -> ToolResult:
         self.runner.sweep()
         if action == "list":
             return self._list()
         if action == "status":
             return await self._status(job, wait)
-        return self._generate(prompt, lyrics, instrumental, seconds, images or [], path)
+        return self._generate(
+            prompt, lyrics, instrumental, seconds, images or [], path, provider, model
+        )
 
     # -- generate ----------------------------------------------------------------
 
@@ -1042,6 +1136,8 @@ class MusicGenerate(Tool):
         seconds: int,
         images: list[str],
         path: str,
+        provider: str = "",
+        model: str = "",
     ) -> ToolResult:
         runner = self.runner
         try:
@@ -1049,7 +1145,8 @@ class MusicGenerate(Tool):
         except ToolError as exc:
             return ToolResult.error(str(exc))
         request = Request(prompt, lyrics, instrumental, seconds, pictures, runner.timeout())
-        fingerprint = request.fingerprint()
+        # The same music from another vendor or model is not the same track.
+        fingerprint = f"{request.fingerprint()}:{provider}:{model}"
         duplicate = runner.duplicate(fingerprint)
         if duplicate is not None:
             return ToolResult.ok(_duplicate(duplicate))
@@ -1059,7 +1156,7 @@ class MusicGenerate(Tool):
             return ToolResult.error(str(exc))
         able: list[Vendor] = []
         passed: list[str] = []
-        for vendor in runner.vendors():
+        for vendor in runner.vendors(provider, model):
             missing = vendor.ready() or vendor.cannot(request)
             if missing:
                 passed.append(f"{vendor.name}: {missing}")
@@ -1139,6 +1236,17 @@ class MusicGenerate(Tool):
     # -- status and list ---------------------------------------------------------
 
     def _list(self) -> ToolResult:
+        """The vendors, as `model` takes them - OpenClaw's `list`."""
+        lines = [
+            "Music vendors, in the order they are asked. `model` takes provider/model; a "
+            "provider alone is the model shown."
+        ]
+        lines += [_listed(vendor) for vendor in self.runner.vendors("", "")]
+        return ToolResult.ok("\n".join(lines))
+
+    def _jobs(self) -> ToolResult:
+        """This session's jobs, newest first - `status` with no job, as
+        OpenClaw's `status` is the session's task."""
         runner = self.runner
         jobs = runner.mine()[-10:]
         if not jobs:
@@ -1148,6 +1256,8 @@ class MusicGenerate(Tool):
         return ToolResult.ok("\n".join(_line(each) for each in reversed(jobs)))
 
     async def _status(self, job: str, wait: int) -> ToolResult:
+        if not job:
+            return self._jobs()
         runner = self.runner
         found = {each.id: each for each in runner.mine()}.get(job)
         if found is None:
