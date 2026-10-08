@@ -2,7 +2,7 @@
 name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
-version: "2.0.0"
+version: "2.1.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
 wakes: true
@@ -13,6 +13,10 @@ config_schema:
     type: str
     default: wake
     description: "How a finished job is told: wake (the agent is woken to tell the person, SDK 1.40) or notice (a line on the next turn)."
+  announce_to:
+    type: str
+    default: ""
+    description: "Where a wake's reply is also sent (SDK 1.41): channel:owner for your DM on the channel you last wrote from, or channel:<address>. Empty: where the session's replies go."
   provider:
     type: str
     default: ""
@@ -128,7 +132,11 @@ that.
    one line per finished job: which job, where it is, who made it, how big it is. It runs as a
    turn of the session's own after whatever is running, never inside a person's turn, and its
    reply goes where the session's replies go: a song asked for in a Telegram DM is announced in
-   that DM. Several jobs that finish together are one wake. Where the agent cannot be woken -
+   that DM. `announce_to` sends it somewhere as well, chosen by you rather than the model:
+   `channel:owner` is your DM on the channel you last wrote from, so a song started at the
+   laptop is announced on your phone; `channel:<address>` is a fixed place, held to the
+   `message` tool's rule (`channels_send_allow`) before the turn is spent (SDK 1.41). Several
+   jobs that finish together are one wake. Where the agent cannot be woken -
    `announce: notice`, an Ultron before 1.40, a `cron` or group session, a lane busy past the
    core's wait, `plugins_no_wake` - the same line rides the session's next turn instead. The
    line carries what the plugin worked out and never a word a vendor wrote; why a job failed,
