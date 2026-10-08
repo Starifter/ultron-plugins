@@ -63,6 +63,10 @@ LYRICS_SHOWN = 4000
 """What `music_status` shows of a vendor's lyrics."""
 KEEP = 200
 """Finished jobs kept in the file; the oldest past this are dropped."""
+DUPLICATE_SECONDS = 120
+"""How long a finished track answers the same request again, as OpenClaw's
+music tool does: long enough to catch a model asking twice, short enough that
+asking again later is a new take."""
 POINT = "musicgen.backend"
 """Where another plugin puts a vendor (`ctx.register_extension`, SDK 1.39)."""
 GOOGLE_HOST = "generativelanguage.googleapis.com"
@@ -161,6 +165,17 @@ class Request:
         if self.lyrics:
             parts.append(f"Lyrics:\n{self.lyrics.strip()}")
         return "\n\n".join(parts)
+
+    def fingerprint(self) -> str:
+        """What makes two requests the same track: everything sent to a vendor,
+        the pictures by their bytes. Not where it is saved - the same music to
+        another file is still the same music, paid for twice."""
+        digest = hashlib.sha256()
+        for part in (self.prompt, self.lyrics, str(self.instrumental), str(self.seconds)):
+            digest.update(part.encode("utf-8") + b"\x00")
+        for image in self.images:
+            digest.update(hashlib.sha256(image.data).digest())
+        return digest.hexdigest()
 
 
 class Made:
@@ -467,6 +482,9 @@ class Musicgen:
         self.ended: dict[str, asyncio.Event] = {}
         self.lyrics: dict[str, str] = {}
         """What a vendor sang, by job, for this session only (see `Job`)."""
+        self.asked: dict[str, str] = {}
+        """Each job's request fingerprint, in memory only: a hash of the prompt
+        is not the prompt, but it is no business of `jobs.json` either."""
         self.vendors: Callable[[], Iterator[Vendor]] = self._vendors
         self.swept = False
 
@@ -510,6 +528,25 @@ class Musicgen:
     def mine(self) -> list[Job]:
         jobs = [job for job in self.file.load().values() if job.session == self.session]
         return sorted(jobs, key=lambda job: job.created)
+
+    def duplicate(self, fingerprint: str) -> Job | None:
+        """This session's job for the same request, if one is still being made
+        or was saved in the last `DUPLICATE_SECONDS`. A failed one is not: asking
+        again after a failure is a retry, not a duplicate."""
+        ids = [job_id for job_id, seen in self.asked.items() if seen == fingerprint]
+        if not ids:
+            return None
+        jobs = {job.id: job for job in self.mine()}
+        now = time.time()
+        for job_id in reversed(ids):
+            job = jobs.get(job_id)
+            if job is None:
+                continue
+            if job.state == "running" and job_id in self.tasks:
+                return job
+            if job.state == "done" and now - job.finished <= DUPLICATE_SECONDS:
+                return job
+        return None
 
     def reserved(self) -> set[str]:
         """Targets a running job has claimed, so two jobs never pick one name."""
@@ -711,6 +748,22 @@ def _notice(job: Job, lyrics: bool) -> str:
     return f"Note: music {job.id} from {job.vendor} failed; music_status {job.id} says why."
 
 
+def _duplicate(job: Job) -> str:
+    """What a repeated request is told: the job it already is, and nothing
+    started or spent."""
+    if job.state == "running":
+        age = _age(time.time() - job.created)
+        return (
+            f"Not started again: music {job.id} is the same request, running for {age} at "
+            f"{job.made_by()}, to be saved to {job.target}. You will be told when it is ready."
+        )
+    age = _age(time.time() - job.finished)
+    return (
+        f"Not made again: music {job.id} is the same request, saved {age} ago to "
+        f"{job.saved} by {job.made_by()}. For another take, change the request."
+    )
+
+
 def _said(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
 
@@ -780,7 +833,9 @@ class GenerateMusic(Tool):
             "tempo, instruments, the voice that sings. Give `lyrics` only when the person "
             "wrote them or asked you to; leave them out and the vendor writes its own. "
             "`images` are workspace pictures that set the mood. Each call is one track and "
-            "costs money: do not make variations nobody asked for."
+            "costs money: do not make variations nobody asked for. The same request while "
+            "its track is being made, or within two minutes of it being saved, starts "
+            "nothing and answers with that job."
         )
 
     @property
@@ -862,10 +917,17 @@ class GenerateMusic(Tool):
         runner.sweep()
         try:
             pictures = tuple(self._picture(named) for named in images or ())
-            target = self._target(path, prompt)
         except ToolError as exc:
             return ToolResult.error(str(exc))
         request = Request(prompt, lyrics, instrumental, seconds, pictures, runner.timeout())
+        fingerprint = request.fingerprint()
+        duplicate = runner.duplicate(fingerprint)
+        if duplicate is not None:
+            return ToolResult.ok(_duplicate(duplicate))
+        try:
+            target = self._target(path, prompt)
+        except ToolError as exc:
+            return ToolResult.error(str(exc))
         able: list[Vendor] = []
         passed: list[str] = []
         for vendor in runner.vendors():
@@ -893,6 +955,7 @@ class GenerateMusic(Tool):
         except OSError as exc:
             # Made anyway: it only will not be listed in a later session.
             passed.append(f"not kept for a later session: {type(exc).__name__}")
+        runner.asked[job.id] = fingerprint
         runner.start(job, able, request)
         line = (
             f"Started music {job.id} with {first.made_by()}; it will be saved to {target} "

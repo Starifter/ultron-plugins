@@ -45,13 +45,13 @@ INTERACTIONS = f"{GOOGLE}/interactions"
 CHAT = "https://openrouter.ai/api/v1/chat/completions"
 
 
-def png() -> bytes:
+def png_of(colour: tuple[int, int, int]) -> bytes:
     out = io.BytesIO()
-    Image.new("RGB", (8, 8), (20, 120, 200)).save(out, format="PNG")
+    Image.new("RGB", (8, 8), colour).save(out, format="PNG")
     return out.getvalue()
 
 
-PNG = png()
+PNG = png_of((20, 120, 200))
 
 
 class Response:
@@ -641,6 +641,69 @@ async def test_music_status_lists_running_jobs_newest_first(tmp_path: Path, wire
     assert "running for" in listed[0] and "-two.mp3" in listed[0]
     it.runner.close()
     await asyncio.sleep(0)
+
+
+# -- the same request twice -----------------------------------------------------
+
+
+async def test_the_same_request_while_it_runs_answers_with_that_job(
+    tmp_path: Path, wire: Wire
+) -> None:
+    backend(tmp_path / "plugins", generate="await asyncio.Event().wait()")
+    it = session(tmp_path, "acme", settings={"provider": "acme"})
+    job = job_id(await call(it.generate, prompt="sea shanty", lyrics="heave ho"))
+    again = await call(it.generate, prompt="sea shanty", lyrics="heave ho", path="other.mp3")
+    assert not again.is_error
+    assert again.content.startswith(f"Not started again: music {job} is the same request")
+    assert len(it.jobs()) == 1 and len(it.runner.tasks) == 1
+    for different in ({"lyrics": "heave"}, {"instrumental": True, "lyrics": ""}, {"seconds": 60}):
+        arguments = {"prompt": "sea shanty", "lyrics": "heave ho", **different}
+        assert "Started music" in (await call(it.generate, **arguments)).content
+    assert len(it.jobs()) == 4
+    assert "sea shanty" not in json.dumps(it.jobs())
+    it.runner.close()
+    await asyncio.sleep(0)
+
+
+async def test_a_track_saved_moments_ago_is_not_made_again_and_later_it_is(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    job = job_id(await call(it.generate, prompt="waves"))
+    await it.settle()
+    again = await call(it.generate, prompt="waves")
+    assert again.content.startswith(f"Not made again: music {job} is the same request, saved")
+    assert "For another take, change the request." in again.content
+    assert len(wire.to("POST", GOOGLE)) == 1
+    kept = it.runner.file.load()[job]
+    kept.finished -= 121
+    it.runner.file.save(kept)
+    assert "Started music" in (await call(it.generate, prompt="waves")).content
+    await it.settle()
+    assert len(wire.to("POST", GOOGLE)) == 2
+
+
+async def test_the_same_pictures_match_and_different_ones_do_not(
+    tmp_path: Path, wire: Wire
+) -> None:
+    it = install(tmp_path)
+    (it.workspace / "a.png").write_bytes(PNG)
+    (it.workspace / "b.png").write_bytes(png_of((200, 10, 10)))
+    await call(it.generate, prompt="x", images=["a.png"])
+    await it.settle()
+    assert "Not made again" in (await call(it.generate, prompt="x", images=["a.png"])).content
+    assert "Started music" in (await call(it.generate, prompt="x", images=["b.png"])).content
+    await it.settle()
+
+
+async def test_a_failed_job_is_retried_rather_than_returned(tmp_path: Path, wire: Wire) -> None:
+    it = install(tmp_path)
+    wire.on("POST", INTERACTIONS, Response({"error": {"status": "UNAVAILABLE"}}, 503), lyria())
+    await call(it.generate, prompt="x")
+    await it.settle()
+    assert "Started music" in (await call(it.generate, prompt="x")).content
+    await it.settle()
+    assert [r.outcome for r in it.events("music")] == ["error", "ok"]
 
 
 # -- refusals -------------------------------------------------------------------

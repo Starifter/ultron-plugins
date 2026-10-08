@@ -122,6 +122,14 @@ that.
    `music_status`, whose result arrives inside an untrusted envelope. A notice never starts a
    turn by itself.
 
+**The same request twice** starts nothing, as OpenClaw's music tool does: while a job in
+this session is being made from the same prompt, lyrics, length, instrumental switch and
+pictures, or for two minutes after it was saved, `generate_music` answers with that job
+instead. Where it is to be saved does not count - the same music to another file is still the
+same music paid for twice. A job that failed does not count either, so asking again after a
+failure is a retry. A different request is a new job, however many are running. The match is
+a hash of the request, held in memory for the session and never written down.
+
 Jobs are kept in `<workspace>/.ultron/musicgen/jobs.json`, so `music_status` still lists them
 in a later session. Lyrics are not: they are a vendor's words, and a file in the workspace is
 one `read_file` would hand the model without its envelope, so they are held in memory for the
