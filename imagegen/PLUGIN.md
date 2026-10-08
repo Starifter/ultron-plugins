@@ -2,11 +2,11 @@
 name: imagegen
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
-version: "2.0.0"
+version: "3.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [openai, google]
 contracts:
-  tools: [generate_image]
+  tools: [image_generate]
 config_schema:
   provider:
     type: str
@@ -36,13 +36,18 @@ config_schema:
 
 # imagegen
 
-One tool, `generate_image`: make a picture from a prompt, or edit pictures already in the
+One tool, `image_generate`: make a picture from a prompt, or edit pictures already in the
 workspace, and save the result there. The model is shown what it made, so it can look
 before telling you it is right.
 
 ```
 /plugins install imagegen
 ```
+
+**From 2.x:** the tool was `generate_image`. It is `image_generate` now, OpenClaw's name, beside
+`music_generate` and `video_generate`; nothing else about it changed. It stays one call that
+answers with the picture - no job, no wake - because the model looking at what it made, and
+editing it in the same turn, is the point of the tool.
 
 ## Keys
 

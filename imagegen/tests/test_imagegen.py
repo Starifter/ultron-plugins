@@ -139,7 +139,7 @@ def installed(
         credentials=lambda vendor: keys.get(vendor, {}),
     )
     assert provision.ok, provision.error
-    return tools.get("generate_image"), auditor, workspace
+    return tools.get("image_generate"), auditor, workspace
 
 
 async def call(tool: Any, **arguments: Any) -> Any:
@@ -163,7 +163,7 @@ def test_the_tool_marks_what_a_vendor_sent_as_untrusted(tmp_path: Path) -> None:
 def test_the_manifest_declares_the_tool_and_only_its_own_vendors() -> None:
     manifest = read_manifest(HERE / "PLUGIN.md", source="dir")
     assert not manifest.warnings, manifest.warnings
-    assert manifest.tools == ("generate_image",)
+    assert manifest.tools == ("image_generate",)
     assert manifest.vendor_credentials == ("openai", "google")
 
 
@@ -461,7 +461,7 @@ def session(
     )
     for name in ("imagegen", *enabled):
         assert report.provisions[name].ok, report.provisions[name].error
-    return tools.get("generate_image"), (plugins, report, tools), auditor, workspace
+    return tools.get("image_generate"), (plugins, report, tools), auditor, workspace
 
 
 async def test_a_backend_another_plugin_registered_is_asked_after_the_built_ins(
