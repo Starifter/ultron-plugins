@@ -4,6 +4,7 @@ description: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and more - 
 version: "1.0.0"
 requires_ultron_sdk: ">=1.41,<2"
 categories: [productivity, google]
+logo: logo.svg
 contracts:
   tools: [google]
 config_schema:
