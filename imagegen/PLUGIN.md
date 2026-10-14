@@ -3,8 +3,8 @@ name: imagegen
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg
-version: "4.0.0"
-requires_ultron_sdk: ">=1.39,<2"
+version: "5.0.0"
+requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [openai, google]
 contracts:
   tools: [image_generate]
@@ -17,10 +17,6 @@ config_schema:
     type: float
     default: 120
     description: "One attempt at one vendor, 5 to 600 seconds, when the model gives no timeoutMs."
-  output_dir:
-    type: str
-    default: images
-    description: "Where pictures go, inside the workspace. A filename the model gives is a name in here."
   openai_model:
     type: str
     default: gpt-image-2
@@ -45,8 +41,13 @@ made, so it can look before telling you it is right.
 /plugins install imagegen
 ```
 
+**From 4.x:** pictures go to `media/images/` in the workspace, where Ultron keeps what its
+plugins make, and the `output_dir` setting is gone - a `filename` is a name in
+`media/images/`. Ultron picks the safe name and never writes over a file, so it needs
+Ultron's SDK 1.43. Pictures already in `images/` stay where they are.
+
 **From 3.x:** the arguments are OpenClaw's now. `aspect` (square, landscape, portrait) is
-`aspectRatio` with OpenClaw's 21 shapes; `path` is `filename`, a name in `output_dir` that
+`aspectRatio` with OpenClaw's 21 shapes; `path` is `filename`, a name in `media/images/` that
 is never refused - a name already taken gets `-2`; `size`, `resolution`, `quality`,
 `outputFormat`, `background`, `openai`, `count` and `timeoutMs` are new, and so are
 `image` and pictures by URL. `mask` is gone, because OpenClaw has none, and so is Imagen,
@@ -76,7 +77,7 @@ Every field is optional but the prompt.
 | `prompt` | What to make, or what to change. |
 | `image`, `images` | Pictures to edit or to work from, up to 16: a workspace path, a `file://` URL inside the workspace, a `data:` URL, or an http(s) URL - fetched under the same address policy as `web_fetch`. |
 | `model` | `provider/model` to ask first - below. |
-| `filename` | A name for the file, kept as its basename inside `output_dir`. |
+| `filename` | A name for the file, kept as its basename inside `media/images/`. |
 | `size` | `1024x1024`, `1536x1024`, `2048x2048`, `3840x2160` and so on. |
 | `aspectRatio` | One of 1:1, 2:1, 20:9, 19.5:9, 2:3, 3:2, 2.35:1, 3:4, 4:3, 4:5, 5:4, 9:16, 9:19.5, 9:20, 16:9, 21:9, 1:2, 4:1, 1:4, 8:1, 1:8. |
 | `resolution` | 1K, 2K or 4K. |
@@ -215,7 +216,7 @@ than sent to code that would not read it. Its request still has `aspect` (always
 - **Generate** up to four pictures from a prompt.
 - **Edit** up to sixteen pictures, from the workspace or a URL, at a vendor that takes that
   many.
-- **Save** to `images/<time>-<prompt>.png`, or to the `filename` the model gives - never over
+- **Save** to `media/images/<time>-<prompt>.png`, or to the `filename` the model gives - never over
   an existing file.
 - **Show** them to the model through Ultron's media store, inside an untrusted envelope -
   the bytes are a vendor's. With pictures off (`image_accept: false`) the files are saved and

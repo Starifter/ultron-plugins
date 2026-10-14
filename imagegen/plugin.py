@@ -26,10 +26,12 @@ OpenAI and Google stay here because their plugins ship inside Ultron, which
 does not know imagegen exists. Their keys come from `ctx.credential`; a backend
 reads its own with its own plugin's. Either way a key is read when its vendor
 is reached, so a key added mid-session is the one spent and a vendor never
-reached is never read. The pictures are written into the workspace, put in the
-media store with `ctx.media.put` so they survive a reload, and handed back as
-an `ImageResult` so the model sees them. Every vendor attempt is a `generate`
-record through `ctx.audit`, beside the tool call's own record.
+reached is never read. The pictures are written to `media/images/` in the
+workspace through `ctx.generated` (SDK 1.43), which picks the safe name and
+never writes over a file, put in the media store with `ctx.media.put` so they
+survive a reload, and handed back as an `ImageResult` so the model sees them.
+Every vendor attempt is a `generate` record through `ctx.audit`, beside the
+tool call's own record.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from ultron.sdk.media import MediaRefused
 from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.runtime import ToolError, assert_active
 from ultron.sdk.tool_plugin import ImageResult, Tool, ToolResult, validate_arguments, wrap_open
@@ -1048,7 +1051,7 @@ class ImageGenerate(Tool):
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Output filename hint; basename preserved in managed media dir.",
+                    "description": "Output filename hint; basename preserved in media/images/.",
                 },
                 "size": {
                     "type": "string",
@@ -1460,24 +1463,23 @@ class ImageGenerate(Tool):
         notes: list[str],
         asked: int,
     ) -> ToolResult:
-        saved: list[Path] = []
+        saved: list[str] = []
         assert_active()
         for data, kind in zip(made.images, kinds, strict=True):
-            target = self._target(filename, prompt, kind)
             try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("xb") as handle:
-                    handle.write(data)
-            except OSError as exc:
+                written = self.ctx.generated.save(
+                    data, name=self._name(filename, prompt, kind), media_type=kind, folder="images"
+                )
+            except (OSError, MediaRefused) as exc:
                 if not saved:
                     return ToolResult.error(f"made by {vendor} but not saved: {exc}")
                 break
-            saved.append(target)
+            saved.append(written.relative)
         who = vendor + (f" ({made.model})" if made.model else "")
         total = sum(len(data) for data in made.images[: len(saved)])
         what = "picture" if len(saved) == 1 else f"{len(saved)} pictures"
         line = f"[{what} made by {who}, {', '.join(dict.fromkeys(kinds))}, {_human(total)}]"
-        line += " saved to " + ", ".join(self._shown(path) for path in saved)
+        line += " saved to " + ", ".join(saved)
         if len(saved) < asked:
             line += f"; {asked} were asked for"
         if passed:
@@ -1499,13 +1501,12 @@ class ImageGenerate(Tool):
         envelope = wrap_open("", source=host)
         return ImageResult(content=line, images=tuple(blocks), envelope=envelope, wrapped=True)
 
-    def _target(self, filename: str, prompt: str, media_type: str) -> Path:
-        """Where a picture goes: `output_dir`, under the basename of the
+    def _name(self, filename: str, prompt: str, media_type: str) -> str:
+        """What a picture is called in `media/images/`: the basename of the
         `filename` hint (OpenClaw's managed media dir), or a name made from the
-        time and the prompt. Never an existing file: a name already taken gets
-        `-2`, `-3`."""
+        time and the prompt. `ctx.generated.save` makes it safe and gives a
+        name already taken `-2`, `-3`, so a picture never lands on a file."""
         ext = EXTENSIONS.get(media_type, "png")
-        folder = inside(self.workspace, str(self.ctx.setting("output_dir", "images") or "images"))
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename.replace("\\", "/")).stem)
         stem = stem.strip(".-")[:80]
         if not stem:
@@ -1513,19 +1514,8 @@ class ImageGenerate(Tool):
             slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower()).strip("-")[:40].strip("-")
             stem = f"{stamp}-{slug or 'image'}"
         # Joined as text, not `with_suffix`: a stem with a dot in it ("v1.2")
-        # would lose its tail, and every `-n` would come back the same name.
-        target = folder / f"{stem}.{ext}"
-        n = 2
-        while target.exists():
-            target = folder / f"{stem}-{n}.{ext}"
-            n += 1
-        return target
-
-    def _shown(self, path: Path) -> str:
-        try:
-            return path.relative_to(self.workspace).as_posix()
-        except ValueError:
-            return str(path)
+        # would lose its tail.
+        return f"{stem}.{ext}"
 
 
 def _adjusted(shaped: Overrides, size: str) -> list[str]:

@@ -3,8 +3,8 @@ name: videogen
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
 logo: logo.svg
-version: "4.0.0"
-requires_ultron_sdk: ">=1.39,<2"
+version: "5.0.0"
+requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
 contracts:
@@ -34,10 +34,6 @@ config_schema:
     type: float
     default: 120
     description: "One request to a vendor - a submission, a status check or a download - 5 to 600 seconds, when the model gives no timeoutMs."
-  output_dir:
-    type: str
-    default: videos
-    description: "Where videos go, inside the workspace. A filename the model gives is a name in here."
   google_model:
     type: str
     default: veo-3.1-fast-generate-preview
@@ -57,9 +53,14 @@ what each takes. That is OpenClaw's split.
 /plugins install videogen
 ```
 
+**From 4.x:** videos are saved in `media/videos/` - the workspace's folder for what Ultron
+made (`ctx.generated`, SDK 1.43) - and the `output_dir` setting is gone. A `filename` is a
+name in `media/videos/`. Videos already in `videos/` stay where they are, and a job started
+before the upgrade lands in `media/videos/` under the name it was given.
+
 **From 3.x:** the arguments are OpenClaw's now. `first_frame` and `last_frame` are `images`
 with `imageRoles` (`first_frame`, `last_frame`, `reference_image`); `seconds` is
-`durationSeconds`, `aspect` is `aspectRatio`, `path` is `filename` - a name in `output_dir`
+`durationSeconds`, `aspect` is `aspectRatio`, `path` is `filename` - a name for the file
 that is never refused. `size`, `audio`, `watermark`, `providerOptions`, `timeoutMs`,
 reference videos and pictures by URL are new. `status` takes no `job` and no `wait`: it lists
 this session's jobs, as OpenClaw's shows the session's task. Veo takes one picture to start
@@ -90,7 +91,7 @@ Every field is optional but the prompt.
 | `video`, `videos` | Up to 4 videos to condition or extend; `videoRoles` the same, with `reference_video`. |
 | `audioRef`, `audioRefs`, `audioRoles` | Up to 3 sounds - shown to the model only when a vendor here takes them (none does yet). |
 | `model` | `provider/model` to ask first - below. |
-| `filename` | A name for the file, kept as its basename inside `output_dir`. |
+| `filename` | A name for the file, kept as its basename inside `media/videos/`. |
 | `size` | `1280x720`, `1920x1080` and so on. |
 | `aspectRatio` | `16:9`, `9:16`, `1:1`, or a vendor's own value. |
 | `resolution` | `480P`, `720P`, `1080P`, `4K`, or a vendor's own value. |
@@ -248,7 +249,7 @@ over for a reference picture or a video.
 2. **Follow.** The plugin asks the vendor every `poll_seconds`, in the background, for up to
    `max_minutes`. A status check that fails on the network or with a 5xx is tried again; five
    in a row, or a 4xx, ends the job.
-3. **Save.** The video is downloaded and written to `videos/<time>-<prompt>.mp4`, or under
+3. **Save.** The video is downloaded and written to `media/videos/<time>-<prompt>.mp4`, or under
    the `filename` the model gave - never over an existing file.
 4. **Tell.** The agent is woken - OpenClaw's completion event, `ctx.wake` (SDK 1.40) - with
    one line per finished job: which job, where it is, who made it, how big it is. It runs as a

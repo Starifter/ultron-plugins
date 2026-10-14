@@ -18,8 +18,8 @@ it, so a backend's object is touched in one place.
 
 A video takes minutes, so nothing waits for one. `video_generate` submits and
 returns a job id; a task the plugin owns follows the job, downloads the video
-and writes it into the workspace; the agent is woken to tell the person
-(`ctx.wake`, SDK 1.40), and where that cannot happen a `before_prompt` hook
+and writes it to `media/videos/` (`ctx.generated`, SDK 1.43); the agent is
+woken to tell the person (`ctx.wake`, SDK 1.40), and where that cannot happen a `before_prompt` hook
 tells the model on the session's next turn. The job belongs to the session, not to the call that
 started it - like a backgrounded `exec` - so the task runs in a context of its
 own, where an abort of the turn that submitted it cannot reach. Jobs are kept in
@@ -43,7 +43,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -1184,25 +1184,18 @@ class Videogen:
         )
 
     def _write(self, job: Job, data: bytes, media_type: str) -> str:
-        ext = EXTENSIONS[media_type]
-        named = inside(self.workspace, job.target)
-        # Joined as text, not `with_suffix`: a name with a dot in it ("v1.2")
+        """The video into `media/videos/` under the stem `_target` chose. Only
+        the stem is read, so a target written by an older version (`videos/...`)
+        lands here too. Something that took the name while the video was being
+        made keeps it: `save` writes beside it as `-2`, and never overwrites."""
+        named = PurePosixPath(job.target.replace("\\", "/")).name
+        # Cut as text, not `with_suffix`: a name with a dot in it ("v1.2")
         # would lose its tail.
-        stem = named.name.removesuffix(named.suffix)
-        target = named.parent / f"{stem}.{ext}"
-        n = 2
-        while True:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("xb") as handle:
-                    handle.write(data)
-                break
-            except FileExistsError:
-                # Something took the name while the video was being made; the
-                # file beside it is the video, and nothing is overwritten.
-                target = named.parent / f"{stem}-{n}.{ext}"
-                n += 1
-        return target.relative_to(self.workspace).as_posix()
+        stem = named.removesuffix(PurePosixPath(named).suffix) or "video"
+        saved = self.ctx.generated.save(
+            data, name=f"{stem}.{EXTENSIONS[media_type]}", media_type=media_type, folder="videos"
+        )
+        return saved.relative
 
     def _end(
         self,
@@ -1726,7 +1719,7 @@ class VideoGenerate(Tool):
             },
             "filename": {
                 "type": "string",
-                "description": "Output filename hint; basename preserved in managed media dir.",
+                "description": "Output filename hint; basename preserved in media/videos/.",
             },
             "size": {"type": "string", "description": "Size hint, e.g. 1280x720, 1920x1080."},
             "aspectRatio": {
@@ -2001,13 +1994,11 @@ class VideoGenerate(Tool):
 
     def _target(self, filename: str, prompt: str) -> str:
         """Where the video will go, decided now so the result can say so:
-        `output_dir`, under the basename of the `filename` hint (OpenClaw's
+        `media/videos/`, under the basename of the `filename` hint (OpenClaw's
         managed media dir) or a name made from the time and the prompt. A name
         already taken, or claimed by a running job, gets `-2`, `-3`."""
         reserved = self.runner.reserved()
-        folder = inside(
-            self.workspace, str(self.runner.ctx.setting("output_dir", "videos") or "videos")
-        )
+        folder = self.runner.ctx.generated.folder("videos").resolve()
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename.replace("\\", "/")).stem)
         stem = stem.strip(".-")[:80]
         if not stem:

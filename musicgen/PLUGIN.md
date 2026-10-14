@@ -3,8 +3,8 @@ name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
 logo: logo.svg
-version: "3.0.0"
-requires_ultron_sdk: ">=1.39,<2"
+version: "4.0.0"
+requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
 contracts:
@@ -26,10 +26,6 @@ config_schema:
     type: float
     default: 300
     description: "One attempt at one vendor, 30 to 900 seconds. A full song takes a minute or two."
-  output_dir:
-    type: str
-    default: music
-    description: "Where tracks go, inside the workspace. A filename the model gives is a name in here."
   google_model:
     type: str
     default: lyria-3.5
@@ -41,17 +37,21 @@ config_schema:
 One tool, OpenClaw's `music_generate` - field for field - with three actions. `generate`
 (the default) hands a prompt, and optionally lyrics, a length, a format and pictures to set
 the mood, to a music vendor and returns at once with a job id. The track is made in the
-background and saved in the workspace when it is ready, usually in under two minutes, and the
-agent is woken to tell you. `status` lists this session's jobs, with the lyrics a vendor sang;
-`list` shows the vendors and their models. That is OpenClaw's split.
+background and saved in the workspace's `media/music/` when it is ready, usually in under
+two minutes, and the agent is woken to tell you. `status` lists this session's jobs, with the
+lyrics a vendor sang; `list` shows the vendors and their models. That is OpenClaw's split.
 
 ```
 /plugins install musicgen
 ```
 
+**From 3.x:** tracks are saved in `media/music/`, the workspace's folder for what a plugin
+made (SDK 1.43), and the `output_dir` setting is gone - a `filename` the model gives is a name
+in there. Tracks already saved under `music/` stay where they are. It needs SDK 1.43.
+
 **From 2.x:** the arguments are OpenClaw's now. `seconds` is `durationSeconds`, with no
 range of its own - a vendor shortens it to its longest, or drops it; `path` is `filename`, a
-name in `output_dir` that is never refused. `format` (mp3 or wav), `image` and pictures by URL
+name in `media/music/` that is never refused. `format` (mp3 or wav), `image` and pictures by URL
 are new, and lyrics with an instrumental are no longer refused. `status` takes no `job` and no
 `wait`: it lists this session's jobs, with their lyrics. Lyria takes no length, as OpenClaw has
 it, so a length asked of Google is dropped and said. A backend from before 3.0 still works
@@ -81,7 +81,7 @@ Every field is optional but the prompt.
 | `model` | `provider/model` to ask first - below. |
 | `durationSeconds` | How long; a vendor may shorten it. |
 | `format` | mp3 or wav. |
-| `filename` | A name for the file, kept as its basename inside `output_dir`. |
+| `filename` | A name for the file, kept as its basename inside `media/music/`. |
 
 ### What a vendor cannot take
 
@@ -195,7 +195,7 @@ dropped and said. Its request still has `seconds`.
    written to, and what was changed to fit.
 2. **Make.** The call to the vendor runs in a task of the session's, never of the turn's - a
    turn stopped after it started the job does not stop the track it paid for.
-3. **Save.** The track is written to `music/<time>-<prompt>.mp3`, or under the `filename`
+3. **Save.** The track is written to `media/music/<time>-<prompt>.mp3`, or under the `filename`
    the model gave, with the extension of what actually came back (MP3, WAV, FLAC, Ogg or M4A) - never
    over an existing file.
 4. **Tell.** The agent is woken - OpenClaw's completion event, `ctx.wake` (SDK 1.40) - with

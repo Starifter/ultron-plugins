@@ -328,14 +328,14 @@ async def test_the_job_is_followed_saved_audited_and_told_once(tmp_path: Path, w
     assert len(wire.to("GET", f"{GOOGLE}/{OPERATION}")) == 2, "running, then done"
     [download] = wire.to("GET", f"{GOOGLE}/files/")
     assert download["headers"] == {"x-goog-api-key": "AIza-g"}
-    [saved] = list((it.workspace / "videos").iterdir())
+    [saved] = list((it.workspace / "media" / "videos").iterdir())
     assert saved.read_bytes() == MP4 and saved.name.endswith("-waves.mp4")
     [record] = it.events("video")
     assert record.outcome == "ok" and record.arguments["job"] == job
     assert record.arguments["bytes"] == len(MP4) and record.arguments["media_type"] == "video/mp4"
     notice = it.runner.notices()
     assert notice == (
-        f"Note: video {job} is ready - saved to videos/{saved.name} "
+        f"Note: video {job} is ready - saved to media/videos/{saved.name} "
         f"(google (veo-3.1-fast-generate-preview), video/mp4, {len(MP4)} B)."
     )
     assert it.runner.notices() == "", "told once"
@@ -383,23 +383,25 @@ async def test_the_job_runs_outside_the_submitting_calls_authority(
     assert it.events("video")[0].outcome == "ok"
 
 
-async def test_a_filename_hint_keeps_its_basename_under_output_dir(
+async def test_a_filename_hint_keeps_its_basename_under_media_videos(
     tmp_path: Path, wire: Wire
 ) -> None:
     it = install(tmp_path)
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
     result = await call(it.generate, prompt="x", filename="../clips/intro.mp4")
-    assert "saved to videos/intro.mp4 when" in result.content
+    assert "saved to media/videos/intro.mp4 when" in result.content
     await it.settle()
-    assert (it.workspace / "videos" / "intro.webm").read_bytes() == WEBM
+    assert (it.workspace / "media" / "videos" / "intro.webm").read_bytes() == WEBM
 
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=MP4))
     wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
-    (it.workspace / "videos" / "taken.mp4").write_bytes(b"mine")
+    (it.workspace / "media" / "videos" / "taken.mp4").write_bytes(b"mine")
     taken = await call(it.generate, prompt="x", filename="taken.mp4")
-    assert "saved to videos/taken-2.mp4 when" in taken.content, "a hint is never refused"
+    assert "saved to media/videos/taken-2.mp4 when" in taken.content, "a hint is never refused"
     claimed = await call(it.generate, prompt="x", filename="taken.mp4")
-    assert "saved to videos/taken-3.mp4 when" in claimed.content, "a running job's name is held"
+    assert "saved to media/videos/taken-3.mp4 when" in claimed.content, (
+        "a running job's name is held"
+    )
     it.runner.close()
 
 
@@ -408,11 +410,11 @@ async def test_something_taking_the_name_meanwhile_is_never_overwritten(
 ) -> None:
     it = install(tmp_path)
     await call(it.generate, prompt="x", filename="clip.mp4")
-    (it.workspace / "videos").mkdir(exist_ok=True)
-    (it.workspace / "videos" / "clip.mp4").write_bytes(b"mine")
+    (it.workspace / "media" / "videos").mkdir(parents=True, exist_ok=True)
+    (it.workspace / "media" / "videos" / "clip.mp4").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "videos" / "clip.mp4").read_bytes() == b"mine"
-    assert (it.workspace / "videos" / "clip-2.mp4").read_bytes() == MP4
+    assert (it.workspace / "media" / "videos" / "clip.mp4").read_bytes() == b"mine"
+    assert (it.workspace / "media" / "videos" / "clip-2.mp4").read_bytes() == MP4
 
 
 async def test_a_name_taken_under_another_extension_is_not_offered(
@@ -422,25 +424,27 @@ async def test_a_name_taken_under_another_extension_is_not_offered(
     holds it as any video type - else the result names intro.mp4 and the save,
     finding intro.webm taken, writes intro-2.webm."""
     it = install(tmp_path)
-    (it.workspace / "videos").mkdir()
-    (it.workspace / "videos" / "intro.webm").write_bytes(b"mine")
+    (it.workspace / "media" / "videos").mkdir(parents=True)
+    (it.workspace / "media" / "videos" / "intro.webm").write_bytes(b"mine")
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
     result = await call(it.generate, prompt="x", filename="intro.mp4")
-    assert "saved to videos/intro-2.mp4 when" in result.content
+    assert "saved to media/videos/intro-2.mp4 when" in result.content
     await it.settle()
-    assert (it.workspace / "videos" / "intro-2.webm").read_bytes() == WEBM
-    assert (it.workspace / "videos" / "intro.webm").read_bytes() == b"mine"
-    assert "saved to videos/intro-2.webm" in (await call(it.generate, action="status")).content
+    assert (it.workspace / "media" / "videos" / "intro-2.webm").read_bytes() == WEBM
+    assert (it.workspace / "media" / "videos" / "intro.webm").read_bytes() == b"mine"
+    assert (
+        "saved to media/videos/intro-2.webm" in (await call(it.generate, action="status")).content
+    )
 
 
 async def test_a_dotted_name_keeps_its_dots_when_saved(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
     wire.on("GET", f"{GOOGLE}/files/", Response(raw=WEBM))
     await call(it.generate, prompt="x", filename="cut.v1.2.mp4")
-    (it.workspace / "videos").mkdir(exist_ok=True)
-    (it.workspace / "videos" / "cut.v1.2.webm").write_bytes(b"mine")
+    (it.workspace / "media" / "videos").mkdir(parents=True, exist_ok=True)
+    (it.workspace / "media" / "videos" / "cut.v1.2.webm").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "videos" / "cut.v1.2-2.webm").read_bytes() == WEBM
+    assert (it.workspace / "media" / "videos" / "cut.v1.2-2.webm").read_bytes() == WEBM
 
 
 async def test_an_image_goes_to_google_inline(tmp_path: Path, wire: Wire) -> None:
@@ -700,7 +704,7 @@ async def test_bytes_that_are_not_a_video_are_refused(tmp_path: Path, wire: Wire
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     assert "not an MP4, MOV or WebM video" in await status_of(it, job)
-    assert not (it.workspace / "videos").exists()
+    assert not (it.workspace / "media" / "videos").exists()
 
 
 async def test_google_never_sends_its_key_to_a_host_it_did_not_choose(
@@ -739,7 +743,7 @@ async def test_a_finished_video_wakes_the_agent_with_facts_only(tmp_path: Path, 
     await it.woken()
     [(plugin, text)] = waker.texts
     assert plugin == "videogen"
-    assert text.startswith(f"Note: video {job} is ready - saved to videos/")
+    assert text.startswith(f"Note: video {job} is ready - saved to media/videos/")
     assert text.endswith("Tell the person, briefly, and say where to find it.")
     assert it.runner.notices() == "", "the woken turn is not told again"
 
@@ -852,6 +856,34 @@ async def test_the_session_ending_stops_following_and_the_next_one_collects(
     assert f"video {job} is ready" in second.runner.notices()
 
 
+async def test_a_job_an_older_version_kept_lands_in_media_videos(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """Before 5.0 a job's target was in `output_dir` (`videos/` by default);
+    only its stem is read now, so the video it was paid for lands beside every
+    other one."""
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", Response({"name": OPERATION}))
+    first = install(tmp_path)
+    job = job_id(await call(first.generate, prompt="waves", filename="old.mp4"))
+    await asyncio.sleep(0)
+    first.runner.close()
+    await asyncio.sleep(0)
+    path = first.workspace / ".ultron" / "videogen" / "jobs.json"
+    kept = json.loads(path.read_text(encoding="utf-8"))
+    [entry] = kept["jobs"]
+    assert entry["target"] == "media/videos/old.mp4"
+    entry["target"] = "videos/old.mp4"
+    path.write_text(json.dumps(kept), encoding="utf-8")
+
+    wire.on("GET", f"{GOOGLE}/{OPERATION}", google_done())
+    second = install(tmp_path)
+    second.runner.resume()
+    await second.settle()
+    assert (second.workspace / "media" / "videos" / "old.mp4").read_bytes() == MP4
+    assert not (second.workspace / "videos").exists()
+    assert f"{job}: saved to media/videos/old.mp4" in await status_of(second, job)
+
+
 async def test_another_sessions_job_is_neither_resumed_nor_shown(
     tmp_path: Path, wire: Wire
 ) -> None:
@@ -884,7 +916,7 @@ async def test_status_says_how_a_job_ended_and_then_no_notice_repeats_it(
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     status = await call(it.status)
-    assert status.content.startswith(f"{job}: saved to videos/")
+    assert status.content.startswith(f"{job}: saved to media/videos/")
     assert it.runner.notices() == ""
 
 

@@ -358,21 +358,21 @@ async def test_the_track_is_saved_audited_and_told_once_and_the_lyrics_held(
     it = install(tmp_path)
     job = job_id(await call(it.generate, prompt="waves"))
     await it.settle()
-    [saved] = list((it.workspace / "music").iterdir())
+    [saved] = list((it.workspace / "media" / "music").iterdir())
     assert saved.read_bytes() == MP3 and saved.name.endswith("-waves.mp3")
     [record] = it.events("music")
     assert record.outcome == "ok" and record.arguments["job"] == job
     assert record.arguments["bytes"] == len(MP3) and record.arguments["media_type"] == "audio/mpeg"
     notice = it.runner.notices()
     assert notice == (
-        f"Note: music {job} is ready - saved to music/{saved.name} "
+        f"Note: music {job} is ready - saved to media/music/{saved.name} "
         f"(google (lyria-3.5), audio/mpeg, {len(MP3)} B). "
         f"music_generate status {job} has the lyrics."
     )
     assert "sun on the water" not in notice
     assert it.runner.notices() == "", "told once"
     status = await call(it.status)
-    assert status.content.startswith(f"{job}: saved to music/{saved.name}")
+    assert status.content.startswith(f"{job}: saved to media/music/{saved.name}")
     assert "What google said with it:\n[Verse]\nsun on the water" in status.content
     assert "sun on the water" not in json.dumps(it.jobs()), "lyrics never reach the disk"
     assert not list(it.workspace.rglob("*.txt"))
@@ -426,30 +426,30 @@ async def test_a_filename_hint_keeps_its_basename_and_takes_the_real_extension(
     it = install(tmp_path)
     wire.on("POST", INTERACTIONS, lyria(WAV, text=""))
     result = await call(it.generate, prompt="x", filename="songs/theme.mp3")
-    assert "saved to music/theme.mp3 when" in result.content
+    assert "saved to media/music/theme.mp3 when" in result.content
     await it.settle()
-    assert (it.workspace / "music" / "theme.wav").read_bytes() == WAV
+    assert (it.workspace / "media" / "music" / "theme.wav").read_bytes() == WAV
     assert not (it.workspace / "songs").exists()
     assert "has the lyrics" not in it.runner.notices()
 
 
 async def test_a_filename_hint_is_never_refused(tmp_path: Path, wire: Wire) -> None:
-    """OpenClaw's managed media dir: the basename under `output_dir`, a taken
+    """OpenClaw's managed media dir: the basename under `media/music/`, a taken
     name numbered, the suffix the format's or .mp3."""
     it = install(tmp_path)
-    (it.workspace / "music").mkdir()
-    (it.workspace / "music" / "taken.mp3").write_bytes(b"x")
+    (it.workspace / "media" / "music").mkdir(parents=True)
+    (it.workspace / "media" / "music" / "taken.mp3").write_bytes(b"x")
     for arguments, target in (
-        ({"filename": "taken"}, "music/taken-2.mp3"),
-        ({"filename": "/etc/song.mp3", "prompt": "a"}, "music/song.mp3"),
-        ({"filename": "..\\..\\escape.wav", "prompt": "b"}, "music/escape.mp3"),
-        ({"filename": "theme", "format": "wav", "prompt": "c"}, "music/theme.wav"),
+        ({"filename": "taken"}, "media/music/taken-2.mp3"),
+        ({"filename": "/etc/song.mp3", "prompt": "a"}, "media/music/song.mp3"),
+        ({"filename": "..\\..\\escape.wav", "prompt": "b"}, "media/music/escape.mp3"),
+        ({"filename": "theme", "format": "wav", "prompt": "c"}, "media/music/theme.wav"),
     ):
         result = await call(it.generate, **{"prompt": "x", **arguments})
         assert not result.is_error, result.content
         assert f"saved to {target} when" in result.content, result.content
         await it.settle()
-    assert (it.workspace / "music" / "taken.mp3").read_bytes() == b"x"
+    assert (it.workspace / "media" / "music" / "taken.mp3").read_bytes() == b"x"
     assert not (tmp_path / "escape.mp3").exists()
 
 
@@ -458,11 +458,15 @@ async def test_something_taking_the_name_meanwhile_is_never_overwritten(
 ) -> None:
     it = install(tmp_path)
     await call(it.generate, prompt="x", filename="song.mp3")
-    (it.workspace / "music").mkdir(exist_ok=True)
-    (it.workspace / "music" / "song.mp3").write_bytes(b"mine")
+    (it.workspace / "media" / "music").mkdir(parents=True, exist_ok=True)
+    (it.workspace / "media" / "music" / "song.mp3").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "music" / "song.mp3").read_bytes() == b"mine"
-    assert (it.workspace / "music" / "song-2.mp3").read_bytes() == MP3
+    assert (it.workspace / "media" / "music" / "song.mp3").read_bytes() == b"mine"
+    assert (it.workspace / "media" / "music" / "song-2.mp3").read_bytes() == MP3
+    [job] = it.jobs()
+    assert job["target"] == "media/music/song.mp3"
+    assert job["saved"] == "media/music/song-2.mp3"
+    assert not (it.workspace / "music").exists(), "the old folder is never written"
 
 
 async def test_a_name_taken_under_another_extension_is_not_offered(
@@ -472,23 +476,23 @@ async def test_a_name_taken_under_another_extension_is_not_offered(
     holds it as any audio type - else the result names theme.mp3 and the save,
     finding theme.wav taken, writes theme-2.wav."""
     it = install(tmp_path)
-    (it.workspace / "music").mkdir()
-    (it.workspace / "music" / "theme.wav").write_bytes(b"mine")
+    (it.workspace / "media" / "music").mkdir(parents=True)
+    (it.workspace / "media" / "music" / "theme.wav").write_bytes(b"mine")
     wire.on("POST", INTERACTIONS, lyria(WAV, text=""))
     result = await call(it.generate, prompt="x", filename="theme")
-    assert "saved to music/theme-2.mp3 when" in result.content
+    assert "saved to media/music/theme-2.mp3 when" in result.content
     await it.settle()
-    assert (it.workspace / "music" / "theme-2.wav").read_bytes() == WAV
-    assert (it.workspace / "music" / "theme.wav").read_bytes() == b"mine"
+    assert (it.workspace / "media" / "music" / "theme-2.wav").read_bytes() == WAV
+    assert (it.workspace / "media" / "music" / "theme.wav").read_bytes() == b"mine"
 
 
 async def test_a_dotted_name_keeps_its_dots_when_saved(tmp_path: Path, wire: Wire) -> None:
     it = install(tmp_path)
     await call(it.generate, prompt="x", filename="mix.v1.2.mp3")
-    (it.workspace / "music").mkdir(exist_ok=True)
-    (it.workspace / "music" / "mix.v1.2.mp3").write_bytes(b"mine")
+    (it.workspace / "media" / "music").mkdir(parents=True, exist_ok=True)
+    (it.workspace / "media" / "music" / "mix.v1.2.mp3").write_bytes(b"mine")
     await it.settle()
-    assert (it.workspace / "music" / "mix.v1.2-2.mp3").read_bytes() == MP3
+    assert (it.workspace / "media" / "music" / "mix.v1.2-2.mp3").read_bytes() == MP3
 
 
 async def test_pictures_go_to_google_inline(tmp_path: Path, wire: Wire) -> None:
@@ -774,7 +778,7 @@ async def test_bytes_that_are_not_audio_are_refused_and_not_passed_on(
     status = await call(it.status)
     assert "not MP3, WAV, FLAC, Ogg or M4A audio" in status.content
     assert [r.arguments["vendor"] for r in it.events("generate")] == ["google"]
-    assert not (it.workspace / "music").exists()
+    assert not (it.workspace / "media" / "music").exists()
 
 
 # -- openrouter, the backend that ships in this marketplace ---------------------
@@ -862,7 +866,7 @@ async def test_status_tells_the_job_so_no_notice_repeats_it(tmp_path: Path, wire
     job = job_id(await call(it.generate, prompt="x"))
     await it.settle()
     status = await call(it.status)
-    assert status.content.startswith(f"{job}: saved to music/")
+    assert status.content.startswith(f"{job}: saved to media/music/")
     assert it.runner.notices() == ""
 
 
@@ -874,7 +878,7 @@ async def test_status_shows_what_the_vendor_was_sent_instead_and_the_lyrics(
     await it.settle()
     status = (await call(it.status)).content
     first = status.splitlines()[0]
-    assert first.startswith(f"{job}: saved to music/")
+    assert first.startswith(f"{job}: saved to media/music/")
     assert first.endswith(". Ignored, not supported: durationSeconds=45.")
     assert status.endswith("What google said with it:\n[Verse]\nsun on the water")
     [kept] = it.jobs()
@@ -912,7 +916,7 @@ async def test_a_finished_track_wakes_the_agent_with_facts_only(tmp_path: Path, 
     await woken(it)
     [(plugin, text)] = waker.texts
     assert plugin == "musicgen"
-    assert text.startswith(f"Note: music {job} is ready - saved to music/")
+    assert text.startswith(f"Note: music {job} is ready - saved to media/music/")
     assert "music_generate status" in text and "sun on the water" not in text
     assert text.endswith("Tell the person, briefly, and say where to find it.")
     assert it.runner.notices() == "", "the woken turn is not told again"

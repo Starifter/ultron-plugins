@@ -214,9 +214,9 @@ async def test_openai_makes_it_it_is_saved_stored_and_shown(tmp_path: Path, wire
     tool, auditor, workspace = installed(tmp_path)
     result = await call(tool, prompt="A Red Square!", aspectRatio="2:3")
     assert not result.is_error, result.content
-    [saved] = list((workspace / "images").iterdir())
+    [saved] = list((workspace / "media" / "images").iterdir())
     assert saved.read_bytes() == PNG and saved.name.endswith("-a-red-square.png")
-    assert f"saved to images/{saved.name}" in result.content
+    assert f"saved to media/images/{saved.name}" in result.content
     assert "[picture made by openai (gpt-image-2), image/png" in result.content
     assert "size 1024x1536 was used for aspectRatio." in result.content
     assert len(result.images) == 1 and result.images[0].source == "made by openai"
@@ -307,7 +307,7 @@ async def test_bytes_that_are_not_a_picture_are_refused(
     tool, _, workspace = installed(tmp_path)
     result = await call(tool, prompt="x")
     assert result.is_error and "not a PNG" in result.content
-    assert not (workspace / "images").exists()
+    assert not (workspace / "media" / "images").exists()
 
 
 async def test_status_says_nothing_is_running(tmp_path: Path, wire: Wire) -> None:
@@ -333,12 +333,12 @@ async def test_two_from_openai_are_two_files_and_two_pictures(
     result = await call(tool, prompt="a fox", count=2)
     assert not result.is_error, result.content
     assert wire.sent[0]["json"]["n"] == 2
-    saved = sorted((workspace / "images").iterdir(), key=lambda path: len(path.name))
+    saved = sorted((workspace / "media" / "images").iterdir(), key=lambda path: len(path.name))
     assert len(saved) == 2 and {path.read_bytes() for path in saved} == {PNG, BLUE}
     assert saved[0].name.endswith("-a-fox.png")
     assert saved[1].name == saved[0].name.replace(".png", "-2.png")
     assert result.content.startswith("[2 pictures made by openai (gpt-image-2), image/png")
-    assert all(f"images/{path.name}" in result.content for path in saved)
+    assert all(f"media/images/{path.name}" in result.content for path in saved)
     assert len(result.images) == 2
     [record] = generated(auditor)
     assert record.arguments["count"] == 2 and len(record.arguments["made"]) == 2
@@ -356,7 +356,7 @@ async def test_google_hands_back_every_picture_it_sent(
     tool, _, workspace = installed(tmp_path, keys=GOOGLE_ONLY)
     result = await call(tool, prompt="x", count=2)
     assert not result.is_error, result.content
-    assert len(result.images) == 2 and len(list((workspace / "images").iterdir())) == 2
+    assert len(result.images) == 2 and len(list((workspace / "media" / "images").iterdir())) == 2
 
 
 async def test_count_over_the_named_vendors_limit_is_refused_before_anything_is_spent(
@@ -368,7 +368,7 @@ async def test_count_over_the_named_vendors_limit_is_refused_before_anything_is_
     assert result.is_error
     assert result.content == "acme generate supports at most 1 output image."
     assert wire.sent == [] and generated(auditor) == [] and asked(auditor) == []
-    assert not (workspace / "images").exists()
+    assert not (workspace / "media" / "images").exists()
 
 
 async def test_count_over_the_configured_vendors_limit_is_refused_too(
@@ -388,7 +388,7 @@ async def test_count_is_clamped_for_a_vendor_nobody_named(tmp_path: Path, wire: 
     assert "made by acme (acme-1)" in result.content and "; 2 were asked for" in result.content
     [record] = asked(auditor)
     assert record.arguments["count"] == 1
-    assert len(list((workspace / "images").iterdir())) == 1
+    assert len(list((workspace / "media" / "images").iterdir())) == 1
 
 
 # -- normalization: what a vendor takes -----------------------------------------
@@ -655,18 +655,18 @@ async def test_with_no_key_at_all_every_vendor_says_what_it_is_missing(
 # -- where it goes --------------------------------------------------------------
 
 
-async def test_a_filename_is_a_basename_in_the_output_dir_and_never_overwrites(
+async def test_a_filename_is_a_basename_in_media_images_and_never_overwrites(
     tmp_path: Path, wire: Wire
 ) -> None:
     tool, _, workspace = installed(tmp_path)
     first = await call(tool, prompt="x", filename="art/logo.jpg")
-    assert "saved to images/logo.png" in first.content, "the real type's extension"
-    (workspace / "images" / "logo.png").write_bytes(b"mine")
+    assert "saved to media/images/logo.png" in first.content, "the real type's extension"
+    (workspace / "media" / "images" / "logo.png").write_bytes(b"mine")
     again = await call(tool, prompt="x", filename="logo.png")
-    assert "saved to images/logo-2.png" in again.content
-    assert (workspace / "images" / "logo.png").read_bytes() == b"mine"
+    assert "saved to media/images/logo-2.png" in again.content
+    assert (workspace / "media" / "images" / "logo.png").read_bytes() == b"mine"
     escaped = await call(tool, prompt="x", filename="../../evil.png")
-    assert "saved to images/evil.png" in escaped.content
+    assert "saved to media/images/evil.png" in escaped.content
     assert not (tmp_path / "evil.png").exists()
 
 
@@ -675,17 +675,21 @@ async def test_a_filename_with_dots_keeps_them_and_still_never_overwrites(
 ) -> None:
     tool, _, workspace = installed(tmp_path)
     first = await call(tool, prompt="x", filename="cover.v1.2.png")
-    assert "saved to images/cover.v1.2.png" in first.content
+    assert "saved to media/images/cover.v1.2.png" in first.content
     again = await call(tool, prompt="x", filename="cover.v1.2.png")
-    assert "saved to images/cover.v1.2-2.png" in again.content
-    assert len(list((workspace / "images").iterdir())) == 2
+    assert "saved to media/images/cover.v1.2-2.png" in again.content
+    assert len(list((workspace / "media" / "images").iterdir())) == 2
 
 
-async def test_output_dir_moves_where_pictures_go(tmp_path: Path, wire: Wire) -> None:
-    tool, _, workspace = installed(tmp_path, settings={"output_dir": "art/out"})
-    result = await call(tool, prompt="x", filename="cat")
-    assert "saved to art/out/cat.png" in result.content
-    assert (workspace / "art" / "out" / "cat.png").read_bytes() == PNG
+async def test_pictures_go_to_media_images_and_output_dir_is_gone(
+    tmp_path: Path, wire: Wire
+) -> None:
+    assert "output_dir" not in MANIFEST.config_schema
+    tool, _, workspace = installed(tmp_path)
+    result = await call(tool, prompt="x", filename="sub/dir/cat")
+    assert "saved to media/images/cat.png" in result.content
+    assert (workspace / "media" / "images" / "cat.png").read_bytes() == PNG
+    assert not (workspace / "images").exists() and not (workspace / "sub").exists()
 
 
 async def test_with_pictures_off_it_is_saved_and_not_shown(tmp_path: Path, wire: Wire) -> None:
@@ -693,7 +697,7 @@ async def test_with_pictures_off_it_is_saved_and_not_shown(tmp_path: Path, wire:
     result = await call(tool, prompt="x")
     assert not result.is_error and not getattr(result, "images", ())
     assert "Pictures are off here" in result.content
-    assert len(list((workspace / "images").iterdir())) == 1
+    assert len(list((workspace / "media" / "images").iterdir())) == 1
 
 
 async def test_timeout_ms_is_the_attempts_timeout(tmp_path: Path, wire: Wire) -> None:
@@ -856,7 +860,7 @@ async def test_a_backend_another_plugin_registered_is_asked_after_the_built_ins(
     assert "passed over openai: no openai key" in result.content
     assert "google: no google key" in result.content
     assert 'source="api.acme.test"' in result.envelope[0]
-    [saved] = list((workspace / "images").iterdir())
+    [saved] = list((workspace / "media" / "images").iterdir())
     assert saved.read_bytes() == PNG
     [record] = generated(auditor)
     assert record.arguments["vendor"] == "acme" and record.detail == "$0.01"
@@ -894,7 +898,7 @@ async def test_a_backend_may_hand_back_several_pictures(tmp_path: Path, wire: Wi
     result = await call(tool, prompt="x", count=2)
     assert not result.is_error, result.content
     assert "[2 pictures made by acme (acme-2)" in result.content
-    assert {path.read_bytes() for path in (workspace / "images").iterdir()} == {PNG, BLUE}
+    assert {path.read_bytes() for path in (workspace / "media" / "images").iterdir()} == {PNG, BLUE}
     assert asked(auditor)[0].arguments["count"] == 2
 
 
@@ -934,7 +938,7 @@ async def test_a_backend_that_fails_is_passed_over_and_named(
     tool, _, _, workspace = session(tmp_path, "acme")
     result = await call(tool, prompt="x")
     assert result.is_error and said in result.content, result.content
-    assert not (workspace / "images").exists()
+    assert not (workspace / "media" / "images").exists()
 
 
 async def test_a_backend_named_for_a_built_in_stands_in_for_it(tmp_path: Path, wire: Wire) -> None:

@@ -41,7 +41,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -809,25 +809,20 @@ class Musicgen:
         )
 
     def _write(self, job: Job, data: bytes, media_type: str) -> str:
-        ext = EXTENSIONS[media_type]
-        named = inside(self.workspace, job.target)
-        # Joined as text, not `with_suffix`: a name with a dot in it ("v1.2")
+        """The track in `media/music/` under the name `_target` chose, with the
+        extension of what came back. A job an older version left behind may
+        name another folder; only its stem is kept. Something that took the
+        name while the track was being made keeps it - `save` writes `-2`
+        beside it and never over it."""
+        named = PurePosixPath(job.target.replace("\\", "/")).name
+        # Cut as text, not `with_suffix`: a name with a dot in it ("v1.2")
         # would lose its tail.
-        stem = named.name.removesuffix(named.suffix)
-        target = named.parent / f"{stem}.{ext}"
-        n = 2
-        while True:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                with target.open("xb") as handle:
-                    handle.write(data)
-                break
-            except FileExistsError:
-                # Something took the name while the track was being made; the
-                # file beside it is the track, and nothing is overwritten.
-                target = named.parent / f"{stem}-{n}.{ext}"
-                n += 1
-        return target.relative_to(self.workspace).as_posix()
+        stem = named.removesuffix(PurePosixPath(named).suffix) or "music"
+        ext = EXTENSIONS[media_type]
+        saved = self.ctx.generated.save(
+            data, name=f"{stem}.{ext}", media_type=media_type, folder="music"
+        )
+        return saved.relative
 
     def _end(
         self,
@@ -1160,7 +1155,7 @@ class MusicGenerate(Tool):
                 },
                 "filename": {
                     "type": "string",
-                    "description": "Output filename hint; basename preserved in managed media dir.",
+                    "description": "Output filename hint; basename preserved in media/music/.",
                 },
             },
         }
@@ -1332,14 +1327,12 @@ class MusicGenerate(Tool):
 
     def _target(self, filename: str, prompt: str, format: str = "") -> str:
         """Where the track will go, decided now so the result can say so:
-        `output_dir`, under the basename of the `filename` hint (OpenClaw's
+        `media/music/`, under the basename of the `filename` hint (OpenClaw's
         managed media dir) or a name made from the time and the prompt. A name
         already taken, or claimed by a running job, gets `-2`, `-3`. The real
         extension is the audio's own, set when it is saved."""
         reserved = self.runner.reserved()
-        folder = inside(
-            self.workspace, str(self.runner.ctx.setting("output_dir", "music") or "music")
-        )
+        folder = self.runner.ctx.generated.folder("music").resolve()
         stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(filename.replace("\\", "/")).stem)
         stem = stem.strip(".-")[:80]
         if not stem:
