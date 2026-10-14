@@ -2,6 +2,7 @@
 name: imagegen
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
+logo: logo.svg
 version: "4.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [openai, google]

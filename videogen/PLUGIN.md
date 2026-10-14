@@ -2,6 +2,7 @@
 name: videogen
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
+logo: logo.svg
 version: "4.0.0"
 requires_ultron_sdk: ">=1.39,<2"
 vendor_credentials: [google]
