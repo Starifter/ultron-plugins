@@ -186,6 +186,8 @@ def test_the_schema_is_openclaws_field_for_field(tmp_path: Path) -> None:
         "prompt",
         "image",
         "images",
+        "mask",
+        "dpi",
         "model",
         "filename",
         "size",
@@ -554,6 +556,127 @@ async def test_a_vendor_that_cannot_take_the_pictures_is_passed_over(
     assert wire.sent == []
 
 
+def rgba(width: int = 8, height: int = 8) -> bytes:
+    """A mask: transparent on the left half, where the picture may change."""
+    picture = Image.new("RGBA", (width, height), (0, 0, 0, 255))
+    picture.paste((0, 0, 0, 0), (0, 0, width // 2, height))
+    out = io.BytesIO()
+    picture.save(out, format="PNG")
+    return out.getvalue()
+
+
+async def test_a_mask_reaches_openai_beside_the_picture(tmp_path: Path, wire: Wire) -> None:
+    tool, auditor, workspace = installed(tmp_path)
+    (workspace / "in.png").write_bytes(PNG)
+    (workspace / "mask.png").write_bytes(rgba())
+    result = await call(tool, prompt="a koala here", image="in.png", mask="@mask.png")
+    assert not result.is_error, result.content
+    body: bytes = wire.sent[0]["data"]
+    assert wire.sent[0]["url"].endswith("/edits")
+    assert body.count(b'name="mask"; filename="mask.png"') == 1
+    assert body.count(rgba()) == 1 and body.count(PNG) == 1
+    [record] = generated(auditor)
+    assert record.arguments["mask"] is True and record.arguments["images"] == 1
+
+
+async def test_a_vendor_that_takes_no_mask_is_passed_over_not_sent_the_edit(
+    tmp_path: Path, wire: Wire
+) -> None:
+    tool, _, workspace = installed(tmp_path, keys=GOOGLE_ONLY)
+    (workspace / "in.png").write_bytes(PNG)
+    (workspace / "mask.png").write_bytes(rgba())
+    result = await call(tool, prompt="x", image="in.png", mask="mask.png")
+    assert result.is_error
+    assert "google: does not take a mask" in result.content
+    assert "openai: no openai key" in result.content
+    assert wire.sent == []
+
+
+async def test_a_mask_is_checked_before_anything_is_spent(tmp_path: Path, wire: Wire) -> None:
+    tool, _, workspace = installed(tmp_path)
+    (workspace / "in.png").write_bytes(PNG)
+    (workspace / "opaque.png").write_bytes(png())
+    (workspace / "big.png").write_bytes(rgba(16, 16))
+    (workspace / "photo.jpg").write_bytes(jpeg())
+    for mask, said in (
+        ("opaque.png", "must be a PNG with transparency"),
+        ("photo.jpg", "must be a PNG with transparency"),
+        ("big.png", "the mask is 16x16 and the picture 8x8"),
+    ):
+        result = await call(tool, prompt="x", image="in.png", mask=mask)
+        assert result.is_error and said in result.content, result.content
+    assert wire.sent == []
+
+
+async def test_list_says_who_takes_a_mask(tmp_path: Path, wire: Wire) -> None:
+    tool, _, _ = installed(tmp_path)
+    listing = (await call(tool, action="list")).content
+    openai_line = next(line for line in listing.splitlines() if line.startswith("- openai/"))
+    google_line = next(line for line in listing.splitlines() if line.startswith("- google/"))
+    assert "takes a mask" in openai_line and "takes a mask" not in google_line
+
+
+async def test_a_dropped_option_names_a_vendor_that_makes_it(tmp_path: Path, wire: Wire) -> None:
+    """The case that sent a model off to cut a background out by hand: the
+    vendor that answered makes no transparency, and the one that does had no
+    key. The result says so, outside the envelope, without building a vendor
+    nobody reached."""
+    tool, _, _ = installed(tmp_path, keys=GOOGLE_ONLY)
+    result = await call(tool, prompt="a logo", background="transparent", outputFormat="png")
+    assert not result.is_error, result.content
+    assert "Ignored, not supported: outputFormat=png, background=transparent." in result.content
+    assert (
+        "openai makes background=transparent, which was passed over: no openai key "
+        "(ultron auth add openai)." in result.content
+    )
+
+
+async def test_no_hint_when_nothing_reached_makes_it(tmp_path: Path, wire: Wire) -> None:
+    tool, _, _ = installed(tmp_path, keys=GOOGLE_ONLY, settings={"provider": "google"})
+    result = await call(tool, prompt="x", background="transparent")
+    assert "Ignored, not supported: background=transparent." in result.content
+    assert " makes background=" not in result.content
+
+
+async def test_dpi_tags_a_png_and_says_what_it_prints_at(tmp_path: Path, wire: Wire) -> None:
+    out = io.BytesIO()
+    Image.new("RGB", (1495, 1052), (210, 226, 224)).save(out, format="PNG", dpi=(72, 72))
+    made = out.getvalue()
+    wire.answers["openai"] = openai_reply(made)
+    tool, auditor, workspace = installed(tmp_path)
+    result = await call(tool, prompt="a poster", dpi=300)
+    assert not result.is_error, result.content
+    assert "Tagged 300 dpi: 1495x1052 px prints at 127 x 89 mm." in result.content
+    [saved] = list((workspace / "media" / "images").iterdir())
+    with Image.open(saved) as picture:
+        assert picture.info["dpi"][0] >= 300, "rounded up: never reads back as 299.99"
+        assert picture.size == (1495, 1052)
+        with Image.open(io.BytesIO(made)) as original:
+            assert picture.tobytes() == original.tobytes(), "no pixel touched"
+    [record] = generated(auditor)
+    assert record.arguments["made"][0]["bytes"] == len(made), "the trail holds what came back"
+
+
+def jpeg(width: int = 8, height: int = 8) -> bytes:
+    out = io.BytesIO()
+    Image.new("RGB", (width, height), (30, 30, 200)).save(out, format="JPEG")
+    return out.getvalue()
+
+
+async def test_dpi_tags_a_jpeg_and_names_a_format_it_cannot(tmp_path: Path, wire: Wire) -> None:
+    wire.answers["openai"] = openai_reply(jpeg())
+    tool, _, workspace = installed(tmp_path)
+    result = await call(tool, prompt="x", outputFormat="jpeg", dpi=600, filename="a.jpg")
+    assert not result.is_error, result.content
+    with Image.open(workspace / "media" / "images" / "a.jpg") as picture:
+        assert picture.info["dpi"] == (600, 600)
+    out = io.BytesIO()
+    Image.new("RGB", (8, 8)).save(out, format="WEBP")
+    wire.answers["openai"] = openai_reply(out.getvalue())
+    webp = await call(tool, prompt="x", outputFormat="webp", dpi=300)
+    assert "Not tagged, webp has no dpi: ask for png or jpeg." in webp.content
+
+
 async def test_an_edit_is_made_at_the_resolution_of_its_largest_picture(
     tmp_path: Path, wire: Wire
 ) -> None:
@@ -725,11 +848,13 @@ def test_validation_refuses_before_anything_runs(tmp_path: Path) -> None:
         ({"prompt": "x", "openai": {"outputCompression": 101}}, "between 0 and 100"),
         ({"prompt": "x", "count": 5}, "count must be between 1 and 4"),
         ({"prompt": "x", "timeoutMs": 0}, "timeoutMs must be a positive"),
+        ({"prompt": "x", "mask": "m.png"}, "a mask needs an image to edit"),
+        ({"prompt": "x", "dpi": 0}, "dpi"),
+        ({"prompt": "x", "dpi": 2401}, "dpi"),
     ):
         with pytest.raises(ToolError, match=match):
             tool.validate(arguments)
     for arguments in (
-        {"prompt": "x", "mask": "m.png"},
         {"prompt": "x", "path": "out.png"},
         {"prompt": "x", "aspect": "square"},
     ):
@@ -1098,7 +1223,7 @@ async def test_list_says_what_a_ready_openai_takes(tmp_path: Path, wire: Wire) -
     tool, _, _ = installed(tmp_path)
     lines = (await call(tool, action="list")).content.splitlines()
     assert lines[1].startswith(
-        "- openai/gpt-image-2: ready; edits up to 5, up to 4 at once, any size, "
+        "- openai/gpt-image-2: ready; edits up to 5, takes a mask, up to 4 at once, any size, "
         "quality low/medium/high/auto, outputFormat png/jpeg/webp, "
         "background transparent/opaque/auto; also "
     )

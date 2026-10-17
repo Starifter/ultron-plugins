@@ -47,6 +47,7 @@ import re
 import struct
 import time
 import uuid
+import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -174,6 +175,68 @@ def dimensions(data: bytes) -> tuple[int, int]:
     except (struct.error, ValueError):
         pass
     return 0, 0
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+MIN_DPI = 1
+MAX_DPI = 2400
+
+
+def has_alpha(data: bytes) -> bool:
+    """Whether a PNG carries transparency - an alpha channel (colour types 4
+    and 6) or a `tRNS` chunk - which is what makes it a mask."""
+    if not data.startswith(PNG_SIGNATURE) or len(data) < 26:
+        return False
+    return data[25] in (4, 6) or _png_chunk(data, b"tRNS") is not None
+
+
+def _png_chunk(data: bytes, kind: bytes) -> tuple[int, int] | None:
+    """Where a PNG chunk of `kind` starts and ends, or `None`."""
+    at = len(PNG_SIGNATURE)
+    while at + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[at : at + 4])
+        end = at + 12 + length
+        if data[at + 4 : at + 8] == kind:
+            return at, end
+        if data[at + 4 : at + 8] == b"IEND":
+            return None
+        at = end
+    return None
+
+
+def with_dpi(data: bytes, dpi: int) -> bytes | None:
+    """The same picture with its resolution tag set to `dpi`, or `None` for a
+    type that has no such tag (GIF, WebP). Only the tag changes: no pixel is
+    touched and nothing is re-encoded.
+
+    A PNG says pixels per metre. 300 dpi is 11811.02 of them, and the 11811 a
+    plain round writes reads back as 299.9994, which a print shop's checker
+    truncates to 299 and refuses. So it is rounded up: it reads back at least
+    what was asked."""
+    if data.startswith(PNG_SIGNATURE):
+        per_metre = math.ceil(dpi / 0.0254)
+        body = b"pHYs" + struct.pack(">IIB", per_metre, per_metre, 1)
+        chunk = struct.pack(">I", 9) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        found = _png_chunk(data, b"pHYs")
+        if found is not None:
+            return data[: found[0]] + chunk + data[found[1] :]
+        ihdr = _png_chunk(data, b"IHDR")
+        if ihdr is None:
+            return None
+        return data[: ihdr[1]] + chunk + data[ihdr[1] :]
+    if data.startswith(b"\xff\xd8"):
+        density = struct.pack(">BHH", 1, dpi, dpi)
+        if data[2:4] == b"\xff\xe0" and data[6:11] == b"JFIF\x00":
+            # The JFIF header's units and densities, in place.
+            return data[:13] + density + data[18:]
+        jfif = b"JFIF\x00\x01\x02" + density + b"\x00\x00"
+        return data[:2] + b"\xff\xe0" + struct.pack(">H", len(jfif) + 2) + jfif + data[2:]
+    return None
+
+
+def print_size(width: int, height: int, dpi: int) -> str:
+    """What `width` x `height` pixels come to on paper at `dpi`."""
+    return f"{width * 25.4 / dpi:.0f} x {height * 25.4 / dpi:.0f} mm"
 
 
 # -- geometry, OpenClaw's -------------------------------------------------------
@@ -437,9 +500,12 @@ class Source:
 class Request:
     """What one vendor is asked for, after its capabilities had their say.
 
-    `aspect` and `mask` are what a backend written for imagegen 3.x read; they
-    are always empty now, so such a backend makes its default shape and is
-    told about no mask."""
+    `aspect` is what a backend written for imagegen 3.x read; it is always
+    empty now, so such a backend makes its default shape. `mask` is a `Source`
+    again since 5.1 - a PNG the size of the first picture, transparent where it
+    may change - and reaches only a vendor whose `edit` capability says
+    `supports_mask`; every other vendor is passed over rather than sent the
+    edit without it, so a 3.x backend still only ever sees `None`."""
 
     __slots__ = (
         "aspect",
@@ -471,6 +537,7 @@ class Request:
         background: str = "",
         openai: Mapping[str, Any] | None = None,
         timeout: float = 120.0,
+        mask: Source | None = None,
     ) -> None:
         self.prompt = prompt
         self.images = images
@@ -484,7 +551,7 @@ class Request:
         self.openai = dict(openai or {})
         self.timeout = timeout
         self.aspect = ""
-        self.mask = None
+        self.mask = mask
 
 
 class Made:
@@ -673,7 +740,13 @@ class OpenAIImages:
             sizes = OPENAI_SIZES
         return {
             "generate": {"max_count": 4, **mode},
-            "edit": {"enabled": True, "max_count": 4, "max_input_images": 5, **mode},
+            "edit": {
+                "enabled": True,
+                "max_count": 4,
+                "max_input_images": 5,
+                "supports_mask": True,
+                **mode,
+            },
             "geometry": {"sizes": sizes, "fallback_sizes": OPENAI_SIZES},
             "output": {
                 "formats": OUTPUT_FORMATS,
@@ -753,6 +826,14 @@ class OpenAIImages:
                     "\r\n\r\n"
                 ).encode()
                 body += image.data
+                body += b"\r\n"
+            if request.mask is not None:
+                # OpenAI's: one PNG the size of the first picture, applied to it.
+                body += (
+                    f'--{boundary}\r\nContent-Disposition: form-data; name="mask"; '
+                    'filename="mask.png"\r\nContent-Type: image/png\r\n\r\n'
+                ).encode()
+                body += request.mask.data
                 body += b"\r\n"
             body += f"--{boundary}--\r\n".encode()
             response = await post(
@@ -1018,8 +1099,10 @@ class ImageGenerate(Tool):
             "result names the files; give the person those paths. A value a vendor cannot take "
             "is moved to its nearest or dropped, and the result says which. Transparent: "
             'outputFormat png|webp + background="transparent"; OpenAI also openai.background, '
-            "default gpt-image-1.5. Each picture costs money: no variations nobody asked for. "
-            "action=list providers/models/readiness; status active task."
+            "default gpt-image-1.5; not every vendor makes one, and action=list says which do. "
+            "Change one region only: mask. For print: dpi. Each picture costs money: no "
+            "variations nobody asked for. action=list providers/models/readiness; status active "
+            "task."
         )
 
     @property
@@ -1042,6 +1125,19 @@ class ImageGenerate(Tool):
                     "items": {"type": "string"},
                     "description": "Reference images for edit or style reference; max "
                     f"{MAX_REFERENCE_IMAGES}.",
+                },
+                "mask": {
+                    "type": "string",
+                    "description": "Mask path/URL for edit: a PNG the size of the first image, "
+                    "transparent where it may change, opaque where it must not. Only a vendor "
+                    "that takes masks is asked.",
+                },
+                "dpi": {
+                    "type": "integer",
+                    "minimum": MIN_DPI,
+                    "maximum": MAX_DPI,
+                    "description": "Print resolution tag written into png/jpeg output, e.g. 300. "
+                    "Tags the pixels made, adds none: the result says the print size.",
                 },
                 "model": {
                     "type": "string",
@@ -1159,7 +1255,13 @@ class ImageGenerate(Tool):
         if timeout_ms is not None and int(timeout_ms) < 1:
             raise ToolError("timeoutMs must be a positive integer in milliseconds.")
         filename = str(checked.get("filename", "") or "").strip()
-        for named in references:
+        mask = str(checked.get("mask", "") or "").strip().removeprefix("@").strip()
+        if mask and not references:
+            raise ToolError("a mask needs an image to edit: give image as well")
+        dpi = checked.get("dpi")
+        if dpi is not None and not MIN_DPI <= int(dpi) <= MAX_DPI:
+            raise ToolError(f"dpi must be between {MIN_DPI} and {MAX_DPI}")
+        for named in (*references, *([mask] if mask else [])):
             if not _remote(named) and not named.startswith("data:"):
                 inside(self.workspace, _local(named))
         provider, model = _choice(checked)
@@ -1179,6 +1281,8 @@ class ImageGenerate(Tool):
             "filename": filename,
             "provider": provider,
             "model": model,
+            "mask": mask,
+            "dpi": int(dpi) if dpi is not None else 0,
         }
 
     async def run(  # type: ignore[override]
@@ -1198,6 +1302,8 @@ class ImageGenerate(Tool):
         filename: str = "",
         provider: str = "",
         model: str = "",
+        mask: str = "",
+        dpi: int = 0,
     ) -> ToolResult:
         if action == "list":
             return ToolResult.ok(self._listing())
@@ -1207,6 +1313,7 @@ class ImageGenerate(Tool):
             )
         try:
             sources = tuple([await self._source(named) for named in references or ()])
+            masking = await self._mask(mask, sources[0]) if mask else None
         except ToolError as exc:
             return ToolResult.error(str(exc))
         timeout = self._timeout(timeout_ms)
@@ -1214,9 +1321,13 @@ class ImageGenerate(Tool):
         inferred = "" if size or resolution or not edit else infer_resolution(sources)
         chosen = provider or str(self.ctx.setting("provider", "") or "").strip().lower()
         passed: list[str] = []
+        # Every vendor reached before the one that answered - built, so its key
+        # was already read - for the hint about what one of them would have made.
+        tried: list[tuple[str, dict[str, Any], str]] = []
         for name, vendor in self.vendors(provider, model):
             missing = _unready(vendor)
             caps = _caps(vendor)
+            tried.append((name, caps, missing))
             mode = caps.get("edit" if edit else "generate") or {}
             most = int(mode.get("max_count") or MAX_COUNT)
             if not missing and name == chosen and count > most:
@@ -1226,8 +1337,9 @@ class ImageGenerate(Tool):
                 return ToolResult.error(
                     f"{name} {kind} supports at most {most} output image{'s' if most != 1 else ''}."
                 )
-            missing = missing or _cannot(caps, len(sources))
+            missing = missing or _cannot(caps, len(sources), masked=masking is not None)
             if missing:
+                tried[-1] = (name, caps, missing)
                 passed.append(f"{name}: {missing}")
                 continue
             # OpenClaw's: an inferred resolution goes only to a vendor that may
@@ -1259,6 +1371,7 @@ class ImageGenerate(Tool):
                 background=shaped.background,
                 openai=openai,
                 timeout=timeout,
+                mask=masking,
             )
             assert_active()
             made, error, took = await self._ask(vendor, request)
@@ -1270,8 +1383,10 @@ class ImageGenerate(Tool):
                 passed.append(f"{name}: {error}")
                 continue
             host = str(getattr(vendor, "host", "") or HOSTS.get(name, name))
-            notes = _adjusted(shaped, size)
-            return self._deliver(made, kinds, name, host, prompt, filename, passed, notes, count)
+            notes = _adjusted(shaped, size) + _elsewhere(shaped, name, tried)
+            return self._deliver(
+                made, kinds, name, host, prompt, filename, passed, notes, count, dpi
+            )
         failure = "; ".join(passed) or "no vendor is configured"
         return ToolResult.error(f"no picture made: {failure}")
 
@@ -1380,6 +1495,24 @@ class ImageGenerate(Tool):
             raise ToolError(f"{named} is not a PNG, JPEG, GIF or WebP picture")
         return Source(data, media_type, label)
 
+    async def _mask(self, named: str, first: Source) -> Source:
+        """The mask, read as a picture is and held to OpenAI's terms before
+        anything is spent: a PNG with transparency, the size of the picture it
+        applies to."""
+        mask = await self._source(named)
+        if mask.media_type != "image/png" or not has_alpha(mask.data):
+            raise ToolError(
+                f"the mask {named} must be a PNG with transparency: transparent where the "
+                "picture may change, opaque where it must not"
+            )
+        size, wanted = dimensions(mask.data), dimensions(first.data)
+        if wanted != (0, 0) and size != wanted:
+            raise ToolError(
+                f"the mask is {size[0]}x{size[1]} and the picture {wanted[0]}x{wanted[1]}: "
+                "they must be the same size"
+            )
+        return mask
+
     async def _ask(self, vendor: Any, request: Request) -> tuple[Made | None, str, float]:
         started = time.monotonic()
         try:
@@ -1398,11 +1531,11 @@ class ImageGenerate(Tool):
             found = [getattr(each, "data", each) for each in images]
         else:
             found = [getattr(made, "data", None)]
-        found = [bytes(each) for each in found if isinstance(each, bytes | bytearray) and each]
-        if not found:
+        kept = [bytes(each) for each in found if isinstance(each, bytes | bytearray) and each]
+        if not kept:
             return None, "nothing came back", time.monotonic() - started
         made = Made(
-            found[:MAX_COUNT],
+            kept[:MAX_COUNT],
             model=str(getattr(made, "model", "") or ""),
             cost=str(getattr(made, "cost", "") or ""),
         )
@@ -1426,6 +1559,8 @@ class ImageGenerate(Tool):
             "images": len(request.images),
             "count": request.count,
         }
+        if request.mask is not None:
+            arguments["mask"] = True
         for key, value in (
             ("size", request.size),
             ("aspectRatio", request.aspect_ratio),
@@ -1462,7 +1597,11 @@ class ImageGenerate(Tool):
         passed: list[str],
         notes: list[str],
         asked: int,
+        dpi: int = 0,
     ) -> ToolResult:
+        if dpi:
+            made, printed = _tagged(made, kinds, dpi)
+            notes = [*notes, printed]
         saved: list[str] = []
         assert_active()
         for data, kind in zip(made.images, kinds, strict=True):
@@ -1516,6 +1655,30 @@ class ImageGenerate(Tool):
         # Joined as text, not `with_suffix`: a stem with a dot in it ("v1.2")
         # would lose its tail.
         return f"{stem}.{ext}"
+
+
+def _tagged(made: Made, kinds: Sequence[str], dpi: int) -> tuple[Made, str]:
+    """Every picture with its `dpi` tag, and the line that says what that means
+    on paper - the tag adds no pixel, so a print shop asking for 300 dpi at a
+    size the pixels do not cover is still refused, and the model should know
+    before the person finds out."""
+    images: list[bytes] = []
+    untagged: list[str] = []
+    for data, kind in zip(made.images, kinds, strict=True):
+        tagged = with_dpi(data, dpi)
+        if tagged is None:
+            untagged.append(EXTENSIONS.get(kind, kind))
+            images.append(data)
+        else:
+            images.append(tagged)
+    width, height = dimensions(images[0])
+    line = f"Tagged {dpi} dpi"
+    if width and height:
+        line += f": {width}x{height} px prints at {print_size(width, height, dpi)}"
+    line += "."
+    if untagged:
+        line += f" Not tagged, {'/'.join(dict.fromkeys(untagged))} has no dpi: ask for png or jpeg."
+    return Made(images, model=made.model, cost=made.cost), line
 
 
 def _adjusted(shaped: Overrides, size: str) -> list[str]:
@@ -1604,10 +1767,11 @@ def _unready(vendor: Any) -> str:
         return f"ready() failed: {type(exc).__name__}"
 
 
-def _cannot(caps: Mapping[str, Any], references: int) -> str:
+def _cannot(caps: Mapping[str, Any], references: int, *, masked: bool = False) -> str:
     """OpenClaw's `resolveReferenceImageCapabilityError`: pictures handed in
     must be taken, or the vendor is passed over - a vendor that dropped them
-    would look like it had done the edit."""
+    would look like it had done the edit. A mask is held to the same rule: a
+    vendor that redrew the whole picture would look like it had kept to it."""
     if not references:
         return ""
     edit = caps.get("edit") or {}
@@ -1616,7 +1780,34 @@ def _cannot(caps: Mapping[str, Any], references: int) -> str:
     most = int(edit.get("max_input_images") or 0)
     if references > most:
         return f"edits {most} picture{'s' if most != 1 else ''} at a time"
+    if masked and not edit.get("supports_mask"):
+        return "does not take a mask"
     return ""
+
+
+_OFFERED = {"quality": "qualities", "outputFormat": "formats", "background": "backgrounds"}
+
+
+def _elsewhere(
+    shaped: Overrides, answered: str, tried: Sequence[tuple[str, Mapping[str, Any], str]]
+) -> list[str]:
+    """For each value the answering vendor dropped, a vendor already reached
+    that makes it, and what stands in its way - so the model can say what
+    would work instead of patching the picture after paying for it. Only
+    vendors already built are named: one past the answer was never built, and
+    building it to ask would read a key for nothing."""
+    notes = []
+    for key, value in shaped.ignored:
+        offered = _OFFERED.get(key)
+        if offered is None:
+            continue
+        for name, caps, missing in tried:
+            if name == answered or value not in ((caps.get("output") or {}).get(offered) or ()):
+                continue
+            why = f", which was passed over: {missing}" if missing else ""
+            notes.append(f"{name} makes {key}={value}{why}.")
+            break
+    return notes
 
 
 def _abilities(caps: Mapping[str, Any]) -> list[str]:
@@ -1626,6 +1817,7 @@ def _abilities(caps: Mapping[str, Any]) -> list[str]:
     generate = caps.get("generate") or {}
     said = [
         f"edits up to {edit.get('max_input_images')}" if edit.get("enabled") else "",
+        "takes a mask" if edit.get("enabled") and edit.get("supports_mask") else "",
         f"up to {generate.get('max_count', 1)} at once",
     ]
     if generate.get("supports_size"):

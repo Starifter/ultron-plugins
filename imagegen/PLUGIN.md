@@ -3,7 +3,7 @@ name: imagegen
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg
-version: "5.0.0"
+version: "5.1.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [openai, google]
 contracts:
@@ -41,6 +41,12 @@ made, so it can look before telling you it is right.
 /plugins install imagegen
 ```
 
+**From 5.0:** two fields beyond OpenClaw's. `mask` changes one region and leaves the rest
+alone, at a vendor that takes one (OpenAI); `dpi` tags what is made for print. And when a
+vendor drops something you asked for, the result names a vendor already tried that makes
+it, and what stood in its way - `openai makes background=transparent, which was passed
+over: no openai key (ultron auth add openai).`
+
 **From 4.x:** pictures go to `media/images/` in the workspace, where Ultron keeps what its
 plugins make, and the `output_dir` setting is gone - a `filename` is a name in
 `media/images/`. Ultron picks the safe name and never writes over a file, so it needs
@@ -50,10 +56,10 @@ Ultron's SDK 1.43. Pictures already in `images/` stay where they are.
 `aspectRatio` with OpenClaw's 21 shapes; `path` is `filename`, a name in `media/images/` that
 is never refused - a name already taken gets `-2`; `size`, `resolution`, `quality`,
 `outputFormat`, `background`, `openai`, `count` and `timeoutMs` are new, and so are
-`image` and pictures by URL. `mask` is gone, because OpenClaw has none, and so is Imagen,
-which Google shut down. A backend from before 4.0 still works (below). Unlike OpenClaw's,
-the tool still answers in the call rather than in a later turn: the model looking at what
-it made, and editing it in the same turn, is the point of the tool.
+`image` and pictures by URL. `mask` went, because OpenClaw has none (5.1 brought it back),
+and so did Imagen, which Google shut down. A backend from before 4.0 still works (below).
+Unlike OpenClaw's, the tool still answers in the call rather than in a later turn: the
+model looking at what it made, and editing it in the same turn, is the point of the tool.
 
 **From 2.x:** the tool was `generate_image`.
 
@@ -76,6 +82,8 @@ Every field is optional but the prompt.
 |---|---|
 | `prompt` | What to make, or what to change. |
 | `image`, `images` | Pictures to edit or to work from, up to 16: a workspace path, a `file://` URL inside the workspace, a `data:` URL, or an http(s) URL - fetched under the same address policy as `web_fetch`. |
+| `mask` | For an edit: a PNG the size of the first picture, transparent where it may change and opaque where it must not, given as `image` is. Checked before anything is spent. Only a vendor that takes masks is asked. |
+| `dpi` | 1 to 2400. Written into PNG and JPEG output as its resolution tag; the result says what the pixels come to on paper at that dpi. It adds no pixel. |
 | `model` | `provider/model` to ask first - below. |
 | `filename` | A name for the file, kept as its basename inside `media/images/`. |
 | `size` | `1024x1024`, `1536x1024`, `2048x2048`, `3840x2160` and so on. |
@@ -102,19 +110,25 @@ OpenClaw's rules, ported (`resolveImageGenerationOverrides`):
 - **A quality, a format or a background** it does not take is dropped.
 - **Pictures handed in** must be taken: a vendor that does not edit, or takes fewer, is
   passed over rather than sent the prompt without them.
+- **A mask** must be taken too: a vendor that takes none is passed over, because one that
+  redrew the whole picture would look as if it had kept to the mask.
 - **`count`** above what the vendor you named (or `provider` names) makes is refused before
   anything is spent; any other vendor makes as many as it can.
 - **An edit with no size or resolution** is made at the size of the largest picture handed
   in - 4K from 3000 pixels, 2K from 1500 - for a vendor that takes a resolution.
 
 The result says each one: `aspectRatio 2.35:1 was made as 21:9.`, `Ignored, not supported:
-quality=high.` Those lines are Ultron's, outside the envelope that holds the pictures.
+quality=high.` For a quality, format or background that was dropped, it also names the
+first vendor already tried that makes it and why it was not the one that answered. Only
+vendors already reached are named: one after the vendor that answered was never built, and
+building it to ask would read its key for nothing. Those lines are Ultron's, outside the
+envelope that holds the pictures.
 
 ## Vendors
 
 Two are built in, with OpenClaw's limits:
 
-- **OpenAI** (`gpt-image-2`): up to 4 pictures, edits up to 5; any size within OpenAI's
+- **OpenAI** (`gpt-image-2`): up to 4 pictures, edits up to 5 with a mask; any size within OpenAI's
   limits on gpt-image-2 and 2.5 (multiples of 16, at most 3840 a side), the listed sizes on
   1.5 and the three 1K sizes on gpt-image-1; no shape or resolution of its own, so those
   become a size; every quality (xhigh and max on 2.5 only), format and background. A
@@ -188,14 +202,16 @@ from the environment.
 {
     "generate": {"max_count": 4, "supports_size": True, "supports_aspect_ratio": False,
                  "supports_resolution": False},
-    "edit": {"enabled": True, "max_count": 4, "max_input_images": 5, ...same supports_*},
+    "edit": {"enabled": True, "max_count": 4, "max_input_images": 5,
+             "supports_mask": False, ...same supports_*},
     "geometry": {"sizes": (...), "aspect_ratios": (...), "resolutions": ("1K", "2K"),
                  "fallback_sizes": (...)},   # an empty `sizes` means any size
     "output": {"qualities": (...), "formats": (...), "backgrounds": (...)},
 }
 ```
 
-`request` has `prompt`, `images` (objects with `data`, `media_type` and `name`), `count`,
+`request` has `prompt`, `images` (objects with `data`, `media_type` and `name`), `mask`
+(one such object, or `None`; never set unless your `edit` says `supports_mask`), `count`,
 and what is left of the model's ask once your capabilities had their say: `size`,
 `aspect_ratio`, `resolution`, `quality`, `output_format`, `background` (each `""` when not
 sent), `openai` (a dict, for OpenAI's own options) and `timeout` (seconds; imagegen also
@@ -216,6 +232,8 @@ than sent to code that would not read it. Its request still has `aspect` (always
 - **Generate** up to four pictures from a prompt.
 - **Edit** up to sixteen pictures, from the workspace or a URL, at a vendor that takes that
   many.
+- **Tag** PNG and JPEG output with a `dpi` for print. A PNG's tag is rounded up, so 300 dpi
+  reads back as 300.02 and never 299.99, which some print shops' checkers refuse.
 - **Save** to `media/images/<time>-<prompt>.png`, or to the `filename` the model gives - never over
   an existing file.
 - **Show** them to the model through Ultron's media store, inside an untrusted envelope -
@@ -223,7 +241,7 @@ than sent to code that would not read it. Its request still has `aspect` (always
   only the paths come back.
 
 Each vendor attempt is a `plugin` record with `event: generate`: vendor, model, how many
-pictures went in, what was sent of size, shape, resolution, quality, format and background,
+pictures went in, whether a mask did, what was sent of size, shape, resolution, quality, format and background,
 and the hash and size of each picture that came back. The prompt is only in the tool call's
 own record.
 
