@@ -31,6 +31,10 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `deepseek` | A model provider for DeepSeek (`DEEPSEEK_API_KEY`), its thinking carried through tool loops the way DeepSeek requires. Needs SDK 1.25. |
 | `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included, `xai/stt` to transcribe voice notes on the same key, and Grok Imagine as a vendor for `imagegen` and `videogen`. |
 | `deepgram` | A media reader: voice notes and recordings transcribed by Deepgram Nova (`DEEPGRAM_API_KEY`). |
+| `tavily` | A `web_search` backend: Tavily (`TAVILY_API_KEY`), rows that are the passage answering the query, every filter mapped, and Tavily's own written answer if you turn it on. |
+| `perplexity` | A `web_search` backend: Perplexity (`PERPLEXITY_API_KEY`), ranked pages from its Search API by default, or with `mode: agent` a written answer with its sources from the Agent API - what Sonar became. |
+| `exa` | A `web_search` backend: Exa (`EXA_API_KEY`), OpenClaw's provider - search by meaning, each row the passages that match, `search_type` and contents as settings, and a deep search's written answer above its rows. |
+| `searxng` | A `web_search` backend: your own SearXNG (`base_url` or `SEARXNG_BASE_URL`), OpenClaw's provider - no key, no bill, tried before the paid searchers; `http://` only on your own machine or network. |
 | `together` | A model provider for Together AI (`TOGETHER_API_KEY`): its hosted open models, priced from its listing, and its image and video models as vendors for `imagegen` and `videogen`. |
 | `fireworks` | A model provider for Fireworks AI (`FIREWORKS_API_KEY`): its hosted open models, reasoning carried through tool loops, and FLUX as a vendor for `imagegen`. Needs SDK 1.25. |
 | `diffs` | A `diffs` tool, OpenClaw's: a diff rendered for a person - a viewer opened from the call's card in the web UI, a PNG or a PDF for a channel. Needs SDK 1.33; files need Playwright. |
