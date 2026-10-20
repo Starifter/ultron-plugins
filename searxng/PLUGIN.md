@@ -4,6 +4,7 @@ description: Your own SearXNG as a web_search backend - no key, no bill, no trac
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"
 categories: [web, search, local]
+logo: logo.svg
 contracts:
   searchers: [searxng]
 config_schema:

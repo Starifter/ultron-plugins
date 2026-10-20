@@ -4,6 +4,7 @@ description: Tavily Search as a web_search backend - results built for agents, a
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"
 categories: [web, search]
+logo: logo.svg
 contracts:
   searchers: [tavily]
 config_schema:
