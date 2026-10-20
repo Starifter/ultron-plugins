@@ -4,6 +4,7 @@ description: Perplexity as a web_search backend - its ranked results, or a writt
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"
 categories: [web, search]
+logo: logo.svg
 contracts:
   searchers: [perplexity]
 config_schema:

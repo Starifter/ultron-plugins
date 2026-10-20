@@ -4,6 +4,7 @@ description: Exa as a web_search backend - search by meaning, with the passages 
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"
 categories: [web, search]
+logo: logo.svg
 contracts:
   searchers: [exa]
 config_schema:
