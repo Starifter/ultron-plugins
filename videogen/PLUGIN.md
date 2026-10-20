@@ -3,7 +3,7 @@ name: videogen
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
 logo: logo.svg
-version: "5.0.0"
+version: "5.1.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
@@ -37,7 +37,7 @@ config_schema:
   google_model:
     type: str
     default: veo-3.1-fast-generate-preview
-    description: "A Veo model: veo-3.1-generate-preview, veo-3.1-fast-generate-preview or veo-3.1-lite-generate-preview."
+    description: "A Veo model: veo-3.1-generate-preview, veo-3.1-fast-generate-preview or veo-3.1-lite-generate-preview. On Ultron 1.45 and later the google plugin's video_model is used instead."
 ---
 
 # videogen
@@ -69,6 +69,11 @@ from, as OpenClaw has it, and no last frame. A backend from before 4.0 still wor
 **From 2.x:** `generate_video` and `video_status` are now `video_generate`.
 
 ## Keys
+
+On Ultron 1.45 and later, Google is Ultron's own `google` plugin's vendor, which it
+registers here; its setting is that plugin's `video_model`. It still takes a key only - a
+Google sign-in is told it cannot make videos yet. On an older Ultron, the copy below is
+used.
 
 Google uses the key Ultron already holds for its model provider - `ultron auth add google`,
 or `GEMINI_API_KEY` in `~/.ultron/.env` - read with `ctx.credential` (SDK 1.38), which is
@@ -134,6 +139,7 @@ in this session, without a restart:
 
 | Plugin | Vendor | What it takes | Its setting |
 |---|---|---|---|
+| `openai` (ships with Ultron 1.45) | `sora-2` | 4, 8 or 12 seconds at 720x1280, 1280x720, 1024x1792 or 1792x1024; one picture to start from; an API key only | `video_model` |
 | `xai` | `grok-imagine-video` | up to 15 seconds, 7 shapes, 480P or 720P; a first frame or up to 7 reference pictures; a video by link to edit (up to 10 seconds) | `video_model` |
 | `xai` | `grok-imagine-video-1.5` | one first frame only, up to 1080P | `video_model` |
 | `openrouter` | `google/veo-3.1` | 4, 6 or 8 seconds, 16:9 or 9:16, 720P or 1080P, a size, the audio switch, up to 4 pictures, a `seed`; billed by OpenRouter | `video_model` |

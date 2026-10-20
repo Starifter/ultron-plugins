@@ -3,7 +3,7 @@ name: imagegen
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg
-version: "5.1.0"
+version: "5.2.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [openai, google]
 contracts:
@@ -20,15 +20,15 @@ config_schema:
   openai_model:
     type: str
     default: gpt-image-2
-    description: "gpt-image-2, gpt-image-2.5-flare, gpt-image-2.5-sunburst, gpt-image-1.5 or gpt-image-1."
+    description: "gpt-image-2, gpt-image-2.5-flare, gpt-image-2.5-sunburst, gpt-image-1.5 or gpt-image-1. On Ultron 1.45 and later the openai plugin's image_model is used instead."
   openai_quality:
     type: str
     default: auto
-    description: "auto, low, medium or high, sent when the model asks for no quality. Higher costs more and takes longer."
+    description: "auto, low, medium or high, sent when the model asks for no quality. Higher costs more and takes longer. On Ultron 1.45 and later the openai plugin's image_quality is used instead."
   google_model:
     type: str
     default: gemini-3.1-flash-image
-    description: "A Gemini image model: gemini-3.1-flash-image or gemini-3-pro-image."
+    description: "A Gemini image model: gemini-3.1-flash-image or gemini-3-pro-image. On Ultron 1.45 and later the google plugin's image_model is used instead."
 ---
 
 # imagegen
@@ -63,9 +63,18 @@ model looking at what it made, and editing it in the same turn, is the point of 
 
 **From 2.x:** the tool was `generate_image`.
 
+**From 5.2:** on Ultron 1.45 and later, OpenAI and Google come from Ultron's own `openai`
+and `google` plugins, which register their image models here - so a **ChatGPT sign-in**
+makes pictures (through the Codex backend), and so does a **Google sign-in** (through
+Vertex AI in its Cloud project), not only a key. Their settings are those plugins'
+`image_model` (and `image_quality`, `image_responses_model` for OpenAI). imagegen keeps
+its own copies below for an older Ultron, where only a key works.
+
 ## Keys
 
-OpenAI and Google use the keys Ultron already holds for its model providers - `ultron auth
+On Ultron 1.45 and later, OpenAI and Google are the `openai` and `google` plugins'
+vendors and read those plugins' own credentials, key or sign-in; see their pages. On an
+older Ultron, OpenAI and Google use the keys Ultron already holds for its model providers - `ultron auth
 add openai` or `google`, or `OPENAI_API_KEY` / `GEMINI_API_KEY` in `~/.ultron/.env`. The
 plugin reads them with `ctx.credential` (SDK 1.38), which is why this manifest declares both
 under `vendor_credentials` and `/plugins` says so before you install it. Every other vendor
