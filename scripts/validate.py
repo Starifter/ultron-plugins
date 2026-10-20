@@ -7,6 +7,10 @@ refresh` will list the entry and `/plugins install` will take it. It does not
 run the plugin: what a plugin does once consented to is the reader's call, and
 this script says nothing about it.
 
+`skills/` is the other marketplace in this repository: the one Ultron connects
+as `official` for `/skills`. Each directory there is one skill, a `SKILL.md`
+read the way skill discovery reads it.
+
 Usage: python scripts/validate.py [root]
 """
 
@@ -23,8 +27,12 @@ from ultron.plugins.discovery import (
     read_manifest,
 )
 from ultron.sdk import SDK_VERSION
+from ultron.skills.base import read_manifest as read_skill
 
-SKIPPED = {".git", ".github", "scripts"}
+SKILLS = "skills"
+"""Where the skills are - the official skill marketplace reads this directory."""
+
+SKIPPED = {".git", ".github", "scripts", SKILLS}
 """Directories that are the repository's and not a plugin's."""
 
 
@@ -57,6 +65,21 @@ def problems(directory: Path) -> list[str]:
     return found
 
 
+def skill_problems(directory: Path) -> list[str]:
+    path = directory / "SKILL.md"
+    if not path.is_file():
+        return ["no SKILL.md"]
+    skill = read_skill(path, source="config")
+    if skill.error:
+        return [skill.error]
+    found: list[str] = []
+    if skill.name != directory.name:
+        found.append(f"SKILL.md says name: {skill.name!r}, directory is {directory.name!r}")
+    if not skill.description:
+        found.append("no description - the Explore tab shows it")
+    return found
+
+
 def main(argv: list[str]) -> int:
     root = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
     if (root / MANIFEST_FILENAME).is_file():
@@ -79,7 +102,19 @@ def main(argv: list[str]) -> int:
         for line in found:
             print(f"    {line}")
         failed += bool(errors)
-    print(f"\n{len(entries)} plugin(s), {failed} failed, SDK {SDK_VERSION}")
+    skills_root = root / SKILLS
+    skills = sorted(
+        path
+        for path in (skills_root.iterdir() if skills_root.is_dir() else ())
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    for directory in skills:
+        found = skill_problems(directory)
+        print(f"{SKILLS}/{directory.name:<17} {'ok' if not found else 'FAIL'}")
+        for line in found:
+            print(f"    {line}")
+        failed += bool(found)
+    print(f"\n{len(entries)} plugin(s), {len(skills)} skill(s), {failed} failed, SDK {SDK_VERSION}")
     return 1 if failed else 0
 
 

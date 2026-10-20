@@ -1,6 +1,7 @@
 # Ultron plugins
 
-The official plugin marketplace for [Ultron](https://github.com/Starifter/ultron).
+The official plugin marketplace for [Ultron](https://github.com/Starifter/ultron), and in
+[`skills/`](skills/) its official skill marketplace.
 Every top-level directory here is one plugin: a `PLUGIN.md` manifest and a `plugin.py`
 beside it, written against `ultron.sdk` and nothing else - exactly what the plugins
 Ultron itself ships are made of.
@@ -43,9 +44,27 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `musicgen` | OpenClaw's `music_generate`, field for field (generate, status, list): a song or an instrumental from Google Lyria, or any vendor another plugin adds - `openrouter` does - with your lyrics or its own, a length and MP3 or WAV where the vendor takes them, made in the background and saved in the workspace's `media/music/`; the agent is woken to tell you when it is done (SDK 1.40), or told on its next turn. The model may pick the vendor and model as `provider/model`, falling back to the rest; `list` shows them, `status` the jobs and their lyrics. Needs SDK 1.43. |
 | `google-cli` | A `google` tool: Google Workspace (Calendar, Gmail, Drive, Docs, Sheets, Contacts, Tasks and more) through the [gog](https://github.com/openclaw/gogcli) CLI, OpenClaw's way in. Reads run under gog's own `--readonly`. Every change is a card you approve. It is available only in the owner's sessions, and what Google returns is marked as untrusted. You install gog and sign it in yourself. Needs SDK 1.41. |
 | `discord` | A channel: a Discord bot (`DISCORD_BOT_TOKEN`) for DMs, server channels, threads and forums - replies drawn as they are written, `ask_user` as buttons, Ultron's slash commands as native ones, and a `discord` tool for servers, history, pins, threads and polls (moderation off unless you turn it on). Ultron shipped it until it moved here; who may talk to it is still `channels_owners`. |
-| `github` | The `github` skill: GitHub through the `gh` CLI - issues, pull requests, CI runs and failed logs, reviews, releases and `gh api`. Markdown only - no tool, no code of its own. You install `gh` and log it in yourself. |
 | `himalaya` | The `himalaya` skill: your email over IMAP, SMTP, JMAP, Gmail or Graph with the himalaya 2.x CLI - list, search, read, compose and send, a yes from you before anything is sent. Markdown only. You install himalaya and configure the account yourself. |
 | `dice` | A `roll_dice` tool - the example a new plugin is copied from. |
+
+## Skills
+
+`skills/` is a second marketplace in the same repository: plain skill directories, a
+`SKILL.md` each, with no plugin around them. Ultron connects it as `official` on the
+`/skills` side, and reads only this directory - a plugin's own `SKILL.md` elsewhere in the
+repository is the plugin's.
+
+```
+/skills market refresh official       fetch or update the copy on this machine
+/skills install github                scan it, then copy it into ~/.ultron/skills/
+```
+
+| skill | what it does |
+|---|---|
+| `github` | GitHub through the `gh` CLI - issues, pull requests, CI runs and failed logs, reviews, releases and `gh api`. You install `gh` and log it in yourself (`gh auth login`); without `gh` or `exec` it never reaches the prompt. |
+
+`skill_marketplace_official` in `config.json` is its address, as `plugin_marketplace_official`
+is the plugins'.
 
 ## What "official" means
 

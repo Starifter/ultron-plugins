@@ -1,5 +1,5 @@
 ---
-# Adapted from OpenClaw's `github` skill (MIT) - see NOTICE.md beside the plugin.
+# Adapted from OpenClaw's `github` skill (MIT) - see NOTICE.md beside it.
 name: github
 description: GitHub through the gh CLI - issues, pull requests, CI runs and failed logs, reviews, releases, and gh api queries.
 homepage: https://cli.github.com
