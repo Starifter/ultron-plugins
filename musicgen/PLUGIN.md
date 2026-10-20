@@ -3,7 +3,7 @@ name: musicgen
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
 logo: logo.svg
-version: "4.0.0"
+version: "4.1.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
@@ -29,7 +29,7 @@ config_schema:
   google_model:
     type: str
     default: lyria-3.5
-    description: "A Lyria model: lyria-3.5 or lyria-3-pro-preview for a full song, lyria-3-clip-preview for a 30-second clip."
+    description: "A Lyria model: lyria-3.5 or lyria-3-pro-preview for a full song, lyria-3-clip-preview for a 30-second clip. On Ultron 1.45 and later the google plugin's music_model is used instead."
 ---
 
 # musicgen
@@ -60,6 +60,11 @@ it, so a length asked of Google is dropped and said. A backend from before 3.0 s
 **From 1.x:** `generate_music` and `music_status` are now `music_generate`.
 
 ## Keys
+
+On Ultron 1.45 and later, Google is Ultron's own `google` plugin's vendor, which it
+registers here; its setting is that plugin's `music_model`. It still takes a key only - a
+Google sign-in is told it cannot make music yet. On an older Ultron, the copy below is
+used.
 
 Google uses the key Ultron already holds for its model provider - `ultron auth add google`,
 or `GEMINI_API_KEY` in `~/.ultron/.env` - read with `ctx.credential` (SDK 1.38), which is
