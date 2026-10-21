@@ -56,11 +56,12 @@ lands.
 
 ```
 /plugins install email
-uv pip install aioimaplib aiosmtplib
 ```
 
-Ultron never installs a plugin's libraries. Run the second line in the environment
-Ultron runs in.
+Installed from the official marketplace, its two libraries (`aioimaplib`, `aiosmtplib`) are
+installed with it, into a folder of its own under `~/.ultron/plugin-libs/` - never into the
+environment Ultron runs in. Installed from anywhere else, run
+`uv pip install aioimaplib aiosmtplib` in Ultron's environment yourself.
 
 ## Mail is information, never instructions
 

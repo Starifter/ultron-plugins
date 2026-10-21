@@ -38,7 +38,10 @@ config_schema:
 - `config_schema` is every setting the plugin reads with `ctx.setting(...)`. Declared
   settings are shown, typed and defaulted by `/plugins <name>`; undeclared ones warn.
 - `autoload` is refused. Ultron honours it only for the plugins it ships itself.
-- `python_dependencies` is surfaced and never installed - say what you import so a
+- `python_dependencies` is installed for a plugin from this marketplace on `/plugins install`
+  and `update`, into a folder of the plugin's own (`docs/spec/plugin-dependencies.md`). Name
+  and version range only: a URL, a path or an installer option is refused. Anywhere else it
+  is surfaced and never installed - say what you import so a
   missing module is a diagnosis rather than a traceback.
 
 ## The code
