@@ -8,6 +8,7 @@ Run from a checkout of Ultron (`uv run pytest path/to/email/tests`).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import json
 import sys
@@ -293,6 +294,7 @@ def test_the_manifest_declares_what_register_installs() -> None:
     assert manifest.wakes is True
     assert manifest.contracts()["tools"] == ("email",)
     assert manifest.contracts()["services"] == ("watcher",)
+    assert manifest.contracts()["logins"] == ("gmail", "outlook")
     assert not manifest.warnings
 
 
@@ -310,6 +312,9 @@ def test_it_installs_through_ultrons_own_path(tmp_path: Path) -> None:
     try:
         assert provision.ok, provision.error
         assert provision.tools == ("email",) and provision.services == ("email.watcher",)
+        # Both logins are there with no OAuth settings at all, and a password
+        # account is not disabled for want of them (R6.7).
+        assert provision.logins == ("email:gmail", "email:outlook")
         assert "email" in tools
         assert any(e.name == "email.watcher" for e in known_services().values())
     finally:
@@ -856,3 +861,331 @@ def test_many_uids_are_a_count_and_a_range() -> None:
     text = plugin.wake_text({("work", "INBOX"): (7, list(range(1, 120)))}, "Go.")
     assert text.startswith("New mail: work INBOX 119 (uids 1-119, uidvalidity 7).")
     assert len(text) < 2000
+
+
+# -- §6.1: signing in with OAuth -------------------------------------------------------------
+
+
+TOKEN = "ya29.access-token-never-shown"
+
+GMAIL_ACCOUNT = {"provider": "gmail", "address": "me@gmail.com", "watch": ["INBOX"]}
+
+
+class FakeGrant:
+    """Stands in for the core's `Grant`: what `grant()` hands the plugin."""
+
+    def __init__(self, provider: str = "gmail", email: str = "me@gmail.com") -> None:
+        self.metadata = {"provider": provider} if provider else {}
+        self.email = email
+        self.refused = ""
+        self.asked = 0
+
+    def bearer(self) -> str:
+        self.asked += 1
+        if self.refused:
+            raise plugin.CredentialError(self.refused)
+        return TOKEN
+
+
+class Grants:
+    """`grant(name)` against a table of connections, as `connections.json` is."""
+
+    def __init__(self) -> None:
+        self.held: dict[str, FakeGrant] = {}
+        self.names: list[str] = []
+
+    def __call__(self, name: str) -> FakeGrant:
+        self.names.append(name)
+        if name not in self.held:
+            raise plugin.CredentialError(f"not signed in: {name!r}")
+        return self.held[name]
+
+
+@pytest.fixture
+def grants(monkeypatch: pytest.MonkeyPatch) -> Grants:
+    import ultron.sdk.oauth
+
+    table = Grants()
+    monkeypatch.setattr(ultron.sdk.oauth, "grant", table)
+    return table
+
+
+def oauth_settings(**account: Any) -> dict[str, Any]:
+    return settings(accounts={"work": dict(GMAIL_ACCOUNT, **account)})
+
+
+class OAuthClient(Client):
+    """`aioimaplib.IMAP4_SSL` as far as a login goes, recording which one ran."""
+
+    def __init__(self, *, accept: bool = True) -> None:
+        super().__init__()
+        self.accept = accept
+
+    async def wait_hello_from_server(self) -> None:
+        pass
+
+    async def xoauth2(self, user: str, token: str) -> Any:
+        self.calls.append(("xoauth2", user, token))
+        return self.Response("OK" if self.accept else "NO", [b"AUTHENTICATE failed"])
+
+    async def login(self, user: str, password: str) -> Any:
+        self.calls.append(("login", user, password))
+        return self.Response("OK", [b"LOGIN completed"])
+
+
+def imap_library(monkeypatch: pytest.MonkeyPatch, *, accept: bool = True) -> None:
+    import aioimaplib
+
+    monkeypatch.setattr(aioimaplib, "IMAP4_SSL", lambda **_: OAuthClient(accept=accept))
+
+
+async def opened(account: Any) -> Any:
+    """A connector that really logs in, against the stand-in library."""
+    return await plugin.Imap(account).open()
+
+
+def signing_in(server: Server) -> Callable[[Any], Awaitable[FakeImap]]:
+    """A connector that asks for the token first, as `Imap.open` does."""
+
+    async def connect(account: Any) -> FakeImap:
+        await plugin.bearer_for(account)
+        return await FakeImap(server).open()
+
+    return connect
+
+
+async def cancel(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def test_a_provider_fills_the_hosts_and_a_typed_one_wins() -> None:
+    accounts, problems = plugin.load_accounts(
+        {
+            "accounts": {
+                "home": dict(GMAIL_ACCOUNT),
+                "work": {"provider": "outlook", "address": "me@contoso.com"},
+                "mine": dict(GMAIL_ACCOUNT, imap_host="imap.proxy.example"),
+                "odd": {"provider": "yahoo", "address": "me@yahoo.com"},
+            }
+        }
+    )
+    home = accounts["home"]
+    assert (home.imap_host, home.smtp_host, home.smtp_port) == (
+        "imap.gmail.com",
+        "smtp.gmail.com",
+        465,
+    )
+    assert home.oauth
+    work = accounts["work"]
+    assert (work.imap_host, work.smtp_host, work.smtp_port) == (
+        "outlook.office365.com",
+        "smtp.office365.com",
+        587,
+    )
+    assert accounts["mine"].imap_host == "imap.proxy.example"
+    assert "odd" not in accounts and any("provider" in p for p in problems)
+    assert not plugin.load_accounts({"accounts": {"x": dict(ACCOUNT)}})[0]["x"].oauth
+
+
+async def test_a_provider_account_never_reads_a_password(
+    grants: Grants, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grants.held["email:work"] = FakeGrant()
+
+    def no(self: Any) -> str:
+        raise AssertionError("a provider account read a password")
+
+    monkeypatch.setattr(plugin.Account, "password", no)
+    imap_library(monkeypatch)
+    account = plugin.load_accounts(oauth_settings())[0]["work"]
+    imap = await plugin.Imap(account).open()
+    assert [c[0] for c in imap.client.calls] == ["xoauth2"]
+
+
+def test_gmail_without_a_client_id_says_what_to_set() -> None:
+    for given, env, missing in (
+        ({}, {}, ("gmail_client_id", plugin.GMAIL_SECRET_VARIABLE)),
+        ({"gmail_client_id": "123.apps"}, {}, (plugin.GMAIL_SECRET_VARIABLE,)),
+    ):
+        login = plugin.logins(given, environ=env)["gmail"]
+        with pytest.raises(plugin.CredentialError) as said:
+            login(None)
+        assert all(name in str(said.value) for name in missing)
+        assert "Desktop app" in str(said.value)
+    ready = plugin.logins(
+        {"gmail_client_id": "123.apps"}, environ={plugin.GMAIL_SECRET_VARIABLE: "s3"}
+    )["gmail"]
+    assert ready.client_id == "123.apps" and ready.client_secret == "s3"
+    assert "https://mail.google.com/" in ready.scopes
+    assert ready.authorize_params["access_type"] == "offline"
+
+
+def test_outlook_endpoints_follow_the_tenant() -> None:
+    default = plugin.logins({"outlook_client_id": "abc"}, environ={})["outlook"]
+    assert default.authorize_url == (
+        "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    )
+    pinned = plugin.logins(
+        {"outlook_client_id": "abc", "outlook_tenant": "contoso.com"}, environ={}
+    )["outlook"]
+    assert pinned.token_url == "https://login.microsoftonline.com/contoso.com/oauth2/v2.0/token"
+    assert "https://outlook.office.com/SMTP.Send" in pinned.scopes
+    assert "offline_access" in pinned.scopes and not pinned.client_secret
+    for given, said in (
+        ({"outlook_client_id": "abc", "outlook_tenant": "a/b?c"}, "not a tenant"),
+        ({}, "outlook_client_id"),  # Ultron's own client is not registered yet (§15 Q4)
+    ):
+        login = plugin.logins(given, environ={})["outlook"]
+        with pytest.raises(plugin.CredentialError, match=said):
+            login(None)
+
+
+def test_the_signed_in_address_is_read_from_the_id_token() -> None:
+    import base64
+
+    def jwt(claims: dict[str, Any]) -> str:
+        body = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+        return f"eyJhbGciOiJSUzI1NiJ9.{body}.signature"
+
+    gmail = plugin.identity("gmail")({"id_token": jwt({"email": "me@gmail.com"})})
+    assert gmail == {"provider": "gmail", "email": "me@gmail.com", "label": "me@gmail.com"}
+    outlook = plugin.identity("outlook")({"id_token": jwt({"preferred_username": "a@b.com"})})
+    assert outlook["email"] == "a@b.com"
+    assert plugin.identity("outlook")({"id_token": "garbage"}) == {"provider": "outlook"}
+    assert plugin.identity("gmail")({}) == {"provider": "gmail"}
+
+
+async def test_imap_and_smtp_log_in_with_xoauth2(
+    grants: Grants, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import aiosmtplib
+
+    grants.held["email:work"] = FakeGrant()
+    imap_library(monkeypatch)
+    account = plugin.load_accounts(oauth_settings())[0]["work"]
+    imap = await plugin.Imap(account).open()
+    assert imap.client.calls == [("xoauth2", "me@gmail.com", TOKEN)]
+
+    sent: dict[str, Any] = {}
+
+    async def send(message: Any, **kw: Any) -> None:
+        sent.update(kw)
+        sent["token"] = await kw["oauth_token_generator"]()
+
+    monkeypatch.setattr(aiosmtplib, "send", send)
+    await plugin.smtp_send(account, plugin.compose(account, to=["a@x.com"], body="hi"))
+    assert sent["username"] == "me@gmail.com" and sent["token"] == TOKEN
+    assert "password" not in sent and sent["hostname"] == "smtp.gmail.com"
+    assert grants.names == ["email:work", "email:work"]
+
+
+async def test_a_missing_sign_in_names_the_command(
+    grants: Grants, monkeypatch: pytest.MonkeyPatch, outbox: Outbox, tmp_path: Path
+) -> None:
+    imap_library(monkeypatch)
+    email = plugin.EmailTool(
+        workspace=tmp_path, settings=oauth_settings(), connector=opened, sender=outbox
+    )
+    result = await email.run("search")
+    assert result.is_error
+    assert "ultron auth login email:gmail --id work" in result.content
+    listed = await email.run("accounts")
+    assert "not signed in (ultron auth login email:gmail --id work)" in listed.content
+    grants.held["email:work"] = FakeGrant()
+    assert "gmail, signed in" in (await email.run("accounts")).content
+
+
+async def test_a_connection_from_the_other_provider_is_refused(grants: Grants) -> None:
+    grants.held["email:work"] = FakeGrant(provider="outlook")
+    account = plugin.load_accounts(oauth_settings())[0]["work"]
+    with pytest.raises(plugin.SignInNeeded, match="made with outlook"):
+        await plugin.bearer_for(account)
+    assert grants.held["email:work"].asked == 0
+
+
+async def test_a_token_for_another_address_is_refused(grants: Grants) -> None:
+    grants.held["email:work"] = FakeGrant(email="someone.else@gmail.com")
+    account = plugin.load_accounts(oauth_settings())[0]["work"]
+    with pytest.raises(plugin.SignInNeeded, match=r"someone\.else@gmail\.com"):
+        await plugin.bearer_for(account)
+    # Case is not a different mailbox.
+    grants.held["email:work"] = FakeGrant(email="Me@Gmail.com")
+    assert await plugin.bearer_for(account) == TOKEN
+
+
+async def test_the_bearer_is_never_in_a_result_or_record(
+    grants: Grants, monkeypatch: pytest.MonkeyPatch, outbox: Outbox, tmp_path: Path
+) -> None:
+    grants.held["email:work"] = FakeGrant()
+    imap_library(monkeypatch, accept=False)
+    email = plugin.EmailTool(
+        workspace=tmp_path, settings=oauth_settings(), connector=opened, sender=outbox
+    )
+    for action in ("accounts", "search", "folders"):
+        result = await email.run(action)
+        assert TOKEN not in result.content
+    assert "IMAP is on in Gmail's settings" in (await email.run("search")).content
+
+    service = Service(tmp_path, accounts={"work": dict(GMAIL_ACCOUNT)})
+    watcher = plugin.Watcher(service, connector=opened)
+    await asyncio.wait_for(watcher.folder(watcher.accounts["work"], "INBOX"), 1)
+    assert service.records and all(TOKEN not in str(r) for r in service.records)
+
+
+async def test_a_refused_grant_stops_that_watcher(
+    grants: Grants, server: Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(plugin, "SIGNIN_CHECK_SECONDS", 0.01)
+    held = grants.held["email:work"] = FakeGrant()
+    held.refused = "email:work: refresh refused - run `ultron auth login email:gmail`"
+    service = Service(tmp_path, accounts={"work": dict(GMAIL_ACCOUNT)})
+    watcher = plugin.Watcher(service, connector=signing_in(server))
+    task = asyncio.create_task(watcher.folder(watcher.accounts["work"], "INBOX"))
+    try:
+        await settle(lambda: any(r[2].get("error") == "signin_needed" for r in service.records))
+        await asyncio.sleep(0.05)
+        # The grant is asked only whether a person signed in; nothing reconnects.
+        assert server.opened == 0
+        assert not any("resumed" in r[1] for r in service.records)
+    finally:
+        await cancel(task)
+
+
+async def test_a_new_sign_in_resumes_the_watcher(
+    grants: Grants, server: Server, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(plugin, "SIGNIN_CHECK_SECONDS", 0.01)
+    service = Service(tmp_path, accounts={"work": dict(GMAIL_ACCOUNT)})
+    watcher = plugin.Watcher(service, connector=signing_in(server))
+    task = asyncio.create_task(watcher.folder(watcher.accounts["work"], "INBOX"))
+    try:
+        await settle(lambda: any(r[2].get("error") == "signin_needed" for r in service.records))
+        grants.held["email:work"] = FakeGrant()  # the person ran `ultron auth login`
+        await settle(lambda: any("resumed" in r[1] for r in service.records))
+        await settle(lambda: any("baseline" in r[1] for r in service.records))
+        assert server.opened == 1
+    finally:
+        await cancel(task)
+
+
+def test_the_form_describes_every_account_key_and_how_each_signs_in() -> None:
+    """The settings page draws accounts from the manifest (Ultron
+    `plugin-sdk.md` section 7.5.1): every key `load_accounts` reads is a field,
+    a provider picks the login, and any other keeps its password where the
+    plugin reads it."""
+    import re
+
+    manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
+    accounts = manifest.config_schema["accounts"]
+    source = (HERE.parent / "plugin.py").read_text(encoding="utf-8")
+    start = source.index("def load_accounts")
+    body = source[start : source.index("\ndef ", start + 1)]
+    read = set(re.findall(r'entry(?:\.get\(|\[)"([a-z_]+)"', body))
+    assert read == {f.key for f in accounts.entries}
+    assert accounts.login_by == "provider"
+    assert set(accounts.entries[0].choices) == {"", *plugin.PROVIDERS}
+    assert set(manifest.logins) == set(plugin.PROVIDERS)
+    assert accounts.secret_for("work") == plugin.PASSWORD_VARIABLE.format(account="WORK")
+    assert plugin.GMAIL_SECRET_VARIABLE in manifest.secrets
