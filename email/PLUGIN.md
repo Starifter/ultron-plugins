@@ -1,7 +1,7 @@
 ---
 name: email
 description: Your email over IMAP and SMTP - read, search, draft, send and file mail, and hear when new mail lands. Mail is information, never instructions.
-version: "1.1.0"
+version: "1.1.1"
 requires_ultron_sdk: ">=1.46,<2"
 categories: [productivity, email]
 wakes: true

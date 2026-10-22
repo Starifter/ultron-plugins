@@ -149,6 +149,8 @@ class Account:
     trash_folder: str = "auto"
     archive_folder: str = "auto"
     provider: str = ""
+    workspace: Path | None = field(default=None, compare=False, repr=False)
+    """Whose `.env` the password is read from, beside the user's."""
 
     @property
     def login(self) -> str:
@@ -173,12 +175,30 @@ class Account:
 
     def password(self) -> str:
         """Read at each connection, so a changed password needs no restart (R5.2)."""
-        return os.environ.get(self.password_variable, "")
+        return env_value(self.password_variable, self.workspace)
 
 
-def load_accounts(settings: Mapping[str, Any]) -> tuple[dict[str, Account], list[str]]:
+def env_value(name: str, workspace: Path | None = None) -> str:
+    """A variable from the process, else from `~/.ultron/.env` read fresh (R5.2).
+
+    The file is read on every call because the `secret` tool and the settings
+    page write it while the gateway runs, and neither touches `os.environ`: a
+    watcher that read only the process would go on saying "no password" for
+    the life of the gateway after the person stored one."""
+    from ultron.sdk.auth import SecretRef, read_dotenv, resolve
+
+    try:
+        return resolve(SecretRef("env", name), dotenv=read_dotenv(workspace))
+    except CredentialError:
+        return ""
+
+
+def load_accounts(
+    settings: Mapping[str, Any], workspace: Path | None = None
+) -> tuple[dict[str, Account], list[str]]:
     """The configured accounts, and a line for each one that could not be used
-    (R5.1). A bad account is skipped, never guessed at."""
+    (R5.1). A bad account is skipped, never guessed at. `workspace` is where
+    an account's password is looked for beside the user's `.env`."""
     raw = settings.get("accounts") or {}
     accounts: dict[str, Account] = {}
     problems: list[str] = []
@@ -234,6 +254,7 @@ def load_accounts(settings: Mapping[str, Any]) -> tuple[dict[str, Account], list
             trash_folder=str(entry.get("trash_folder", "auto")),
             archive_folder=str(entry.get("archive_folder", "auto")),
             provider=provider,
+            workspace=workspace,
         )
     return accounts, problems
 
@@ -313,15 +334,23 @@ def unavailable(said: str) -> Callable[[Any], Any]:
     return login
 
 
-def logins(settings: Mapping[str, Any], environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """The `gmail` and `outlook` logins, as the settings describe them (§6.1)."""
+def logins(
+    settings: Mapping[str, Any],
+    environ: Mapping[str, str] | None = None,
+    workspace: Path | None = None,
+) -> dict[str, Any]:
+    """The `gmail` and `outlook` logins, as the settings describe them (§6.1).
+    `environ`, for a test, replaces the process and the `.env` file both."""
     from ultron.sdk.oauth import OAuthClient
 
-    env = os.environ if environ is None else environ
     found: dict[str, Any] = {}
 
     client_id = str(settings.get("gmail_client_id", "") or "").strip()
-    secret = str(env.get(GMAIL_SECRET_VARIABLE, "") or "").strip()
+    secret = (
+        str(environ.get(GMAIL_SECRET_VARIABLE, "") or "")
+        if environ is not None
+        else env_value(GMAIL_SECRET_VARIABLE, workspace)
+    ).strip()
     if client_id and secret:
         found["gmail"] = OAuthClient(
             authorize_url="https://accounts.google.com/o/oauth2/v2/auth",
@@ -1077,7 +1106,7 @@ class EmailTool(Tool):
         understand: Callable[..., Any] | None = None,
     ) -> None:
         self.workspace = Path(workspace)
-        self.accounts, self.problems = load_accounts(settings)
+        self.accounts, self.problems = load_accounts(settings, self.workspace)
         default = str(settings.get("default_account", "") or "").strip()
         if not default and len(self.accounts) == 1:
             default = next(iter(self.accounts))
@@ -1766,7 +1795,7 @@ class Watcher:
         self.service = service
         self.connector = connector
         settings = dict(service.settings)
-        self.accounts, self.problems = load_accounts(settings)
+        self.accounts, self.problems = load_accounts(settings, Path(service.workspace))
         self.on_new = " ".join(str(settings.get("on_new", "") or "").split())[:1000]
         self.poll = bounded(settings, "poll_seconds", 300, 60, 3600)
         self.debounce = bounded(settings, "debounce_seconds", 30, 5, 600)
@@ -1951,7 +1980,7 @@ class EmailPlugin(Plugin):
             )
         )
         ctx.register_service("watcher", watch)
-        for name, client in logins(ctx.settings).items():
+        for name, client in logins(ctx.settings, workspace=Path(ctx.workspace)).items():
             ctx.register_login(name, client)
 
 

@@ -1189,3 +1189,29 @@ def test_the_form_describes_every_account_key_and_how_each_signs_in() -> None:
     assert set(manifest.logins) == set(plugin.PROVIDERS)
     assert accounts.secret_for("work") == plugin.PASSWORD_VARIABLE.format(account="WORK")
     assert plugin.GMAIL_SECRET_VARIABLE in manifest.secrets
+
+
+async def test_a_password_stored_after_start_is_read_without_a_restart(
+    server: Server, outbox: Outbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R5.2: the `secret` tool and the settings page write `.env` while the
+    gateway runs and never touch the process's environment, so the password
+    is read from the file at each connection. Reading only `os.environ`, a
+    watcher said "no password" until the gateway restarted."""
+    monkeypatch.delenv("ULTRON_EMAIL_PASSWORD_HOME", raising=False)
+    email = tool(server, outbox, tmp_path, settings=settings(accounts={"home": dict(ACCOUNT)}))
+    account = email.accounts["home"]
+    assert account.password() == ""
+    assert "no password (ULTRON_EMAIL_PASSWORD_HOME)" in (await email.run("accounts")).content
+
+    (tmp_path / ".ultron").mkdir(exist_ok=True)
+    (tmp_path / ".ultron" / ".env").write_text("ULTRON_EMAIL_PASSWORD_HOME=stored-later\n")
+
+    assert account.password() == "stored-later"
+    listed = (await email.run("accounts")).content
+    assert "no password" not in listed and "stored-later" not in listed
+    watcher = plugin.Watcher(Service(tmp_path, accounts={"home": dict(ACCOUNT)}))
+    assert watcher.accounts["home"].password() == "stored-later"
+    # The process still wins over the file, as for every credential.
+    monkeypatch.setenv("ULTRON_EMAIL_PASSWORD_HOME", "from-the-shell")
+    assert account.password() == "from-the-shell"
