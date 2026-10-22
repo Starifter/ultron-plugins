@@ -641,7 +641,12 @@ class Client:
 
         self.Response = namedtuple("Response", "result lines")
         self.calls: list[tuple[Any, ...]] = []
-        self.protocol = type("P", (), {"capabilities": {"IMAP4REV1", "MOVE", "IDLE"}})()
+        # The library's own state, kept as it keeps it: SELECT moves it to
+        # SELECTED, EXAMINE (a plain command there) does not, and a command
+        # outside its states is refused before it is sent.
+        self.protocol = type(
+            "P", (), {"capabilities": {"IMAP4REV1", "MOVE", "IDLE"}, "state": "AUTH"}
+        )()
 
     def has_capability(self, capability: str) -> bool:
         return capability in self.protocol.capabilities
@@ -652,13 +657,22 @@ class Client:
 
     async def select(self, mailbox: str) -> Any:
         self.calls.append(("select", mailbox))
+        self.protocol.state = "SELECTED"
         return self.Response("OK", [b"OK [UIDVALIDITY 9] x"])
 
+    def _selected(self, command: str) -> None:
+        import aioimaplib
+
+        if self.protocol.state != "SELECTED":
+            raise aioimaplib.Abort(f"command {command} illegal in state {self.protocol.state}")
+
     async def uid_search(self, *criteria: str) -> Any:
+        self._selected("SEARCH")
         self.calls.append(("uid_search", *criteria))
         return self.Response("OK", [b"3 5 8", b"SEARCH completed"])
 
     async def uid(self, command: str, *args: str) -> Any:
+        self._selected("UID")
         self.calls.append(("uid", command, *args))
         return self.Response("OK", [b"Done"])
 
@@ -1215,3 +1229,18 @@ async def test_a_password_stored_after_start_is_read_without_a_restart(
     # The process still wins over the file, as for every credential.
     monkeypatch.setenv("ULTRON_EMAIL_PASSWORD_HOME", "from-the-shell")
     assert account.password() == "from-the-shell"
+
+
+async def test_a_folder_opened_to_read_is_searchable() -> None:
+    """The library enters its selected state on SELECT only; the plugin opens a
+    folder to read with EXAMINE, so it says the folder is open itself. Without
+    that every search failed with "command SEARCH illegal in state AUTH",
+    before anything reached the server, and so did the new-mail watcher."""
+    account = plugin.load_accounts(settings())[0]["work"]
+    imap = plugin.Imap(account)
+    imap.client = Client()
+    assert imap.client.protocol.state == "AUTH"
+    await imap.select("INBOX")
+    assert imap.client.calls == [("examine", '"INBOX"')]  # read-only, still
+    assert imap.client.protocol.state == "SELECTED"
+    assert await imap.search(["UNSEEN"]) == [3, 5, 8]

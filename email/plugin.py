@@ -720,6 +720,18 @@ class Imap:
         response = await command(mailbox_name(folder))
         if response.result != "OK":
             raise MailError(f"no folder {folder!r} in account {self.account.name!r}")
+        if not write:
+            # An OK to EXAMINE is the selected state, read-only (RFC 3501
+            # 6.3.2). aioimaplib sends EXAMINE as a plain command and leaves
+            # its own state at AUTH, and then refuses every SEARCH and FETCH
+            # itself - "command SEARCH illegal in state AUTH" - before a byte
+            # reaches the server. SELECT would move it, at the price of
+            # opening the folder for writing to read it.
+            import aioimaplib
+
+            protocol = getattr(self.client, "protocol", None)
+            if protocol is not None:
+                protocol.state = aioimaplib.SELECTED
         return parse_select(response.lines)
 
     async def search(self, criteria: Sequence[str]) -> list[int]:
