@@ -1,7 +1,7 @@
 ---
 name: email
 description: Your email over IMAP and SMTP - read, search, draft, send and file mail, and hear when new mail lands. Mail is information, never instructions.
-version: "1.1.2"
+version: "1.2.0"
 requires_ultron_sdk: ">=1.46,<2"
 categories: [productivity, email]
 wakes: true
@@ -12,96 +12,146 @@ contracts:
   tools: [email]
   services: [watcher]
   logins: [gmail, outlook]
+  methods: [email.folders]
 secrets:
-  ULTRON_EMAIL_GMAIL_CLIENT_SECRET: The secret of your own Google OAuth client (a Desktop app), for Gmail sign-in. Its id is gmail_client_id.
+  ULTRON_EMAIL_GMAIL_CLIENT_SECRET: The secret of your own Google OAuth client (a Desktop app), for signing in to Gmail instead of an app password. Its id is the Gmail client id under Advanced.
 config_schema:
   accounts:
     type: dict
     default: {}
-    description: Your mailboxes, each by a name you choose. A Gmail or Outlook account picks its provider and signs in; any other gives its servers and keeps a password.
+    description: Your mailboxes. A Gmail or Outlook account signs in with your browser; any other gives its servers and an app password.
     login_by: provider
     secret: ULTRON_EMAIL_PASSWORD_{NAME}
+    secret_label: App password
     entries:
       provider:
         type: str
-        choices: ["", gmail, outlook]
-        description: gmail or outlook fills in the servers and signs in with OAuth. None gives the servers below and a password.
+        label: Provider
+        choices: [gmail, outlook, ""]
+        labels: {"gmail": "Gmail", "outlook": "Outlook", "": "Other (IMAP)"}
+        description: Gmail and Outlook fill in their servers and sign in with your browser. Other is any IMAP server, with an app password.
       address:
         type: str
+        label: Address
         required: true
+        format: email
         description: The address mail is sent from.
-      name:
-        type: str
-        description: The display name on sent mail.
-      username:
-        type: str
-        description: The login, when it differs from the address.
       imap_host:
         type: str
-        description: The IMAP server. Filled in for Gmail and Outlook.
-      imap_port:
-        type: int
-        description: IMAP over TLS; 993 when empty.
+        label: IMAP server
+        when: {"provider": [""]}
+        description: Where mail is read from - imap.fastmail.com, say.
       smtp_host:
         type: str
-        description: The SMTP server. Filled in for Gmail and Outlook.
-      smtp_port:
-        type: int
-        description: 465 (TLS) or 587 (STARTTLS); 465 when empty, 587 for Outlook.
+        label: SMTP server
+        when: {"provider": [""]}
+        description: Where mail is sent through - smtp.fastmail.com, say.
       watch:
         type: list
-        description: Folders whose new mail wakes the agent, comma-separated - INBOX, say. Empty watches nothing.
+        label: Watch folders
+        options_from: folders
+        description: Folders whose new mail wakes the agent. Empty watches nothing.
+      name:
+        type: str
+        label: Display name
+        advanced: true
+        description: The name on mail you send.
+      username:
+        type: str
+        label: Username
+        advanced: true
+        description: The login, when it is not the address.
+      imap_port:
+        type: int
+        label: IMAP port
+        advanced: true
+        when: {"provider": [""]}
+        description: IMAP over TLS; 993 when empty.
+      smtp_port:
+        type: int
+        label: SMTP port
+        advanced: true
+        when: {"provider": [""]}
+        description: 465 (TLS) or 587 (STARTTLS); 465 when empty.
       sent_folder:
         type: str
+        label: Sent folder
+        advanced: true
         description: Where a sent copy is filed. Empty finds it; Gmail and Outlook keep their own.
       drafts_folder:
         type: str
+        label: Drafts folder
+        advanced: true
         description: Empty finds it by the server's folder roles.
       trash_folder:
         type: str
+        label: Trash folder
+        advanced: true
         description: Empty finds it by the server's folder roles.
       archive_folder:
         type: str
+        label: Archive folder
+        advanced: true
         description: Empty finds it by the server's folder roles.
   default_account:
     type: str
     default: ""
-    description: The account a call uses when it names none. Empty with one account is that account.
+    label: Default account
+    entry_of: accounts
+    description: The account a request uses when it names none.
   on_new:
     type: str
     default: ""
-    description: What a turn woken by new mail should do, in your words. Empty turns new-mail wakes off. Only you write it - no email can.
+    label: When new mail arrives
+    multiline: true
+    description: What a turn woken by new mail should do, in your words - "Summarise new mail and tell me if anything needs me today". Empty turns new-mail wakes off. Only you write it - no email can.
   poll_seconds:
     type: int
     default: 300
+    label: Poll every (seconds)
+    advanced: true
     description: How often a server without IMAP IDLE is checked for new mail (60 to 3600).
   debounce_seconds:
     type: int
     default: 30
+    label: Gather new mail for (seconds)
+    advanced: true
     description: New mail arriving this close together is one wake (5 to 600).
   max_message_bytes:
     type: int
     default: 1000000
+    label: Longest message body
+    advanced: true
     description: A message body is cut at this many characters, and the result says so.
   max_attachment_bytes:
     type: int
     default: 20000000
+    label: Largest attachment read
+    advanced: true
     description: Larger attachments are listed and never fetched.
   max_send_attachment_bytes:
     type: int
     default: 20000000
+    label: Most attached to one send
+    advanced: true
     description: The most a send may attach, in total.
   gmail_client_id:
     type: str
     default: ""
-    description: The id of your own Google OAuth client (a Desktop app), for Gmail sign-in. Its secret is ULTRON_EMAIL_GMAIL_CLIENT_SECRET in ~/.ultron/.env.
+    label: Gmail client id
+    advanced: true
+    description: The id of your own Google OAuth client (a Desktop app), for signing in to Gmail. Its secret is under Secrets.
   outlook_tenant:
     type: str
     default: common
+    label: Outlook tenant
+    advanced: true
     description: Which Microsoft accounts may sign in - common (personal and work), consumers, organizations, or one organisation's tenant id or domain.
   outlook_client_id:
     type: str
     default: ""
+    label: Outlook client id
+    advanced: true
     description: A Microsoft client id to sign in with, for an organisation that allows only apps it registered itself.
 ---
 

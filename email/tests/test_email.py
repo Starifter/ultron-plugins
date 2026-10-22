@@ -1244,3 +1244,43 @@ async def test_a_folder_opened_to_read_is_searchable() -> None:
     assert imap.client.calls == [("examine", '"INBOX"')]  # read-only, still
     assert imap.client.protocol.state == "SELECTED"
     assert await imap.search(["UNSEEN"]) == [3, 5, 8]
+
+
+class PageContext:
+    """The parts of a plugin context the settings page's method reads."""
+
+    def __init__(self, current: dict[str, Any]) -> None:
+        self.settings: dict[str, Any] = {}  # what the session installed with: stale
+        self.current = current
+
+    def current_settings(self) -> dict[str, Any]:
+        return self.current
+
+
+async def test_folders_answers_for_a_saved_account_from_the_file(
+    server: Server, tmp_path: Path
+) -> None:
+    """`email.folders` (the watch picker): the account comes from the config as
+    it is now, so one saved a moment ago answers - and a server the page names
+    is never used, so a stored password cannot be pointed somewhere else."""
+    # A folder that holds folders and no mail is nothing to watch.
+    server.boxes["[Gmail]"] = Box(flags=("\\Noselect", "\\HasChildren"))
+    seen: list[str] = []
+
+    async def connect(account: Any) -> FakeImap:
+        seen.append(account.imap_host)
+        return await FakeImap(server).open()
+
+    handler = plugin.folders_method(PageContext(settings()), connector=connect)
+    answer = await handler({"entry": "work", "imap_host": "evil.example"}, tmp_path)
+    assert answer["options"] == ["INBOX", "Sent", "Drafts", "Trash", "Archive"]
+    assert seen == ["imap.example.com"]
+    with pytest.raises(plugin.MailError, match="no saved account 'nobody'"):
+        await handler({"entry": "nobody"}, tmp_path)
+
+
+def test_the_manifest_declares_the_folders_method() -> None:
+    manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
+    assert manifest.contracts()["methods"] == ("email.folders",)
+    watch = next(f for f in manifest.config_schema["accounts"].entries if f.key == "watch")
+    assert watch.options_from == "folders"

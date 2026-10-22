@@ -1975,6 +1975,41 @@ async def watch(service: Any) -> None:
     await Watcher(service).run()
 
 
+# -- the settings page ----------------------------------------------------------------
+
+
+def folders_method(
+    ctx: Any, connector: Connector = connect
+) -> Callable[[Mapping[str, Any], Any], Any]:
+    """`email.folders`: a saved account's folders, for the settings page's
+    watch picker (Ultron `plugin-sdk.md` §7.5.2, `options_from`).
+
+    The page names the account and nothing else. Its servers and its login come
+    from the config file as it is now (`ctx.current_settings()`, SDK 1.48), so an
+    account saved a moment ago answers, and a call cannot point a stored
+    password at a server the page chose. Folder names are server facts and
+    reach a page, never a model."""
+
+    async def folders(params: Mapping[str, Any], workspace: Any) -> Mapping[str, Any]:
+        name = str(params.get("entry", "") or "").strip()
+        current = getattr(ctx, "current_settings", None)
+        settings = current() if callable(current) else ctx.settings
+        accounts, _ = load_accounts(settings, Path(workspace))
+        account = accounts.get(name)
+        if account is None:
+            raise MailError(f"no saved account {name!r}: save it on the settings page first")
+        imap = await connector(account)
+        try:
+            found = await imap.folders()
+        finally:
+            await imap.close()
+        # A \Noselect folder holds folders and no mail: nothing to watch.
+        names = [f.name for f in found if "\\noselect" not in (flag.lower() for flag in f.flags)]
+        return {"options": names}
+
+    return folders
+
+
 # -- the plugin ---------------------------------------------------------------------------
 
 
@@ -1992,6 +2027,11 @@ class EmailPlugin(Plugin):
             )
         )
         ctx.register_service("watcher", watch)
+        ctx.register_method(
+            "email.folders",
+            folders_method(ctx),
+            audit=lambda params: {"entry": str(params.get("entry", ""))},
+        )
         for name, client in logins(ctx.settings, workspace=Path(ctx.workspace)).items():
             ctx.register_login(name, client)
 
