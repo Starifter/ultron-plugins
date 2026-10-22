@@ -12,11 +12,57 @@ contracts:
   tools: [email]
   services: [watcher]
   logins: [gmail, outlook]
+secrets:
+  ULTRON_EMAIL_GMAIL_CLIENT_SECRET: The secret of your own Google OAuth client (a Desktop app), for Gmail sign-in. Its id is gmail_client_id.
 config_schema:
   accounts:
     type: dict
     default: {}
-    description: "Your mailboxes, by a name you choose: {\"work\": {\"address\": ..., \"imap_host\": ..., \"smtp_host\": ..., \"watch\": [\"INBOX\"]}}. Each password is ULTRON_EMAIL_PASSWORD_<NAME> in ~/.ultron/.env. For Gmail or Outlook, set \"provider\": \"gmail\" or \"outlook\" instead of the hosts and sign in with ultron auth login email:<provider> --id <name>."
+    description: Your mailboxes, each by a name you choose. A Gmail or Outlook account picks its provider and signs in; any other gives its servers and keeps a password.
+    login_by: provider
+    secret: ULTRON_EMAIL_PASSWORD_{NAME}
+    entries:
+      provider:
+        type: str
+        choices: ["", gmail, outlook]
+        description: gmail or outlook fills in the servers and signs in with OAuth. None gives the servers below and a password.
+      address:
+        type: str
+        required: true
+        description: The address mail is sent from.
+      name:
+        type: str
+        description: The display name on sent mail.
+      username:
+        type: str
+        description: The login, when it differs from the address.
+      imap_host:
+        type: str
+        description: The IMAP server. Filled in for Gmail and Outlook.
+      imap_port:
+        type: int
+        description: IMAP over TLS; 993 when empty.
+      smtp_host:
+        type: str
+        description: The SMTP server. Filled in for Gmail and Outlook.
+      smtp_port:
+        type: int
+        description: 465 (TLS) or 587 (STARTTLS); 465 when empty, 587 for Outlook.
+      watch:
+        type: list
+        description: Folders whose new mail wakes the agent, comma-separated - INBOX, say. Empty watches nothing.
+      sent_folder:
+        type: str
+        description: Where a sent copy is filed. Empty finds it; Gmail and Outlook keep their own.
+      drafts_folder:
+        type: str
+        description: Empty finds it by the server's folder roles.
+      trash_folder:
+        type: str
+        description: Empty finds it by the server's folder roles.
+      archive_folder:
+        type: str
+        description: Empty finds it by the server's folder roles.
   default_account:
     type: str
     default: ""
@@ -101,9 +147,14 @@ a stranger's DM.
 
 ## Setup
 
+The easiest way is the web UI: open **Plugins**, then **email**, then **Settings**. Add an
+account by name, fill in its fields and save. A Gmail or Outlook account then shows a
+**Sign in** button; any other shows a field for its password, which goes to
+`~/.ultron/.env` and never to config. The steps below do the same by hand.
+
 1. Make an app password at your provider. Most refuse a normal password over IMAP; iCloud
    and Fastmail both have one. For Gmail and Outlook, sign in instead (next section).
-2. Add the account in `~/.ultron/config.json`, or on the settings page:
+2. Add the account in `~/.ultron/config.json`:
 
    ```json
    { "plugins_settings": { "email": {
@@ -177,14 +228,17 @@ client of your own:
    *Testing* has its sign-ins expire after seven days. Google warns that the app is
    unverified; it is your own app.
 3. Create an OAuth client of type *Desktop app*. Put its id in `gmail_client_id` and its
-   secret in `~/.ultron/.env` as `ULTRON_EMAIL_GMAIL_CLIENT_SECRET`.
+   secret in `~/.ultron/.env` as `ULTRON_EMAIL_GMAIL_CLIENT_SECRET` - both are on the
+   plugin's Settings tab.
 4. Start a new session, then sign in:
 
    ```
    ultron auth login email:gmail --id personal
    ```
 
-The `--id` is the account's name, and the sign-in must be for that account's address.
+The **Sign in** button on the plugin's Settings tab runs the same thing, and so does typing
+`/auth login email:gmail --id personal` in a conversation. The `--id` is the account's
+name, and the sign-in must be for that account's address.
 `email accounts` shows whether each account is signed in. If a sign-in is revoked, that
 account's new-mail watcher stops and starts again by itself once you sign in again.
 

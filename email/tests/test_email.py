@@ -1168,3 +1168,24 @@ async def test_a_new_sign_in_resumes_the_watcher(
         assert server.opened == 1
     finally:
         await cancel(task)
+
+
+def test_the_form_describes_every_account_key_and_how_each_signs_in() -> None:
+    """The settings page draws accounts from the manifest (Ultron
+    `plugin-sdk.md` section 7.5.1): every key `load_accounts` reads is a field,
+    a provider picks the login, and any other keeps its password where the
+    plugin reads it."""
+    import re
+
+    manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
+    accounts = manifest.config_schema["accounts"]
+    source = (HERE.parent / "plugin.py").read_text(encoding="utf-8")
+    start = source.index("def load_accounts")
+    body = source[start : source.index("\ndef ", start + 1)]
+    read = set(re.findall(r'entry(?:\.get\(|\[)"([a-z_]+)"', body))
+    assert read == {f.key for f in accounts.entries}
+    assert accounts.login_by == "provider"
+    assert set(accounts.entries[0].choices) == {"", *plugin.PROVIDERS}
+    assert set(manifest.logins) == set(plugin.PROVIDERS)
+    assert accounts.secret_for("work") == plugin.PASSWORD_VARIABLE.format(account="WORK")
+    assert plugin.GMAIL_SECRET_VARIABLE in manifest.secrets
