@@ -102,6 +102,9 @@ uv run --project ../Ultron pytest <name>/tests
 The script is the whole of what this marketplace promises about an entry. Tests are yours
 to add and welcome: put them in `<name>/tests/`, driving the plugin with a fake client the
 way `openrouter/tests/` does (asyncio in auto mode, from the `pyproject.toml` at the root).
+The libraries your manifest's `python_dependencies` names are installed for the tests the way
+`/plugins install` installs them for a user: what Ultron's environment lacks goes into
+`.test-libs/<name>/` (ignored by git) on the first run, with uv or pip, and is reused after.
 `ruff check .` and `ruff format .` read Ultron's own settings from the same file, so a
 plugin reads like the code it plugs into.
 
