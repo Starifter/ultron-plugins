@@ -21,6 +21,7 @@ import pytest
 
 from ultron.plugins import read_manifest
 from ultron.tools.authority import run_started
+from ultron.tools.profiles import ToolProfile
 
 HERE = Path(__file__).resolve().parent
 
@@ -563,7 +564,7 @@ async def test_without_move_a_server_is_told_no_rather_than_expunged(
     assert 1 in server.boxes["INBOX"].messages
 
 
-# -- E5: owner lanes only ----------------------------------------------------------------
+# -- E5: owner lanes, and the owner's schedule ----------------------------------------------
 
 
 def test_tool_is_absent_from_a_group_lane(tmp_path: Path) -> None:
@@ -571,6 +572,16 @@ def test_tool_is_absent_from_a_group_lane(tmp_path: Path) -> None:
     every lane no owner holds, and pins that in `tool-profiles.md` R3.8."""
     email = plugin.EmailTool(workspace=tmp_path, settings=settings())
     assert email.trusted_only is True and email.gated is True
+
+
+def test_tool_is_offered_in_a_cron_run_and_no_other_lane_no_owner_holds(tmp_path: Path) -> None:
+    """E5, R3.8a: `scheduled` lets a cron job have the tool; a group, a hook
+    session and a stranger's DM still do not. Sending stays E3's."""
+    email = plugin.EmailTool(workspace=tmp_path, settings=settings())
+    assert email.scheduled is True
+    assert ToolProfile(kind="cron", untrusted="a scheduled run").hidden("email", email) == ""
+    for kind in ("group", "hook", "direct"):
+        assert ToolProfile(kind=kind, untrusted="no owner").hidden("email", email), kind
 
 
 # -- R6.1, R7.1: correctness against the server -------------------------------------------

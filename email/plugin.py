@@ -29,7 +29,9 @@ person wrote in `on_new`. Never a subject, a sender or a snippet. Reading what
 arrived is the model's next step, through this tool, enveloped.
 
 The tool acts with the owner's mailboxes, so it is `trusted_only`: it does not
-exist in a group, a thread, a cron run, a hook session or a stranger's DM (E5).
+exist in a group, a thread, a hook session or a stranger's DM (E5). It is also
+`scheduled`, so a cron job has it - reading, drafting and filing, never sending,
+because a cron run is not a person's (E3).
 """
 
 from __future__ import annotations
@@ -1075,6 +1077,10 @@ class EmailTool(Tool):
     the server facts and the plugin's own lines stay outside the envelope."""
     gated = True
     trusted_only = True
+    scheduled = True
+    """A cron job may read and file mail (`tool-profiles.md` R3.8a); E3 is what
+    keeps it from sending. A core before SDK 1.50 ignores this and leaves the
+    tool out of cron, which is the safe way to be wrong."""
     description = DESCRIPTION
     parameters = {
         "type": "object",
