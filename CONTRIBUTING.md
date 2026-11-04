@@ -88,7 +88,7 @@ A skill that needs no code of its own is a directory under `skills/`: a `SKILL.m
 `name:` matches the directory, and whatever files it links. It is installed by `/skills
 install <name>` and copied whole, so keep tests and anything a reader does not need out of
 it. A skill that has to ship beside code - a tool, a setting, a provider - is a plugin that
-registers it with `ctx.register_skill`, as `himalaya` does.
+registers it with `ctx.register_skill`.
 
 ## Before opening a pull request
 
