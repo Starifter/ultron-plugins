@@ -90,6 +90,24 @@ install <name>` and copied whole, so keep tests and anything a reader does not n
 it. A skill that has to ship beside code - a tool, a setting, a provider - is a plugin that
 registers it with `ctx.register_skill`.
 
+## Contributing an MCP server
+
+An MCP server is a folder `mcp/<name>/` with a `SERVER.md`: frontmatter, then a few
+paragraphs on what it does and what a person should know before adding it. Copy one of
+the entries already there. The rules, which `scripts/validate.py` checks:
+
+- `name` matches the folder; `title` and a one-line `description` (at most 200
+  characters) are required; `homepage` is `https`.
+- Exactly one of `url` (a remote server, `https` only) and `command` with `args` (a local
+  one). A local package is **pinned** - `pkg@1.2.3` for `npx`, `pkg==1.2.3` for `uvx`, a
+  tag or digest for `docker run` - so adding it adds the version that was reviewed.
+- A key is declared under `secrets:`, never written into the source: `header` (and
+  `prefix`) for a remote server, `env` for a local one, with a `description` that says
+  where to get it. A server that signs in with OAuth declares nothing.
+- An optional `logo` is a file in the folder, under 64 KB, SVG, PNG, JPEG or WebP.
+
+Ultron's `docs/spec/mcp-catalog.md` is the whole contract.
+
 ## Before opening a pull request
 
 From a checkout of Ultron beside this one:

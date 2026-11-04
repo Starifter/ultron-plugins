@@ -66,6 +66,35 @@ repository is the plugin's.
 `skill_marketplace_official` in `config.json` is its address, as `plugin_marketplace_official`
 is the plugins'.
 
+## MCP servers
+
+`mcp/` is a catalogue of MCP servers worth adding: a folder per server, each a `SERVER.md`
+saying what it does, how to reach it, and which key it wants. Nothing in it runs. It comes
+down with the plugins, so `/plugins market refresh` fetches it, and the **Discover** tab of
+`/mcp` (or the MCP tab of the Plugins page) lists it.
+
+```
+/mcp install github                   add it, ask for its key, connect it now
+/mcp install time                     a local one shows its command line first
+/mcp key github                       replace a key later
+```
+
+A key is asked for at the masked prompt and kept in `~/.ultron/.env`; the server's entry
+in `config.json` names the variable and never holds the value. A server that signs in with
+OAuth is `/mcp login <name>` after installing.
+
+| server | kind | what it does |
+|---|---|---|
+| `github` | remote, token | Issues, pull requests, code search, Actions and releases. |
+| `linear` | remote, sign-in | Linear issues, projects and comments. |
+| `notion` | remote, sign-in | Notion pages and databases. |
+| `sentry` | remote, sign-in | Sentry errors, issues, traces and releases. |
+| `stripe` | remote, sign-in | Customers, payments, invoices and products. |
+| `context7` | remote | Current documentation for libraries and frameworks. |
+| `git` | local, `uvx` | Status, diffs, logs, blame and commits in local repositories. |
+| `time` | local, `uvx` | The time in any timezone, and conversions. |
+| `sequential-thinking` | local, `npx` | A step-by-step scratchpad for long problems. |
+
 ## What "official" means
 
 Only that Ultron knows this repository's address. A plugin here goes through the same

@@ -11,6 +11,11 @@ this script says nothing about it.
 as `official` for `/skills`. Each directory there is one skill, a `SKILL.md`
 read the way skill discovery reads it.
 
+`mcp/` is the MCP catalogue (Ultron's `docs/spec/mcp-catalog.md`): each
+directory one server, a `SERVER.md` read the way `/mcp install` reads it. The
+server is never connected and its command never run - what it does once added
+is the reader's call, as it is for a plugin.
+
 Usage: python scripts/validate.py [root]
 """
 
@@ -29,10 +34,18 @@ from ultron.plugins.discovery import (
 from ultron.sdk import SDK_VERSION
 from ultron.skills.base import read_manifest as read_skill
 
+try:  # an Ultron older than the catalogue reads no `mcp/`, and says so below
+    from ultron.plugins.mcp_catalog import read_entry, read_entry_logo
+except ImportError:  # pragma: no cover - depends on the Ultron installed
+    read_entry = None  # type: ignore[assignment]
+
 SKILLS = "skills"
 """Where the skills are - the official skill marketplace reads this directory."""
 
-SKIPPED = {".git", ".github", "scripts", SKILLS}
+MCP = "mcp"
+"""Where the MCP catalogue is - `/mcp install` reads this directory."""
+
+SKIPPED = {".git", ".github", "scripts", SKILLS, MCP}
 """Directories that are the repository's and not a plugin's."""
 
 
@@ -80,6 +93,17 @@ def skill_problems(directory: Path) -> list[str]:
     return found
 
 
+def mcp_problems(directory: Path) -> list[str]:
+    if read_entry is None:
+        return ["this Ultron has no MCP catalogue reader - install a newer one"]
+    entry = read_entry(directory, "official")
+    if entry.error:
+        return [entry.error]
+    if entry.logo and read_entry_logo(entry) is None:
+        return [f"logo {entry.logo!r} is missing, over the cap, or not the type it claims"]
+    return []
+
+
 def main(argv: list[str]) -> int:
     root = Path(argv[1]) if len(argv) > 1 else Path(__file__).resolve().parent.parent
     if (root / MANIFEST_FILENAME).is_file():
@@ -114,7 +138,22 @@ def main(argv: list[str]) -> int:
         for line in found:
             print(f"    {line}")
         failed += bool(found)
-    print(f"\n{len(entries)} plugin(s), {len(skills)} skill(s), {failed} failed, SDK {SDK_VERSION}")
+    mcp_root = root / MCP
+    servers = sorted(
+        path
+        for path in (mcp_root.iterdir() if mcp_root.is_dir() else ())
+        if path.is_dir() and not path.name.startswith(".")
+    )
+    for directory in servers:
+        found = mcp_problems(directory)
+        print(f"{MCP}/{directory.name:<20} {'ok' if not found else 'FAIL'}")
+        for line in found:
+            print(f"    {line}")
+        failed += bool(found)
+    print(
+        f"\n{len(entries)} plugin(s), {len(skills)} skill(s), {len(servers)} MCP server(s),"
+        f" {failed} failed, SDK {SDK_VERSION}"
+    )
     return 1 if failed else 0
 
 
