@@ -91,6 +91,16 @@ OAuth is `/mcp login <name>` after installing.
 | `sentry` | remote, sign-in | Sentry errors, issues, traces and releases. |
 | `stripe` | remote, sign-in | Customers, payments, invoices and products. |
 | `context7` | remote | Current documentation for libraries and frameworks. |
+| `dropbox` | remote, sign-in | Find, read, organise and share your files. |
+| `figma` | remote, sign-in | Design context for code, and writing back to the canvas. |
+| `canva` | remote, sign-in | Create, edit, search and export designs. |
+| `vercel` | remote, sign-in | Projects, deployments, build logs and docs. |
+| `railway` | remote, sign-in | Projects, services, deployments, variables and logs. |
+| `supabase` | remote, sign-in | Tables, SQL, migrations, logs and edge functions. |
+| `gitlab` | remote, sign-in | Issues, merge requests, pipelines and code search on GitLab.com. |
+| `cloudflare` | remote, sign-in | Workers, KV, R2, D1 and Hyperdrive. |
+| `paypal` | remote, sign-in | Invoices, orders, payments, subscriptions and disputes. |
+| `square` | remote, sign-in | Payments, orders, customers, catalog and inventory. |
 | `git` | local, `uvx` | Status, diffs, logs, blame and commits in local repositories. |
 | `time` | local, `uvx` | The time in any timezone, and conversions. |
 | `sequential-thinking` | local, `npx` | A step-by-step scratchpad for long problems. |
