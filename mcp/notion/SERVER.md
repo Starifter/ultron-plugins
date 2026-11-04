@@ -3,6 +3,7 @@ name: notion
 title: Notion
 description: Search, read and edit Notion pages and databases.
 homepage: https://developers.notion.com/docs/mcp
+logo: logo.svg
 categories: [productivity]
 url: https://mcp.notion.com/mcp
 ---

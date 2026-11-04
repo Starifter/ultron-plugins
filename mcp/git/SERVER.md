@@ -3,6 +3,7 @@ name: git
 title: Git
 description: Status, diffs, logs, blame and commits in local Git repositories.
 homepage: https://github.com/modelcontextprotocol/servers/tree/main/src/git
+logo: logo.svg
 categories: [developer]
 command: uvx
 args: [mcp-server-git==2026.10.28]

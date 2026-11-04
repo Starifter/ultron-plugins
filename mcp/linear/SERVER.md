@@ -3,6 +3,7 @@ name: linear
 title: Linear
 description: Find, create and update Linear issues, projects and comments.
 homepage: https://linear.app/docs/mcp
+logo: logo.svg
 categories: [productivity]
 url: https://mcp.linear.app/mcp
 ---

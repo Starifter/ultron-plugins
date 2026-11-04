@@ -3,6 +3,7 @@ name: sentry
 title: Sentry
 description: Errors, issues, traces and releases from Sentry.
 homepage: https://docs.sentry.io/product/sentry-mcp/
+logo: logo.svg
 categories: [developer]
 url: https://mcp.sentry.dev/mcp
 ---

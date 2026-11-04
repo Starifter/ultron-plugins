@@ -3,6 +3,7 @@ name: context7
 title: Context7
 description: Current documentation and code examples for libraries and frameworks.
 homepage: https://context7.com
+logo: logo.svg
 categories: [developer]
 url: https://mcp.context7.com/mcp
 ---

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 34 34">
+  <title>Context7</title>
+  <defs>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#dcebe7" />
+      <stop offset="1" stop-color="#cfe3de" />
+    </linearGradient>
+  </defs>
+  <rect x="0.5" y="0.5" width="33" height="33" rx="7.5" fill="url(#rim)" />
+  <rect x="5" y="5" width="24" height="24" rx="3" fill="#007a55" />
+  <g fill="none" stroke="#c8f4e9" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M11.2 10.5h2.8M12.4 10.5l1.1 4.2M13.5 18.3l-1.1 4.2M11.2 22.5h2.8" />
+    <path d="M22.8 10.5h-2.8M21.6 10.5l-1.1 4.2M20.5 18.3l1.1 4.2M22.8 22.5h-2.8" />
+  </g>
+</svg>

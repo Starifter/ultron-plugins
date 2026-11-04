@@ -3,6 +3,7 @@ name: github
 title: GitHub
 description: Issues, pull requests, code search, Actions and releases on GitHub, through GitHub's own MCP server.
 homepage: https://github.com/github/github-mcp-server
+logo: logo.svg
 categories: [developer]
 url: https://api.githubcopilot.com/mcp/
 secrets:

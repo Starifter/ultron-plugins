@@ -3,6 +3,7 @@ name: sequential-thinking
 title: Sequential thinking
 description: A scratchpad for working through a problem step by step, revising and branching as it goes.
 homepage: https://github.com/modelcontextprotocol/servers/tree/main/src/sequentialthinking
+logo: logo.svg
 categories: [utility]
 command: npx
 args: ["-y", "@modelcontextprotocol/server-sequential-thinking@2.0.0"]

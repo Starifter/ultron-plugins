@@ -3,6 +3,7 @@ name: stripe
 title: Stripe
 description: Customers, payments, invoices and products in your Stripe account.
 homepage: https://docs.stripe.com/mcp
+logo: logo.svg
 categories: [finance, developer]
 url: https://mcp.stripe.com
 ---
