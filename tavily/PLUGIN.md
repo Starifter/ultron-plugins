@@ -1,5 +1,6 @@
 ---
 name: tavily
+title: Tavily
 description: Tavily Search as a web_search backend - results built for agents, an answer if you want one.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"

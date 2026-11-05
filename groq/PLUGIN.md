@@ -1,5 +1,6 @@
 ---
 name: groq
+title: Groq
 description: The Groq model provider - open models, served fast - and Whisper for voice notes.
 version: "1.1.0"
 requires_ultron_sdk: ">=1.23,<2"

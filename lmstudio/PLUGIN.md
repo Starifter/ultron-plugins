@@ -1,5 +1,6 @@
 ---
 name: lmstudio
+title: LM Studio
 description: Models loaded in LM Studio on this machine - no key, no bill.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.24,<2"

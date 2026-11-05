@@ -1,5 +1,6 @@
 ---
 name: google-cli
+title: Google-CLI
 description: Google Workspace - Calendar, Gmail, Drive, Docs, Sheets and more - through the gog CLI; reads run read-only, every change is a card you approve.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.41,<2"

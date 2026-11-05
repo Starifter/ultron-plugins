@@ -1,5 +1,6 @@
 ---
 name: dice
+title: Dice
 description: Roll dice - a small, honest example of a marketplace plugin.
 version: "1.0.0"
 requires_ultron_sdk: ">=1,<2"

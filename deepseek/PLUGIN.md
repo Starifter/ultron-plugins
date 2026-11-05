@@ -1,5 +1,6 @@
 ---
 name: deepseek
+title: DeepSeek
 description: The DeepSeek model provider - DeepSeek's own models, at DeepSeek.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.25,<2"

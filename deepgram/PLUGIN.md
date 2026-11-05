@@ -1,5 +1,6 @@
 ---
 name: deepgram
+title: Deepgram
 description: Deepgram speech-to-text - voice notes and recordings transcribed by Nova.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.23,<2"

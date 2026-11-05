@@ -1,5 +1,6 @@
 ---
 name: fireworks
+title: Fireworks AI
 description: The Fireworks AI model provider - open models, hosted at Fireworks - and FLUX pictures for imagegen.
 version: "1.3.0"
 requires_ultron_sdk: ">=1.25,<2"

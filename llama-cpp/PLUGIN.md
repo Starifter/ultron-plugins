@@ -1,5 +1,6 @@
 ---
 name: llama-cpp
+title: llama.cpp
 description: A model provider for a llama.cpp server on this machine - GGUF models, no key, no bill.
 version: "1.1.0"
 requires_ultron_sdk: ">=1.24,<2"

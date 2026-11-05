@@ -1,5 +1,6 @@
 ---
 name: ollama
+title: Ollama
 description: Models through a local Ollama - no key, no bill - or Ollama's cloud with a key.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.24,<2"

@@ -1,5 +1,6 @@
 ---
 name: videogen
+title: Video Generation
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
 logo: logo.svg

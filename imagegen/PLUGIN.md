@@ -1,5 +1,6 @@
 ---
 name: imagegen
+title: Image Generation
 description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg

@@ -1,5 +1,6 @@
 ---
 name: openrouter
+title: OpenRouter
 description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image, video and music models for imagegen, videogen and musicgen.
 version: "1.5.0"
 requires_ultron_sdk: ">=1.23,<2"

@@ -1,5 +1,6 @@
 ---
 name: exa
+title: Exa
 description: Exa as a web_search backend - search by meaning, with the passages that match.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"

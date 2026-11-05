@@ -1,5 +1,6 @@
 ---
 name: diffs
+title: Diffs
 description: Diffs rendered for a person - a viewer in the web UI, a PNG or a PDF.
 categories: [code, media]
 logo: logo.svg

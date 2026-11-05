@@ -1,5 +1,6 @@
 ---
 name: perplexity
+title: Perplexity
 description: Perplexity as a web_search backend - its ranked results, or a written answer with its sources.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"

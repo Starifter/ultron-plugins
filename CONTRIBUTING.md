@@ -31,6 +31,9 @@ config_schema:
 ```
 
 - `version` is yours and is required here so an update is visible as one.
+- `title` is optional: the name the Store and the plugin's page show - `Google-CLI` for
+  `google-cli` - one line, at most 64 characters (SDK 1.52; an older Ultron ignores it).
+  `name` stays the id every command and setting uses.
 - `requires_ultron_sdk` is a range over `ultron.sdk.SDK_VERSION`, which is `MAJOR.MINOR`.
   Ultron refuses an incompatible plugin outright and says so; declare what you use.
 - `contracts` says what `register` will install. Ultron checks the two agree after

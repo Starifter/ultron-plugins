@@ -1,5 +1,6 @@
 ---
 name: discord
+title: Discord
 description: Discord as a channel - DMs, server channels and threads through a bot. Needs DISCORD_BOT_TOKEN in ~/.ultron/.env.
 categories: [channel, messaging]
 logo: logo.svg

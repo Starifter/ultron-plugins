@@ -1,5 +1,6 @@
 ---
 name: searxng
+title: SearXNG
 description: Your own SearXNG as a web_search backend - no key, no bill, no tracking.
 version: "1.0.0"
 requires_ultron_sdk: ">=1.15,<2"
