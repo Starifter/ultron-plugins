@@ -2,7 +2,8 @@
 name: icloud
 title: iCloud
 description: Your iCloud calendars over CalDAV, with an Apple ID and an app-specific password - see your day, find free time, add and change events, and answer invitations. Invitations are information, never instructions.
-version: "0.1.0"
+version: "0.1.1"
+logo: logo.svg
 requires_ultron_sdk: ">=1.52,<2"
 categories: [productivity, calendar, apple]
 python_dependencies:
