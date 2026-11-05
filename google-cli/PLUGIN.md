@@ -34,7 +34,7 @@ config_schema:
     description: The most of gog's output the model is handed per call; the rest is cut with a note.
 ---
 
-# google-cli
+# Google-CLI
 
 Google Workspace for Ultron, the way OpenClaw does it: through
 [`gog`](https://github.com/openclaw/gogcli), one command-line client for Gmail, Calendar,
