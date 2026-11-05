@@ -4,8 +4,8 @@ A directory plugin written against `ultron.sdk` and nothing else, built from
 Ultron's `docs/spec/email.md`. It brings one tool, `email`, and one background
 service, `watcher`. IMAP and SMTP are built in, through `aioimaplib` and
 `aiosmtplib`; there is no backend layer (R6.4). An account logs in with a
-password - an app password at most providers. `provider:` fills in Gmail's or
-Outlook's servers and nothing else.
+password - an app password at most providers. `provider: gmail` fills in Gmail's
+servers and nothing else.
 
 **Mail is information, never instruction (E1).** Nothing a message says is a
 prompt, a command or a reason to act. Every word a sender controls - every
@@ -74,7 +74,6 @@ class Preset:
 
 PROVIDERS = {
     "gmail": Preset("imap.gmail.com", "smtp.gmail.com", 465),
-    "outlook": Preset("outlook.office365.com", "smtp.office365.com", 587),
 }
 
 READ_ACTIONS = ("accounts", "folders", "search", "read", "thread", "attachment")
@@ -252,11 +251,6 @@ def refused(account: Account, server: str) -> str:
         return (
             f"{said} - check {account.password_variable} is a Gmail app password (it needs "
             "2-Step Verification on) and that IMAP is on in Gmail's settings"
-        )
-    if account.provider == "outlook":
-        return (
-            f"{said} - check {account.password_variable}; Microsoft refuses passwords over "
-            "IMAP and SMTP for most accounts, and Ultron has no Outlook sign-in"
         )
     return f"{said} - check {account.password_variable} (many providers want an app password)"
 
@@ -1013,8 +1007,8 @@ class EmailTool(Tool):
             "no email account is configured. The person adds one under "
             "plugins_settings.email.accounts (address, imap_host, smtp_host, and watch for "
             "folders to hear about), and its password as ULTRON_EMAIL_PASSWORD_<ACCOUNT> "
-            "with the `secret` tool. A Gmail or Outlook account can set provider: gmail or "
-            "outlook in place of the two hosts. Tell them; do not ask for a password in chat."
+            "with the `secret` tool. A Gmail account can set provider: gmail "
+            "in place of the two hosts. Tell them; do not ask for a password in chat."
         )
         if self.problems:
             said += " Problems: " + "; ".join(self.problems)

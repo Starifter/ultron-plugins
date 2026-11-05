@@ -885,7 +885,7 @@ def test_many_uids_are_a_count_and_a_range() -> None:
     assert len(text) < 2000
 
 
-# -- §6.1: Gmail and Outlook presets ----------------------------------------------------------
+# -- §6.1: the Gmail preset ------------------------------------------------------------------
 
 
 GMAIL_ACCOUNT = {"provider": "gmail", "address": "me@gmail.com", "watch": ["INBOX"]}
@@ -917,9 +917,9 @@ def test_a_provider_fills_the_hosts_and_a_typed_one_wins() -> None:
         {
             "accounts": {
                 "home": dict(GMAIL_ACCOUNT),
-                "work": {"provider": "outlook", "address": "me@contoso.com"},
                 "mine": dict(GMAIL_ACCOUNT, imap_host="imap.proxy.example"),
                 "odd": {"provider": "yahoo", "address": "me@yahoo.com"},
+                "gone": {"provider": "outlook", "address": "me@contoso.com"},
             }
         }
     )
@@ -929,20 +929,15 @@ def test_a_provider_fills_the_hosts_and_a_typed_one_wins() -> None:
         "smtp.gmail.com",
         465,
     )
-    work = accounts["work"]
-    assert (work.imap_host, work.smtp_host, work.smtp_port) == (
-        "outlook.office365.com",
-        "smtp.office365.com",
-        587,
-    )
     assert accounts["mine"].imap_host == "imap.proxy.example"
-    assert "odd" not in accounts and any("provider" in p for p in problems)
+    assert "odd" not in accounts and "gone" not in accounts
+    assert sum("provider" in p for p in problems) == 2
 
 
 async def test_a_provider_account_logs_in_with_its_app_password(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """There is no OAuth sign-in: a Gmail or Outlook account is a password
+    """There is no OAuth sign-in: a Gmail account is a password
     account whose servers are filled in."""
     import aiosmtplib
 
@@ -972,16 +967,15 @@ async def test_a_refused_provider_login_names_the_app_password(
     async def opened(account: Any) -> Any:
         return await plugin.Imap(account).open()
 
-    for provider, said in (("gmail", "Gmail app password"), ("outlook", "no Outlook sign-in")):
-        email = plugin.EmailTool(
-            workspace=tmp_path,
-            settings=settings(accounts={"work": dict(GMAIL_ACCOUNT, provider=provider)}),
-            connector=opened,
-            sender=outbox,
-        )
-        result = await email.run("search")
-        assert result.is_error and said in result.content
-        assert "ULTRON_EMAIL_PASSWORD_WORK" in result.content and "wrong" not in result.content
+    email = plugin.EmailTool(
+        workspace=tmp_path,
+        settings=settings(accounts={"work": dict(GMAIL_ACCOUNT)}),
+        connector=opened,
+        sender=outbox,
+    )
+    result = await email.run("search")
+    assert result.is_error and "Gmail app password" in result.content
+    assert "ULTRON_EMAIL_PASSWORD_WORK" in result.content and "wrong" not in result.content
 
 
 def test_the_form_describes_every_account_key() -> None:

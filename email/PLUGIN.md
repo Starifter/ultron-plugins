@@ -17,16 +17,16 @@ config_schema:
   accounts:
     type: dict
     default: {}
-    description: Your mailboxes, each with its servers and an app password. Gmail and Outlook fill in their own servers.
+    description: Your mailboxes, each with its servers and an app password. Gmail fills in its own servers.
     secret: ULTRON_EMAIL_PASSWORD_{NAME}
     secret_label: App password
     entries:
       provider:
         type: str
         label: Provider
-        choices: [gmail, outlook, ""]
-        labels: {"gmail": "Gmail", "outlook": "Outlook", "": "Other (IMAP)"}
-        description: Gmail and Outlook fill in their servers. Other is any IMAP server. Every account signs in with an app password.
+        choices: [gmail, ""]
+        labels: {"gmail": "Gmail", "": "Other (IMAP)"}
+        description: Gmail fills in its servers. Other is any IMAP server. Every account signs in with an app password.
       address:
         type: str
         label: Address
@@ -138,7 +138,7 @@ config_schema:
 
 Your mail for Ultron, over plain IMAP and SMTP, so it works with any provider: Fastmail,
 iCloud, Gmail, your own server - anything that takes an app password over IMAP (see
-[Gmail and Outlook](#gmail-and-outlook)). One tool, `email`,
+[Gmail](#gmail)). One tool, `email`,
 reads, searches, drafts, sends and files mail across as many accounts as you configure.
 One background service watches the folders you choose and tells the agent when new mail
 lands.
@@ -182,7 +182,7 @@ account by name, fill in its fields and its app password, and save. The password
 `~/.ultron/.env` and never to config. The steps below do the same by hand.
 
 1. Make an app password at your provider. Most refuse a normal password over IMAP; iCloud
-   and Fastmail both have one. For Gmail and Outlook, see the next section.
+   and Fastmail both have one. For Gmail, see the next section.
 2. Add the account in `~/.ultron/config.json`:
 
    ```json
@@ -218,12 +218,12 @@ account by name, fill in its fields and its app password, and save. The password
 | `watch` | `[]` | Folders whose new mail wakes the agent. Empty watches nothing. |
 | `sent_folder` | `auto` | Where a sent copy is filed. `auto` finds your Sent folder, and files nothing for Gmail and Outlook, which keep their own copy. `""` never files one. |
 | `drafts_folder`, `trash_folder`, `archive_folder` | `auto` | Found by the server's folder roles, else by name. |
-| `provider` | `""` | `gmail` or `outlook`: fills in the hosts and ports. The account still signs in with an app password. |
+| `provider` | `""` | `gmail`: fills in the hosts and ports. The account still signs in with an app password. |
 
-## Gmail and Outlook
+## Gmail
 
-Set `provider` and the plugin fills in the servers; the account signs in with an app
-password like any other. Ultron has no Google or Microsoft sign-in.
+Set `provider: gmail` and the plugin fills in Gmail's servers; the account signs in with an
+app password like any other. Ultron has no Google sign-in.
 
 ```json
 { "plugins_settings": { "email": {
@@ -233,13 +233,12 @@ password like any other. Ultron has no Google or Microsoft sign-in.
 } } }
 ```
 
-**Gmail.** Turn on 2-Step Verification for your Google account, make an app password at
+Turn on 2-Step Verification for your Google account, make an app password at
 <https://myaccount.google.com/apppasswords>, and store it as
 `ULTRON_EMAIL_PASSWORD_PERSONAL`. IMAP must be on in Gmail's settings.
 
-**Outlook.** Microsoft has turned off passwords over IMAP and SMTP for Outlook.com and most
-Microsoft 365 mailboxes, so an Outlook account works only where your organisation still
-allows an app password. If the login is refused, that is why.
+Outlook is not supported: Microsoft has turned off passwords over IMAP and SMTP for
+Outlook.com and most Microsoft 365 mailboxes, and Ultron has no Microsoft sign-in.
 
 ## What the agent can do
 
