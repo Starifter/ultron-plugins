@@ -281,7 +281,7 @@ async def listed(t: Any) -> list[str]:
 def test_the_manifest_declares_what_register_installs() -> None:
     manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
     assert manifest.name == "icloud"
-    assert manifest.contracts()["tools"] == ("apple_calendar",)
+    assert manifest.contracts()["tools"] == ("apple_calendar", "apple_mail")
     assert not manifest.warnings, manifest.warnings
 
 
@@ -296,7 +296,7 @@ def test_it_installs_through_ultrons_own_path(tmp_path: Path) -> None:
     )
     try:
         assert provision.ok, provision.error
-        assert provision.tools == ("apple_calendar",) and "apple_calendar" in tools
+        assert provision.tools == ("apple_calendar", "apple_mail") and "apple_calendar" in tools
     finally:
         uninstall_one(provision, tools=tools)
 
@@ -717,3 +717,538 @@ def test_tool_is_absent_from_a_group_lane(tmp_path: Path) -> None:
     assert ToolProfile(kind="cron", untrusted="a scheduled run").hidden(t.name, t) == ""
     for kind in ("group", "hook", "direct"):
         assert ToolProfile(kind=kind, untrusted="no owner").hidden(t.name, t), kind
+
+
+# == Part 2: mail (spec §19) ==================================================================
+#
+# The `email` suite's in-memory IMAP server and recording SMTP sender, with iCloud's
+# folder names. A test that holds the same rule as one in `email`'s suite has its name.
+
+import json  # noqa: E402
+from email.message import EmailMessage  # noqa: E402
+
+
+def mail(
+    sender: str = "Billing <billing@example.net>",
+    subject: str = "Invoice 2291 due Friday",
+    body: str = "Hi, please pay invoice 2291.",
+    to: str = ME,
+    message_id: str = "<a1@example.net>",
+) -> bytes:
+    message = EmailMessage()
+    message["From"] = sender
+    message["To"] = to
+    message["Subject"] = subject
+    message["Date"] = "Tue, 21 Oct 2026 10:13:58 +0100"
+    message["Message-ID"] = message_id
+    message.set_content(body)
+    return message.as_bytes()
+
+
+class Box:
+    def __init__(self, validity: int = 1714, flags: tuple[str, ...] = ()) -> None:
+        self.validity = validity
+        self.flags = flags
+        self.messages: dict[int, tuple[set[str], bytes]] = {}
+        self.next = 1
+
+    def add(self, data: bytes, *flags: str) -> int:
+        uid = self.next
+        self.messages[uid] = (set(flags), data)
+        self.next += 1
+        return uid
+
+
+class ImapServer:
+    """One iCloud mailbox, with iCloud's folder names, and every command sent."""
+
+    def __init__(self, *, move: bool = True) -> None:
+        self.boxes: dict[str, Box] = {
+            "INBOX": Box(),
+            "Sent Messages": Box(flags=("\\Sent",)),
+            "Drafts": Box(flags=("\\Drafts",)),
+            "Deleted Messages": Box(flags=("\\Trash",)),
+            "Archive": Box(flags=("\\Archive",)),
+        }
+        self.capabilities = {"IDLE"} | ({"MOVE"} if move else set())
+        self.log: list[tuple[Any, ...]] = []
+        self.pushed = asyncio.Event()
+        self.opened = 0
+
+
+class FakeImap:
+    def __init__(self, server: ImapServer) -> None:
+        self.server = server
+        self.box: Box | None = None
+
+    async def open(self) -> FakeImap:
+        self.server.opened += 1
+        return self
+
+    def has(self, capability: str) -> bool:
+        return capability in self.server.capabilities
+
+    async def close(self) -> None:
+        pass
+
+    async def folders(self) -> list[Any]:
+        return [plugin.Folder(name, box.flags) for name, box in self.server.boxes.items()]
+
+    async def status(self, folder: str) -> tuple[int, int]:
+        box = self.server.boxes[folder]
+        return len(box.messages), sum(1 for f, _ in box.messages.values() if "\\Seen" not in f)
+
+    async def select(self, folder: str, *, write: bool = False) -> Any:
+        if folder not in self.server.boxes:
+            raise plugin.MailError(f"no folder {folder!r}")
+        self.box = self.server.boxes[folder]
+        self.server.log.append(("select", folder, write))
+        return plugin.Selected(self.box.validity, self.box.next)
+
+    async def search(self, criteria: list[str]) -> list[int]:
+        assert self.box is not None
+        self.server.log.append(("search", *criteria))
+        found = []
+        for uid, (flags, data) in self.box.messages.items():
+            words, i, keep = list(criteria), 0, True
+            while i < len(words):
+                if words[i] == "UNSEEN":
+                    keep = keep and "\\Seen" not in flags
+                    i += 1
+                elif words[i] == "UID":
+                    keep = keep and uid >= int(words[i + 1].split(":")[0])
+                    i += 2
+                elif words[i] in ("FROM", "SUBJECT", "TEXT", "TO"):
+                    keep = keep and json.loads(words[i + 1]).lower() in data.decode().lower()
+                    i += 2
+                else:
+                    i += 1
+            if keep:
+                found.append(uid)
+        return found
+
+    async def fetch(self, uids: list[int], parts: str) -> list[Any]:
+        assert self.box is not None
+        return [
+            plugin.Fetched(
+                u,
+                tuple(sorted(self.box.messages[u][0])),
+                100,
+                "21-Oct-2026 09:14:00 +0000",
+                self.box.messages[u][1],
+            )
+            for u in uids
+            if u in self.box.messages
+        ]
+
+    async def append(self, folder: str, data: bytes, flags: str) -> None:
+        self.server.log.append(("append", folder, flags))
+        self.server.boxes[folder].add(data, *flags.strip("()").split())
+
+    async def move(self, uids: list[int], folder: str) -> None:
+        assert self.box is not None
+        if "MOVE" not in self.server.capabilities:
+            raise plugin.MailError("no MOVE")
+        self.server.log.append(("move", tuple(uids), folder))
+        for uid in uids:
+            flags, data = self.box.messages.pop(uid)
+            self.server.boxes[folder].add(data, *flags)
+
+    async def store(self, uids: list[int], operation: str, flag: str) -> None:
+        assert self.box is not None
+        self.server.log.append(("store", tuple(uids), operation, flag))
+        for uid in uids:
+            (
+                self.box.messages[uid][0].add
+                if operation == "+FLAGS"
+                else self.box.messages[uid][0].discard
+            )(flag)
+
+    async def idle(self, timeout: float) -> None:
+        await self.server.pushed.wait()
+        self.server.pushed.clear()
+
+
+def connector(server: ImapServer) -> Callable[[Any], Awaitable[FakeImap]]:
+    async def connect(account: Any) -> FakeImap:
+        return await FakeImap(server).open()
+
+    return connect
+
+
+class Outbox:
+    def __init__(self) -> None:
+        self.sent: list[EmailMessage] = []
+
+    async def __call__(self, account: Any, message: EmailMessage) -> None:
+        self.sent.append(message)
+
+
+def mail_settings(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "accounts": {"home": {"apple_id": ME, "watch": ["INBOX"]}},
+        "on_new": "Summarise it.",
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.fixture
+def imap() -> ImapServer:
+    s = ImapServer()
+    s.boxes["INBOX"].add(mail())
+    return s
+
+
+@pytest.fixture
+def outbox() -> Outbox:
+    return Outbox()
+
+
+def mailer(server: ImapServer, outbox: Outbox, tmp_path: Path, **kw: Any) -> Any:
+    return plugin.AppleMailTool(
+        workspace=tmp_path,
+        settings=kw.pop("settings", None) or mail_settings(),
+        connector=connector(server),
+        sender=outbox,
+        **kw,
+    )
+
+
+# -- R17.1 - R17.4: the account and Apple's servers ---------------------------------------------
+
+
+def test_the_servers_are_apples_and_fixed() -> None:
+    """R17.2: the hosts are constants; an account cannot name its own."""
+    found, problems = plugin.load_mailboxes(mail_settings())
+    box = found["home"]
+    assert (box.imap_host, box.imap_port) == ("imap.mail.me.com", 993)
+    assert (box.smtp_host, box.smtp_port) == ("smtp.mail.me.com", 587)
+    assert box.address == ME and box.watch == ("INBOX",)
+    _, problems = plugin.load_mailboxes(
+        {"accounts": {"home": {"apple_id": ME, "imap_host": "imap.evil.example"}}}
+    )
+    assert any("unknown key imap_host" in p for p in problems)
+
+
+async def test_smtp_goes_to_apple_with_starttls(monkeypatch: pytest.MonkeyPatch) -> None:
+    import aiosmtplib
+
+    seen: dict[str, Any] = {}
+
+    async def send(message: Any, **kw: Any) -> None:
+        seen.update(kw)
+
+    monkeypatch.setattr(aiosmtplib, "send", send)
+    box = plugin.load_mailboxes(mail_settings())[0]["home"]
+    await plugin.smtp_send(box, EmailMessage())
+    assert seen["hostname"] == "smtp.mail.me.com" and seen["port"] == 587
+    assert seen["start_tls"] is True and seen["use_tls"] is False
+    assert seen["username"] == ME and seen["password"] == PASSWORD
+
+
+async def test_the_imap_login_tries_the_name_then_the_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R17.3: the name part first, then the whole address, as Apple documents."""
+    import aioimaplib
+
+    tried: list[str] = []
+    hosts: list[tuple[str, int]] = []
+
+    class Said:
+        def __init__(self, result: str) -> None:
+            self.result, self.lines = result, [b"x"]
+
+    class Client:
+        def __init__(self, host: str, port: int, **kw: Any) -> None:
+            hosts.append((host, port))
+            self.protocol = type("P", (), {"capabilities": ("IDLE", "MOVE")})()
+
+        async def wait_hello_from_server(self) -> None:
+            return None
+
+        async def login(self, user: str, password: str) -> Said:
+            tried.append(user)
+            return Said("OK" if user == ME else "NO")
+
+    monkeypatch.setattr(aioimaplib, "IMAP4_SSL", Client)
+    box = plugin.load_mailboxes(mail_settings())[0]["home"]
+    await plugin.Imap(box).open()
+    assert tried == ["me", ME]
+    assert hosts == [("imap.mail.me.com", 993)]
+
+    tried.clear()
+    monkeypatch.setattr(Client, "login", lambda self, u, p: _said(tried, u))
+    with pytest.raises(plugin.LoginRefused, match="app-specific password"):
+        await plugin.Imap(box).open()
+    assert tried == ["me", ME]
+
+
+async def _said(tried: list[str], user: str) -> Any:
+    tried.append(user)
+    return type("Said", (), {"result": "NO", "lines": [b"no"]})()
+
+
+async def test_a_mail_address_is_needed_for_another_domain(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    """R17.1: an Apple ID at another domain names `mail_address`; the calendar is unaffected."""
+    other = {"accounts": {"home": {"apple_id": "me@gmail.com"}}}
+    result = await mailer(imap, outbox, tmp_path, settings=other).run("search")
+    assert result.is_error and "mail_address" in result.content
+    assert "home" in plugin.load_accounts(other)[0]
+    fixed = {"accounts": {"home": {"apple_id": "me@gmail.com", "mail_address": "me@icloud.com"}}}
+    assert not (await mailer(imap, outbox, tmp_path, settings=fixed).run("search")).is_error
+    _, problems = plugin.load_accounts(
+        {"accounts": {"home": {"apple_id": ME, "mail_address": "nope"}}}
+    )
+    assert any("mail_address is not an address" in p for p in problems)
+
+
+def test_the_form_describes_the_mail_keys() -> None:
+    """R17.4."""
+    manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
+    entries = {f.key: f for f in manifest.config_schema["accounts"].entries}
+    assert {"mail_address", "watch"} <= set(entries)
+    assert manifest.contracts()["methods"] == ("icloud.folders",)
+    assert manifest.contracts()["services"] == ("watcher",) and manifest.wakes is True
+
+
+# -- A7, R17.5 - R17.9: the tool -----------------------------------------------------------
+
+
+async def test_message_text_is_always_inside_the_envelope(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    result = await mailer(imap, outbox, tmp_path).run("read", uid=1)
+    assert result.wrapped and not result.is_error, result.content
+    outside, inside = split(result.content)
+    assert "home INBOX uid 1 (uidvalidity 1714)" in outside
+    assert "apple_mail:home" in inside
+    for written in ("Billing", "Invoice 2291", "please pay", "billing@example.net"):
+        assert written not in outside, written
+        assert written in inside, written
+
+
+async def test_send_is_refused_in_a_woken_run_in_yolo(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    t = mailer(imap, outbox, tmp_path)
+    for starter in ("system", "hook", "untrusted", "sub", None):
+        result = await as_(starter, lambda: t.run("send", to=["a@x.com"], subject="hi", body="b"))
+        assert result.is_error and "not started by a person" in result.content, starter
+    assert t.subject({"action": "send", "to": ["a@x.com"]}) is None
+    assert outbox.sent == []
+
+
+async def test_reply_and_forward_are_refused_in_a_woken_run(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    t = mailer(imap, outbox, tmp_path)
+    for action in ("reply", "forward"):
+        result = await as_("system", lambda a=action: t.run(a, uid=1, to=["a@x.com"], body="b"))
+        assert result.is_error and "not started by a person" in result.content
+    assert outbox.sent == []
+
+
+async def test_draft_is_allowed_in_a_woken_run(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    t = mailer(imap, outbox, tmp_path)
+    result = await as_("system", lambda: t.run("draft", to=["a@x.com"], subject="hi", body="b"))
+    assert not result.is_error, result.content
+    assert len(imap.boxes["Drafts"].messages) == 1
+
+
+async def test_organizing_is_allowed_in_a_woken_run(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    t = mailer(imap, outbox, tmp_path)
+    result = await as_("system", lambda: t.run("mark", uid=1, seen=True))
+    assert not result.is_error, result.content
+    assert "\\Seen" in imap.boxes["INBOX"].messages[1][0]
+
+
+async def test_trash_moves_and_never_expunges(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    result = await mailer(imap, outbox, tmp_path).run("trash", uid=1)
+    assert not result.is_error, result.content
+    assert len(imap.boxes["Deleted Messages"].messages) == 1 and not imap.boxes["INBOX"].messages
+    assert not [e for e in imap.log if e[0] == "store" and "\\Deleted" in e]
+    no_move = ImapServer(move=False)
+    no_move.boxes["INBOX"].add(mail())
+    result = await mailer(no_move, outbox, tmp_path).run("trash", uid=1)
+    assert result.is_error and 1 in no_move.boxes["INBOX"].messages
+
+
+async def test_search_quotes_every_value(imap: ImapServer, outbox: Outbox, tmp_path: Path) -> None:
+    await mailer(imap, outbox, tmp_path).run("search", subject='x" OR ALL "')
+    search = next(e for e in imap.log if e[0] == "search")
+    assert search[1:] == ("SUBJECT", '"x\\" OR ALL \\""')
+    result = await mailer(imap, outbox, tmp_path).run("search", subject="a\r\nb")
+    assert result.is_error and "line break" in result.content
+
+
+async def test_uidvalidity_change_refuses_the_call(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    result = await mailer(imap, outbox, tmp_path).run("read", uid=1, uidvalidity=99)
+    assert result.is_error and "renumbered" in result.content
+
+
+async def test_a_sent_copy_is_filed_in_sent_messages(
+    imap: ImapServer, outbox: Outbox, tmp_path: Path
+) -> None:
+    """R17.8: iCloud's SMTP is not known to file one, so a copy is appended."""
+    t = mailer(imap, outbox, tmp_path)
+    result = await as_("person", lambda: t.run("send", to=["a@x.com"], subject="hi", body="b"))
+    assert not result.is_error, result.content
+    assert len(outbox.sent) == 1 and outbox.sent[0]["From"] == ME
+    assert len(imap.boxes["Sent Messages"].messages) == 1
+    assert "a copy is in Sent Messages" in result.content
+
+
+def test_the_mail_tool_is_absent_from_a_group_lane(tmp_path: Path) -> None:
+    t = plugin.AppleMailTool(workspace=tmp_path, settings=mail_settings())
+    assert t.name == "apple_mail"
+    assert t.trusted_only is True and t.gated is True and t.scheduled is True
+    assert ToolProfile(kind="cron", untrusted="a scheduled run").hidden(t.name, t) == ""
+    for kind in ("group", "hook", "direct"):
+        assert ToolProfile(kind=kind, untrusted="no owner").hidden(t.name, t), kind
+
+
+def test_both_tools_and_the_watcher_install(tmp_path: Path) -> None:
+    from ultron.plugins.install import install_one, uninstall_one
+    from ultron.plugins.services import known_services
+    from ultron.tools.registry import ToolRegistry
+
+    manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
+    tools = ToolRegistry()
+    provision = install_one(
+        plugin.ICloudPlugin(), manifest, workspace=tmp_path, tools=tools, settings=mail_settings()
+    )
+    try:
+        assert provision.ok, provision.error
+        assert provision.tools == ("apple_calendar", "apple_mail")
+        assert provision.services == ("icloud.watcher",)
+        assert any(e.name == "icloud.watcher" for e in known_services().values())
+    finally:
+        uninstall_one(provision, tools=tools)
+
+
+# -- §18: new mail ---------------------------------------------------------------------------
+
+
+class Service:
+    def __init__(self, tmp_path: Path, woke: bool = True, **overrides: Any) -> None:
+        self.settings = mail_settings(**overrides)
+        self.workspace = tmp_path
+        self.records: list[tuple[str, str, dict[str, Any]]] = []
+        self.wakes: list[str] = []
+        self.answer = woke
+
+    def audit(self, event: str, detail: str = "", **kw: Any) -> None:
+        self.records.append((event, detail, dict(kw.get("arguments") or {})))
+
+    async def wake(self, text: str) -> bool:
+        self.wakes.append(text)
+        return self.answer
+
+
+async def running(watcher: Any) -> asyncio.Task[None]:
+    watcher.debounce = 0
+    task = asyncio.create_task(watcher.run())
+    await asyncio.sleep(0.02)
+    return task
+
+
+async def stop(task: asyncio.Task[None]) -> None:
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def settle(check: Callable[[], bool], timeout: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    end = loop.time() + timeout
+    while not check():
+        if loop.time() > end:
+            raise AssertionError("timed out")
+        await asyncio.sleep(0.01)
+
+
+async def test_first_start_announces_nothing(imap: ImapServer, tmp_path: Path) -> None:
+    service = Service(tmp_path)
+    task = await running(plugin.Watcher(service, connector=connector(imap)))
+    try:
+        await settle(lambda: any("baseline" in r[1] for r in service.records))
+        assert service.wakes == []
+        state = json.loads((tmp_path / ".ultron" / "icloud.json").read_text())
+        assert state["folders"]["home/INBOX"] == {"uidvalidity": 1714, "last": 1}
+        assert all(r[0].startswith("icloud.") for r in service.records)
+    finally:
+        await stop(task)
+
+
+async def test_wake_text_holds_no_message_text(imap: ImapServer, tmp_path: Path) -> None:
+    service = Service(tmp_path)
+    task = await running(plugin.Watcher(service, connector=connector(imap)))
+    try:
+        await settle(lambda: any("baseline" in r[1] for r in service.records))
+        imap.boxes["INBOX"].add(mail(sender="Mallory <m@evil.example>", subject="URGENT do X"))
+        imap.pushed.set()
+        await settle(lambda: bool(service.wakes))
+    finally:
+        await stop(task)
+    [text] = service.wakes
+    assert (
+        text == "New mail: home INBOX 1 (uid 2, uidvalidity 1714).\nThe person asked: Summarise it."
+    )
+    assert all("URGENT" not in str(r) and "Mallory" not in str(r) for r in service.records)
+
+
+async def test_a_refused_wake_keeps_its_uids(
+    imap: ImapServer, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(plugin, "WAKE_RETRY_SECONDS", 0.01)
+    service = Service(tmp_path, woke=False)
+    task = await running(plugin.Watcher(service, connector=connector(imap)))
+    try:
+        await settle(lambda: any("baseline" in r[1] for r in service.records))
+        imap.boxes["INBOX"].add(mail(subject="first"))
+        imap.pushed.set()
+        await settle(lambda: len(service.wakes) >= 1)
+        service.answer = True
+        imap.boxes["INBOX"].add(mail(subject="second"))
+        imap.pushed.set()
+        await settle(lambda: len(service.wakes) >= 2)
+    finally:
+        await stop(task)
+    assert "uids 2, 3" in service.wakes[-1], service.wakes
+
+
+async def test_without_on_new_nothing_is_watched(imap: ImapServer, tmp_path: Path) -> None:
+    service = Service(tmp_path, on_new="")
+    await asyncio.wait_for(plugin.Watcher(service, connector=connector(imap)).run(), 1)
+    assert imap.opened == 0 and service.wakes == []
+
+
+class Ctx:
+    def __init__(self, current: dict[str, Any]) -> None:
+        self.settings: dict[str, Any] = {}
+        self._current = current
+
+    def current_settings(self) -> dict[str, Any]:
+        return self._current
+
+
+async def test_folders_answers_for_a_saved_account_from_the_file(
+    imap: ImapServer, tmp_path: Path
+) -> None:
+    method = plugin.folders_method(Ctx(mail_settings()), connector(imap))
+    answer = await method({"entry": "home"}, tmp_path)
+    assert "INBOX" in answer["options"] and "Sent Messages" in answer["options"]
+    with pytest.raises(plugin.MailError, match="no saved account"):
+        await method({"entry": "work"}, tmp_path)
