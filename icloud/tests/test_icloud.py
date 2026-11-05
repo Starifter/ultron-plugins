@@ -1,8 +1,8 @@
-"""The apple-calendar plugin against a stand-in for iCloud's CalDAV server
-(Ultron's `docs/spec/apple-calendar.md` §14). Where a test holds the same rule
+"""The icloud plugin against a stand-in for iCloud's CalDAV server
+(Ultron's `docs/spec/icloud.md` §14). Where a test holds the same rule
 as one in the `microsoft365` plugin's suite, it has the same name.
 
-Run from a checkout of Ultron (`uv run pytest path/to/apple-calendar/tests`).
+Run from a checkout of Ultron (`uv run pytest path/to/icloud/tests`).
 """
 
 from __future__ import annotations
@@ -27,9 +27,7 @@ HERE = Path(__file__).resolve().parent
 
 
 def _load() -> Any:
-    spec = importlib.util.spec_from_file_location(
-        "ultron_plugin_apple_calendar", HERE.parent / "plugin.py"
-    )
+    spec = importlib.util.spec_from_file_location("ultron_plugin_icloud", HERE.parent / "plugin.py")
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -237,7 +235,7 @@ def icloud() -> FakeICloud:
 
 @pytest.fixture(autouse=True)
 def password(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ULTRON_APPLE_CALENDAR_PASSWORD_HOME", PASSWORD)
+    monkeypatch.setenv("ULTRON_ICLOUD_PASSWORD_HOME", PASSWORD)
 
 
 def settings(**overrides: Any) -> dict[str, Any]:
@@ -282,7 +280,7 @@ async def listed(t: Any) -> list[str]:
 
 def test_the_manifest_declares_what_register_installs() -> None:
     manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
-    assert manifest.name == "apple-calendar"
+    assert manifest.name == "icloud"
     assert manifest.contracts()["tools"] == ("apple_calendar",)
     assert not manifest.warnings, manifest.warnings
 
@@ -294,7 +292,7 @@ def test_it_installs_through_ultrons_own_path(tmp_path: Path) -> None:
     manifest = read_manifest(HERE.parent / "PLUGIN.md", source="dir")
     tools = ToolRegistry()
     provision = install_one(
-        plugin.AppleCalendarPlugin(), manifest, workspace=tmp_path, tools=tools, settings=settings()
+        plugin.ICloudPlugin(), manifest, workspace=tmp_path, tools=tools, settings=settings()
     )
     try:
         assert provision.ok, provision.error
@@ -309,7 +307,7 @@ def test_the_form_describes_every_account_key() -> None:
     accounts = manifest.config_schema["accounts"]
     assert {f.key for f in accounts.entries} == set(plugin.ACCOUNT_KEYS)
     assert not accounts.login_by and not manifest.logins
-    assert accounts.secret_for("home") == "ULTRON_APPLE_CALENDAR_PASSWORD_HOME"
+    assert accounts.secret_for("home") == "ULTRON_ICLOUD_PASSWORD_HOME"
 
 
 def test_a_bad_account_is_refused_with_its_key() -> None:
@@ -338,9 +336,9 @@ async def test_without_an_account_the_tool_says_what_it_needs(
 ) -> None:
     result = await tool(icloud, tmp_path, settings={"accounts": {}}).run("events", **WINDOW)
     assert result.is_error and "no Apple account is configured" in result.content
-    monkeypatch.delenv("ULTRON_APPLE_CALENDAR_PASSWORD_HOME")
+    monkeypatch.delenv("ULTRON_ICLOUD_PASSWORD_HOME")
     result = await tool(icloud, tmp_path).run("calendars")
-    assert result.is_error and "ULTRON_APPLE_CALENDAR_PASSWORD_HOME" in result.content
+    assert result.is_error and "ULTRON_ICLOUD_PASSWORD_HOME" in result.content
     assert "never ask for it in chat" in result.content.lower()
     assert icloud.log == []
 
@@ -372,7 +370,7 @@ async def test_a_401_names_the_app_specific_password(icloud: FakeICloud, tmp_pat
     icloud.statuses = [(401, {})]
     result = await tool(icloud, tmp_path).run("calendars")
     assert result.is_error and "app-specific password" in result.content
-    assert "ULTRON_APPLE_CALENDAR_PASSWORD_HOME" in result.content
+    assert "ULTRON_ICLOUD_PASSWORD_HOME" in result.content
     assert PASSWORD not in result.content
     assert len(icloud.log) == 1
 

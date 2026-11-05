@@ -1,7 +1,7 @@
-"""apple-calendar: a person's iCloud calendars over CalDAV.
+"""icloud: a person's iCloud calendars over CalDAV.
 
 A directory plugin written against `ultron.sdk` and nothing else, built from
-Ultron's `docs/spec/apple-calendar.md`. It brings one tool, `apple_calendar`.
+Ultron's `docs/spec/icloud.md`. It brings one tool, `apple_calendar`.
 An account signs in with its Apple ID and an app-specific password, read from
 `~/.ultron/.env` at each call and sent only to Apple's `icloud.com` hosts (A5).
 
@@ -42,11 +42,11 @@ from ultron.sdk.plugin_entry import Plugin, PluginContext
 from ultron.sdk.runtime import CredentialError, assert_active, started_by
 from ultron.sdk.tool_plugin import Subject, Tool, ToolResult, wrap
 
-PLUGIN = "apple-calendar"
+PLUGIN = "icloud"
 TOOL = "apple_calendar"
 ROOT = "https://caldav.icloud.com/"
 """Where discovery starts (R6.1)."""
-PASSWORD_VARIABLE = "ULTRON_APPLE_CALENDAR_PASSWORD_{account}"
+PASSWORD_VARIABLE = "ULTRON_ICLOUD_PASSWORD_{account}"
 """Where an account's app-specific password lives: `~/.ultron/.env` (A5)."""
 
 ACCOUNT_NAME = re.compile(r"[a-z0-9_]+")
@@ -297,7 +297,7 @@ class CalDav:
                 )
             sent = {
                 "Authorization": self._authorization(),
-                "User-Agent": "Ultron apple-calendar",
+                "User-Agent": "Ultron icloud",
                 **(headers or {}),
             }
             reply = await self.transport(method, url, sent, body)
@@ -805,10 +805,10 @@ class AppleCalendarTool(Tool):
 
     def _setup_line(self) -> str:
         said = (
-            "no Apple account is configured. The person adds one on the apple-calendar "
+            "no Apple account is configured. The person adds one on the icloud "
             "plugin's settings (their Apple ID) with an app-specific password from "
-            "account.apple.com, or sets plugins_settings.apple-calendar.accounts.<name>.apple_id "
-            "and stores ULTRON_APPLE_CALENDAR_PASSWORD_<NAME> with the `secret` tool. Tell them; "
+            "account.apple.com, or sets plugins_settings.icloud.accounts.<name>.apple_id "
+            "and stores ULTRON_ICLOUD_PASSWORD_<NAME> with the `secret` tool. Tell them; "
             "never ask for a password in chat."
         )
         if self.problems:
@@ -1099,7 +1099,7 @@ class AppleCalendarTool(Tool):
         event.add("UID", uid)
         self._apply(event, account, arguments, creating=True)
         wrapper = icalendar.Calendar()
-        wrapper.add("PRODID", "-//Ultron//apple-calendar//EN")
+        wrapper.add("PRODID", "-//Ultron//icloud//EN")
         wrapper.add("VERSION", "2.0")
         wrapper.add_component(event)
         url = urljoin(
@@ -1184,7 +1184,7 @@ def xml_headers(depth: str) -> dict[str, str]:
 # -- the plugin -----------------------------------------------------------------------------------
 
 
-class AppleCalendarPlugin(Plugin):
+class ICloudPlugin(Plugin):
     name = PLUGIN
     description = "Your iCloud calendars over CalDAV."
 
@@ -1192,4 +1192,4 @@ class AppleCalendarPlugin(Plugin):
         ctx.register_tool(AppleCalendarTool(workspace=ctx.workspace, settings=ctx.settings))
 
 
-__all__ = ["AppleCalendarPlugin", "AppleCalendarTool", "CalDav"]
+__all__ = ["AppleCalendarTool", "CalDav", "ICloudPlugin"]
