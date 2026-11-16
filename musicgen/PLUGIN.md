@@ -4,7 +4,7 @@ title: Music Generation
 description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
 categories: [media, audio, music]
 logo: logo.svg
-version: "4.1.0"
+version: "4.2.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true

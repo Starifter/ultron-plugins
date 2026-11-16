@@ -40,7 +40,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import unquote, urlsplit
@@ -509,6 +509,7 @@ FIELDS = (
     "saved",
     "bytes",
     "media_type",
+    "sha256",
     "cost",
     "notified",
     "notes",
@@ -539,6 +540,8 @@ class Job:
         """Where it went - the target, or beside it when something took that name."""
         self.bytes = int(values.get("bytes") or 0)
         self.media_type = str(values.get("media_type") or "")
+        self.sha256 = str(values.get("sha256") or "")
+        """The saved bytes' hash: with `saved`, what the chat draws the track by."""
         self.cost = str(values.get("cost") or "")
         self.notified = bool(values.get("notified"))
         self.notes = str(values.get("notes") or "")
@@ -841,6 +844,7 @@ class Musicgen:
         job.saved = saved
         job.bytes = size
         job.media_type = media_type
+        job.sha256 = sha256
         job.cost = cost
         with contextlib.suppress(OSError):
             self.file.save(job)
@@ -877,14 +881,21 @@ class Musicgen:
             return
         self.waking = loop.create_task(self._wake(), context=contextvars.Context())
 
-    async def _send_wake(self, text: str) -> bool:
+    async def _send_wake(self, text: str, jobs: Sequence[Job] = ()) -> bool:
         """`ctx.wake`, with `deliver` when a person set `announce_to` - the
         owner's DM or a named place (SDK 1.41). An Ultron before 1.41 refuses
-        the keyword, and the next turn is told instead."""
+        the keyword, and the next turn is told instead. The tracks that were
+        saved ride along as `generated` (SDK 1.53) where the core takes it, so
+        the web UI draws them under the reply; an older core is not handed
+        the keyword at all."""
+        extra: dict[str, Any] = {}
         to = str(self.ctx.setting("announce_to", "") or "").strip()
         if to:
-            return bool(await self.ctx.wake(text, deliver=to))
-        return bool(await self.ctx.wake(text))
+            extra["deliver"] = to
+        made = _references(self.ctx.wake, jobs)
+        if made:
+            extra["generated"] = made
+        return bool(await self.ctx.wake(text, **extra))
 
     async def _wake(self) -> None:
         """OpenClaw's completion event: a turn of the session's own that says
@@ -904,7 +915,7 @@ class Musicgen:
             lines = [_notice(job, job.id in self.lyrics) for job in jobs]
             lines.append("Tell the person, briefly, and say where to find it.")
             try:
-                woke = bool(await self._send_wake("\n".join(lines)))
+                woke = bool(await self._send_wake("\n".join(lines), jobs))
             except asyncio.CancelledError:
                 woke = False
                 raise
@@ -1437,6 +1448,25 @@ async def _fetch(url: str) -> bytes:
     if response.truncated:
         raise ToolError(f"{url} is over {MAX_IMAGE_BYTES // (1024 * 1024)} MB")
     return response.body
+
+
+def _references(wake: Callable[..., Any], jobs: Sequence[Job]) -> tuple[Any, ...]:
+    """The saved tracks as `GeneratedRef`s for `ctx.wake(generated=...)`, or
+    nothing on a core before SDK 1.53 - which has neither the name nor the
+    keyword, and would refuse the wake for it."""
+    try:
+        from ultron.sdk.media import GeneratedRef
+
+        takes = "generated" in inspect.signature(wake).parameters
+    except (ImportError, TypeError, ValueError):
+        return ()
+    if not takes:
+        return ()
+    return tuple(
+        GeneratedRef(path=job.saved, sha256=job.sha256, media_type=job.media_type, size=job.bytes)
+        for job in jobs
+        if job.state == "done" and job.saved and job.sha256
+    )
 
 
 def _line(job: Job) -> str:

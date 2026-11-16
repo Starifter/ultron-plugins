@@ -208,10 +208,14 @@ class Waker:
         self.texts: list[tuple[str, str]] = []
         self.hold: asyncio.Event | None = None
         self.delivers: list[str] = []
+        self.generated: list[tuple[Any, ...]] = []
 
-    async def __call__(self, plugin: str, text: str, deliver: str = "") -> bool:
+    async def __call__(
+        self, plugin: str, text: str, deliver: str = "", generated: tuple[Any, ...] = ()
+    ) -> bool:
         self.texts.append((plugin, text))
         self.delivers.append(deliver)
+        self.generated.append(tuple(generated))
         if self.hold is not None:
             await self.hold.wait()
         return self.answer
@@ -920,6 +924,24 @@ async def test_a_finished_track_wakes_the_agent_with_facts_only(tmp_path: Path, 
     assert "music_generate status" in text and "sun on the water" not in text
     assert text.endswith("Tell the person, briefly, and say where to find it.")
     assert it.runner.notices() == "", "the woken turn is not told again"
+
+
+async def test_a_finished_track_rides_the_wake_so_the_chat_draws_it(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """SDK 1.53: the saved track is handed to `ctx.wake` by path and hash, and
+    the core checks it against `media/` - so it is the file that was saved."""
+    import hashlib
+
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    await call(it.generate, prompt="waves")
+    await woken(it)
+    [[ref]] = waker.generated
+    saved = it.workspace / ref.path
+    assert ref.path.startswith("media/music/") and saved.is_file()
+    assert ref.sha256 == hashlib.sha256(saved.read_bytes()).hexdigest()
+    assert ref.media_type.startswith("audio/") and ref.size == saved.stat().st_size
 
 
 async def test_a_wake_that_did_not_run_leaves_it_for_the_next_turn(
