@@ -31,6 +31,7 @@ where a plugin comes from and never where one runs from: forgetting this marketp
 | `groq` | A model provider for Groq (`GROQ_API_KEY`): open models served fast, with `/think` per model family, and `groq/whisper` to transcribe voice notes on the same key. |
 | `deepseek` | A model provider for DeepSeek (`DEEPSEEK_API_KEY`), its thinking carried through tool loops the way DeepSeek requires. Needs SDK 1.25. |
 | `xai` | A model provider for xAI's Grok (`XAI_API_KEY`), priced from xAI's own listing, long-context rate included, `xai/stt` to transcribe voice notes on the same key, and Grok Imagine as a vendor for `imagegen` and `videogen`. |
+| `venice` (Venice AI) | A model provider for Venice AI (`VENICE_API_KEY`): open and frontier models served privately, priced from Venice's own listing (long-context rates included), `/think` offering exactly the efforts each model takes, and Venice's own system prompt left out. Needs SDK 1.26. |
 | `deepgram` | A media reader: voice notes and recordings transcribed by Deepgram Nova (`DEEPGRAM_API_KEY`). |
 | `tavily` | A `web_search` backend: Tavily (`TAVILY_API_KEY`), rows that are the passage answering the query, every filter mapped, and Tavily's own written answer if you turn it on. |
 | `perplexity` | A `web_search` backend: Perplexity (`PERPLEXITY_API_KEY`), ranked pages from its Search API by default, or with `mode: agent` a written answer with its sources from the Agent API - what Sonar became. |
