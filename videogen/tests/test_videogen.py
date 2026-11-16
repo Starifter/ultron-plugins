@@ -143,10 +143,14 @@ class Waker:
         self.texts: list[tuple[str, str]] = []
         self.hold: asyncio.Event | None = None
         self.delivers: list[str] = []
+        self.generated: list[tuple[Any, ...]] = []
 
-    async def __call__(self, plugin: str, text: str, deliver: str = "") -> bool:
+    async def __call__(
+        self, plugin: str, text: str, deliver: str = "", generated: tuple[Any, ...] = ()
+    ) -> bool:
         self.texts.append((plugin, text))
         self.delivers.append(deliver)
+        self.generated.append(tuple(generated))
         if self.hold is not None:
             await self.hold.wait()
         return self.answer
@@ -746,6 +750,24 @@ async def test_a_finished_video_wakes_the_agent_with_facts_only(tmp_path: Path, 
     assert text.startswith(f"Note: video {job} is ready - saved to media/videos/")
     assert text.endswith("Tell the person, briefly, and say where to find it.")
     assert it.runner.notices() == "", "the woken turn is not told again"
+
+
+async def test_a_finished_video_rides_the_wake_so_the_chat_draws_it(
+    tmp_path: Path, wire: Wire
+) -> None:
+    """SDK 1.53: the saved video is handed to `ctx.wake` by path and hash, and
+    the core checks it against `media/` - so it is the file that was saved."""
+    import hashlib
+
+    waker = Waker()
+    it = install(tmp_path, waker=waker)
+    await call(it.generate, prompt="waves")
+    await it.woken()
+    [[ref]] = waker.generated
+    saved = it.workspace / ref.path
+    assert ref.path.startswith("media/videos/") and saved.is_file()
+    assert ref.sha256 == hashlib.sha256(saved.read_bytes()).hexdigest()
+    assert ref.media_type.startswith("video/") and ref.size == saved.stat().st_size
 
 
 async def test_a_failed_video_wakes_without_the_vendors_words(tmp_path: Path, wire: Wire) -> None:

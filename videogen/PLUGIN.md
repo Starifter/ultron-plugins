@@ -4,7 +4,7 @@ title: Video Generation
 description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
 categories: [media, video]
 logo: logo.svg
-version: "5.1.0"
+version: "5.2.0"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
