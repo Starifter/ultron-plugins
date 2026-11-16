@@ -64,6 +64,10 @@ repository is the plugin's.
 | skill | what it does |
 |---|---|
 | `github` | GitHub through the `gh` CLI - issues, pull requests, CI runs and failed logs, reviews, releases and `gh api`. You install `gh` and log it in yourself (`gh auth login`); without `gh` or `exec` it never reaches the prompt. |
+| `coding-agent` | Hands a large coding job - a feature, a refactor, an issue to a PR - to Claude Code, Codex or OpenCode as a background process in its own worktree. Each agent uses its own login (`claude login`, `codex login`, `opencode auth`). |
+| `mcporter` | Inspects and tries MCP servers Ultron is not connected to with the `mcporter` CLI - tools, schemas, one call, a resource. A call through it is an `exec` line in the trail; adding a server stays yours. |
+| `oracle` | A second model's review or debugging pass over selected files with the `oracle` CLI, previewed before anything is sent. The files go to that model's vendor, on your key or your signed-in browser. |
+| `summarize` | Transcripts and summaries of YouTube videos, podcasts and media links with the `summarize` CLI, where `web_fetch` falls short. It prefers `--extract`; a summary uses your own model key. |
 
 `skill_marketplace_official` in `config.json` is its address, as `plugin_marketplace_official`
 is the plugins'.
