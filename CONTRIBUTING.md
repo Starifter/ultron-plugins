@@ -72,9 +72,9 @@ A plugin can be extended by plugins it has never heard of (SDK 1.39). The owner 
 point named for itself - `ctx.extensions_in("imagegen.backend")` - and anyone writes into
 it with `ctx.register_extension("imagegen.backend", "acme", build)`. The writer needs no
 `requires_plugins` and no import: with the owner absent, the entry sits unread. That is how
-`xai`, `openrouter`, `together` and `fireworks` give `imagegen` and `videogen` their
-vendors and `openrouter` gives `musicgen` one, and how a new image, video or music vendor
-joins without a change to any of them.
+Ultron's own vendors - OpenAI, Gemini, xAI, OpenRouter, Together, Fireworks - reach `imagegen`,
+`videogen` and `musicgen`, and how a new image, video or music vendor joins without a change
+to any of them.
 
 - **Owning a point:** publish the interface in your `PLUGIN.md`, as `imagegen`,
   `videogen` and `musicgen` do under *Adding a vendor*, and treat what you read as code you did not write:
@@ -122,7 +122,7 @@ uv run --project ../Ultron pytest <name>/tests
 
 The script is the whole of what this marketplace promises about an entry. Tests are yours
 to add and welcome: put them in `<name>/tests/`, driving the plugin with a fake client the
-way `openrouter/tests/` does (asyncio in auto mode, from the `pyproject.toml` at the root).
+way `imagegen/tests/` does (asyncio in auto mode, from the `pyproject.toml` at the root).
 The libraries your manifest's `python_dependencies` names are installed for the tests the way
 `/plugins install` installs them for a user: what Ultron's environment lacks goes into
 `.test-libs/<name>/` (ignored by git) on the first run, with uv or pip, and is reused after.

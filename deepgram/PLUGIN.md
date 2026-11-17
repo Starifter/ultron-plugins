@@ -42,7 +42,8 @@ there is one the next reader down the ladder answers.
 ## Where it sits
 
 The reader is named `deepgram`, with priority 48. It comes after `groq/whisper` (40) and
-`xai/stt` (45) and before `openai/whisper` (50), if those are installed and have keys.
+`xai/stt` (45) and before `openai/whisper` (50) - all three ship with Ultron - when their
+vendor has a key.
 `audio_reader: deepgram` pins it with no fallback. The reference line on the message
 names the reader that answered.
 

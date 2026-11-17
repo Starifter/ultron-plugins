@@ -120,8 +120,9 @@ read when it is reached:
 | `openrouter` | `google/lyria-3-pro-preview` | lyrics, an instrumental, up to 180 seconds, MP3 or WAV (WAV when none is asked), one picture; billed by OpenRouter | `providers_settings.openrouter.music_model` |
 
 On an Ultron from before its providers moved into the core, it came from the `openrouter`
-marketplace plugin, with the setting in that plugin's `music_model`. That plugin still
-works, and enabled replaces Ultron's own; on a current Ultron it adds nothing. Any other
+marketplace plugin, with the setting in that plugin's `music_model`. That plugin is no
+longer in this marketplace; a copy already installed still works, and enabled replaces
+Ultron's own. Any other
 vendor still comes from a plugin (below), in this session, without a restart.
 
 `provider` picks which is asked first; then Google, and the backends in the order they were

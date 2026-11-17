@@ -157,8 +157,8 @@ install**. Each needs only that vendor's key or sign-in (`ultron auth add <vendo
 
 On an Ultron from before its providers moved into the core, `xai`, `openrouter` and
 `together` came from the marketplace plugins of those names, with the setting in that
-plugin's `video_model`. Those plugins still work, and one enabled replaces Ultron's own
-vendor of its name; on a current Ultron they add nothing. Any other vendor still comes from
+plugin's `video_model`. Those plugins are no longer in this marketplace; a copy already
+installed still works, and enabled replaces Ultron's own vendor of its name. Any other vendor still comes from
 a plugin (below), in this session, without a restart.
 
 `provider` picks which is asked first; then Google, and the backends in the order they were

@@ -54,6 +54,48 @@ these tests are about this plugin, so a session here leaves them out where Ultro
 has them in its core. `test_ultron_s_own_vendors` puts them back."""
 
 
+# -- Ultron's own vendors, through a plugin ---------------------------------------
+
+VENDOR = """from ultron.providers.companions import {name} as vendor
+from ultron.sdk.plugin_entry import Plugin, PluginContext
+
+
+class Stand(Plugin):
+    description = "Ultron's own {name} backend, put in by a plugin."
+
+    def register(self, ctx: PluginContext) -> None:
+        def build(model=""):
+            credential = ctx.credential("{name}")
+            keys = {{k: v for k, v in credential.items() if k in ("api_key", "auth_token")}}
+            return vendor.{cls}(model=model, **keys)
+
+        ctx.register_extension("{point}", "{name}", build)
+"""
+
+
+def ultron_vendor(root: Path, name: str) -> None:
+    """A real vendor without Ultron's whole core: Ultron's own `name` backend
+    (`ultron.providers.companions`), put in by a plugin of that name - what the
+    marketplace's `name` plugin did before Ultron shipped the vendor itself. It
+    reads `name`'s credential under its own plugin's name, as that plugin did.
+    Skipped on an Ultron that does not ship the vendor."""
+    pytest.importorskip(f"ultron.providers.companions.{name}")
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "PLUGIN.md").write_text(
+        f"---\nname: {name}\ndescription: Ultron's {name} vendor.\n"
+        f"vendor_credentials: [{name}]\n---\n",
+        encoding="utf-8",
+    )
+    (directory / "plugin.py").write_text(
+        VENDOR.format(name=name, cls=CLASSES[name], point=POINT_NAME), encoding="utf-8"
+    )
+
+
+CLASSES = {"xai": "XAIVideo"}
+POINT_NAME = "videogen.backend"
+
+
 def png() -> bytes:
     out = io.BytesIO()
     Image.new("RGB", (8, 8), (20, 120, 200)).save(out, format="PNG")
@@ -592,6 +634,7 @@ async def test_google_is_passed_over_for_more_pictures_than_veo_takes(
 async def test_a_refused_submission_falls_through_and_is_audited(
     tmp_path: Path, wire: Wire
 ) -> None:
+    ultron_vendor(tmp_path / "plugins", "xai")
     it = session(tmp_path, "xai", keys={"google": {"api_key": "AIza-g"}, "xai": {"api_key": "xk"}})
     wire.on(
         "POST",
@@ -613,6 +656,7 @@ async def test_a_refused_submission_falls_through_and_is_audited(
 
 
 async def test_with_no_key_every_vendor_says_what_it_is_missing(tmp_path: Path, wire: Wire) -> None:
+    ultron_vendor(tmp_path / "plugins", "xai")
     it = session(tmp_path, "xai", keys={})
     result = await call(it.generate, prompt="x")
     assert result.is_error
@@ -635,6 +679,7 @@ async def test_a_vendor_after_the_one_that_took_it_is_never_read(
 async def test_the_provider_setting_puts_a_provider_plugins_vendor_first(
     tmp_path: Path, wire: Wire
 ) -> None:
+    ultron_vendor(tmp_path / "plugins", "xai")
     it = session(
         tmp_path,
         "xai",

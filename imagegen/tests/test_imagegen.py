@@ -41,6 +41,48 @@ these tests are about this plugin, so a session here leaves them out where Ultro
 has them in its core. `test_ultron_s_own_vendors` puts them back."""
 
 
+# -- Ultron's own vendors, through a plugin ---------------------------------------
+
+VENDOR = """from ultron.providers.companions import {name} as vendor
+from ultron.sdk.plugin_entry import Plugin, PluginContext
+
+
+class Stand(Plugin):
+    description = "Ultron's own {name} backend, put in by a plugin."
+
+    def register(self, ctx: PluginContext) -> None:
+        def build(model=""):
+            credential = ctx.credential("{name}")
+            keys = {{k: v for k, v in credential.items() if k in ("api_key", "auth_token")}}
+            return vendor.{cls}(model=model, **keys)
+
+        ctx.register_extension("{point}", "{name}", build)
+"""
+
+
+def ultron_vendor(root: Path, name: str) -> None:
+    """A real vendor without Ultron's whole core: Ultron's own `name` backend
+    (`ultron.providers.companions`), put in by a plugin of that name - what the
+    marketplace's `name` plugin did before Ultron shipped the vendor itself. It
+    reads `name`'s credential under its own plugin's name, as that plugin did.
+    Skipped on an Ultron that does not ship the vendor."""
+    pytest.importorskip(f"ultron.providers.companions.{name}")
+    directory = root / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "PLUGIN.md").write_text(
+        f"---\nname: {name}\ndescription: Ultron's {name} vendor.\n"
+        f"vendor_credentials: [{name}]\n---\n",
+        encoding="utf-8",
+    )
+    (directory / "plugin.py").write_text(
+        VENDOR.format(name=name, cls=CLASSES[name], point=POINT_NAME), encoding="utf-8"
+    )
+
+
+CLASSES = {"xai": "XAIImages"}
+POINT_NAME = "imagegen.backend"
+
+
 MANIFEST = read_manifest(HERE / "PLUGIN.md", source="dir")
 LOADED = load(MANIFEST)
 """Imported by Ultron's own loader, exactly as a session imports it - not put in
@@ -418,6 +460,7 @@ async def test_an_aspect_ratio_google_lacks_is_made_as_the_nearest_and_said(
 async def test_a_size_alone_becomes_an_aspect_ratio_for_a_vendor_without_sizes(
     tmp_path: Path, wire: Wire
 ) -> None:
+    ultron_vendor(tmp_path / "plugins", "xai")
     tool, _, _, _ = session(tmp_path, "xai", keys={"xai": {"api_key": "xai-k"}})
     result = await call(tool, prompt="x", size="1792x1024")
     assert not result.is_error, result.content
@@ -1106,6 +1149,7 @@ async def test_a_backend_enabled_or_disabled_mid_session_is_in_or_out_at_once(
 async def test_the_xai_plugin_is_a_vendor_when_both_are_enabled(tmp_path: Path, wire: Wire) -> None:
     """The real thing: the marketplace's `xai` plugin, its builder, its key read
     under its own name - and imagegen naming none of it."""
+    ultron_vendor(tmp_path / "plugins", "xai")
     tool, _, auditor, _ = session(tmp_path, "xai", keys={"xai": {"api_key": "xai-k"}})
     result = await call(tool, prompt="a fox", aspectRatio="9:16", resolution="4K")
     assert "made by xai (grok-imagine-image-2.0)" in result.content
@@ -1202,6 +1246,7 @@ async def test_a_backend_that_cannot_take_a_model_is_passed_over_not_misnamed(
 async def test_the_xai_plugin_makes_it_on_the_model_the_model_chose(
     tmp_path: Path, wire: Wire
 ) -> None:
+    ultron_vendor(tmp_path / "plugins", "xai")
     tool, _, _, _ = session(tmp_path, "xai", keys={"xai": {"api_key": "xai-k"}})
     result = await call(tool, prompt="a fox", model="xai/grok-imagine-image-pro")
     assert "made by xai (grok-imagine-image-pro)" in result.content
