@@ -4,7 +4,7 @@ title: Image Generation
 description: Make and edit pictures with OpenAI, Google, OpenRouter, xAI, Together, Fireworks, or any vendor a plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg
-version: "5.2.1"
+version: "5.2.2"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [openai, google]
 contracts:
@@ -167,8 +167,8 @@ plugin to install**. Each needs only that vendor's key or sign-in (`ultron auth 
 On an Ultron from before its providers moved into the core, these four came from the
 `xai`, `openrouter`, `together` and `fireworks` marketplace plugins, with the setting in
 that plugin's `image_model`. Those plugins are no longer in this marketplace; a copy
-already installed still works, and enabled replaces Ultron's own vendor of its name. Any other vendor still comes
-from a plugin (below), in this session, without a restart.
+already installed still works, and enabled replaces Ultron's own vendor of its name. Any
+other vendor still comes from a plugin (below), in this session, without a restart.
 
 `provider` picks which is asked first; then OpenAI, Google, and the backends in the order
 they were registered. A vendor with no usable key, one that cannot take the pictures
