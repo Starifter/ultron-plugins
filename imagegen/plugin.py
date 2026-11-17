@@ -102,6 +102,27 @@ BUILT_IN = ("openai", "google")
 plugin registered, when `provider` names none."""
 POINT = "imagegen.backend"
 """Where another plugin puts a vendor (`ctx.register_extension`, SDK 1.39)."""
+
+STANDS_IN = {"gemini": "google"}
+"""Names a backend may be registered under for a built-in. Ultron's own Gemini
+provider registers as `gemini`, the name it took from `google` on 2026-11-04; it
+is the Google vendor, so it stands in for the built-in, and `gemini/<id>` names
+it. A backend registered under `google` itself wins over it."""
+
+
+def _standing_in(found: Mapping[str, Callable[..., Any]]) -> dict[str, Callable[..., Any]]:
+    """The backends with each `STANDS_IN` name under the built-in's."""
+    named = dict(found)
+    for old, new in STANDS_IN.items():
+        if old in named:
+            named.setdefault(new, named.pop(old))
+    return named
+
+
+def _stood_in(name: str) -> str:
+    return STANDS_IN.get(name, name)
+
+
 HOSTS = {
     "openai": "api.openai.com",
     "google": "generativelanguage.googleapis.com",
@@ -1319,7 +1340,7 @@ class ImageGenerate(Tool):
         timeout = self._timeout(timeout_ms)
         edit = bool(sources)
         inferred = "" if size or resolution or not edit else infer_resolution(sources)
-        chosen = provider or str(self.ctx.setting("provider", "") or "").strip().lower()
+        chosen = provider or _stood_in(str(self.ctx.setting("provider", "") or "").strip().lower())
         passed: list[str] = []
         # Every vendor reached before the one that answered - built, so its key
         # was already read - for the hint about what one of them would have made.
@@ -1399,7 +1420,7 @@ class ImageGenerate(Tool):
         one disabled since is out. A backend registered under a built-in's name
         stands in for it."""
         builders: dict[str, Callable[..., Any]] = {name: self._builder(name) for name in BUILT_IN}
-        builders.update(self.ctx.extensions_in(POINT))
+        builders.update(_standing_in(self.ctx.extensions_in(POINT)))
         return builders
 
     def _names(self) -> list[str]:
@@ -1424,7 +1445,7 @@ class ImageGenerate(Tool):
         something only at its own vendor. A named vendor that is not here, or
         whose builder cannot take a model, is passed over like one with no key."""
         builders = self._builders()
-        configured = str(self.ctx.setting("provider", "") or "").strip().lower()
+        configured = _stood_in(str(self.ctx.setting("provider", "") or "").strip().lower())
         if provider and provider not in builders:
             yield provider, _Broken(f"not here - the vendors are {', '.join(builders)}")
         order = [name for name in dict.fromkeys((provider, configured)) if name in builders]
@@ -1845,6 +1866,7 @@ def _choice(checked: Mapping[str, Any]) -> tuple[str, str]:
     named = str(checked.get("model", "") or "").strip()
     provider, _, model = named.partition("/")
     provider = provider.strip().lower()
+    provider = STANDS_IN.get(provider, provider)
     if named and not VENDOR_NAME.fullmatch(provider):
         raise ToolError(f"model {named!r} is not provider/model - openai/gpt-image-2, say")
     if model and (not MODEL_ID.fullmatch(model) or ".." in model or "//" in model):

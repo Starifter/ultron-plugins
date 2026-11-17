@@ -1,10 +1,10 @@
 ---
 name: imagegen
 title: Image Generation
-description: Make and edit pictures with OpenAI, Google, or any vendor another plugin adds, saved in the workspace.
+description: Make and edit pictures with OpenAI, Google, OpenRouter, xAI, Together, Fireworks, or any vendor a plugin adds, saved in the workspace.
 categories: [media, images]
 logo: logo.svg
-version: "5.2.0"
+version: "5.2.1"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [openai, google]
 contracts:
@@ -64,6 +64,12 @@ model looking at what it made, and editing it in the same turn, is the point of 
 
 **From 2.x:** the tool was `generate_image`.
 
+**From 5.2.1:** xAI, OpenRouter, Together and Fireworks ship with Ultron now, beside its
+catalog providers (Ultron's `docs/core/providers.md`), so they need a key, not a plugin.
+And Ultron's own Gemini backend, which registers as `gemini` since the provider's rename
+from `google`, stands in for the built-in `google` rather than being tried as a second
+vendor; `gemini/<id>` names it, as `google/<id>` does.
+
 **From 5.2:** on Ultron 1.45 and later, OpenAI and Google come from Ultron's own `openai`
 and `google` plugins, which register their image models here - so a **ChatGPT sign-in**
 makes pictures (through the Codex backend), and so does a **Google sign-in** (through
@@ -79,7 +85,8 @@ older Ultron, OpenAI and Google use the keys Ultron already holds for its model 
 add openai` or `google`, or `OPENAI_API_KEY` / `GEMINI_API_KEY` in `~/.ultron/.env`. The
 plugin reads them with `ctx.credential` (SDK 1.38), which is why this manifest declares both
 under `vendor_credentials` and `/plugins` says so before you install it. Every other vendor
-is a backend (below) and reads its key itself, in its own plugin's name. A key is read only
+is a backend (below) and reads its own key - Ultron's for the four it ships (xAI,
+OpenRouter, Together, Fireworks), a plugin's for one a plugin adds. A key is read only
 when its vendor is reached, and each read is an `auth` record in the trail with a
 fingerprint, never the key. With no key anywhere the tool is still there, and every call
 says which vendors were passed over and why.
@@ -146,18 +153,25 @@ Two are built in, with OpenClaw's limits:
 - **Google** (`gemini-3.1-flash-image`): up to 4 pictures, edits up to 5; ten shapes, 1K to
   4K, and five sizes it knows by shape; no quality, format or background.
 
-Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
-in this session, without a restart:
+Four more come with Ultron itself, beside its catalog providers of the same names - **no
+plugin to install**. Each needs only that vendor's key or sign-in (`ultron auth add
+<vendor>`, or `ultron auth login openrouter`), read when the vendor is reached:
 
-| Plugin | Vendor | What it takes | Its setting |
+| Vendor | Model | What it takes | Its setting |
 |---|---|---|---|
-| `xai` | `grok-imagine-image-2.0` | up to 4, edits up to 3; 13 shapes; 1K or 2K | `image_model` |
-| `openrouter` | `openai/gpt-image-2` | up to 4, edits up to 5; 10 shapes; 1K to 4K; billed by OpenRouter | `image_model` |
-| `together` | `black-forest-labs/FLUX.1-schnell` | up to 4 from words only, at one of three sizes | `image_model` |
-| `fireworks` | `flux-1-schnell-fp8` | one from words only, in nine shapes | `image_model` |
+| `xai` | `grok-imagine-image-2.0` | up to 4, edits up to 3; 13 shapes; 1K or 2K | `providers_settings.xai.image_model` |
+| `openrouter` | `openai/gpt-image-2` | up to 4, edits up to 5; 10 shapes; 1K to 4K; billed by OpenRouter | `providers_settings.openrouter.image_model` |
+| `together` | `black-forest-labs/FLUX.1-schnell` | up to 4 from words only, at one of three sizes | `providers_settings.together.image_model` |
+| `fireworks` | `flux-1-schnell-fp8` | one from words only, in nine shapes | `providers_settings.fireworks.image_model` |
+
+On an Ultron from before its providers moved into the core, these four came from the
+`xai`, `openrouter`, `together` and `fireworks` marketplace plugins, with the setting in
+that plugin's `image_model`. Those plugins still work, and one enabled replaces Ultron's
+own vendor of its name; on a current Ultron they add nothing. Any other vendor still comes
+from a plugin (below), in this session, without a restart.
 
 `provider` picks which is asked first; then OpenAI, Google, and the backends in the order
-their plugins install. A vendor with no usable key, one that cannot take the pictures
+they were registered. A vendor with no usable key, one that cannot take the pictures
 handed in, or one that fails is passed over and named in the result.
 
 ## The model's choice

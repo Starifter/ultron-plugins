@@ -71,6 +71,27 @@ music tool does: long enough to catch a model asking twice, short enough that
 asking again later is a new take."""
 POINT = "musicgen.backend"
 """Where another plugin puts a vendor (`ctx.register_extension`, SDK 1.39)."""
+
+STANDS_IN = {"gemini": "google"}
+"""Names a backend may be registered under for a built-in. Ultron's own Gemini
+provider registers as `gemini`, the name it took from `google` on 2026-11-04; it
+is the Google vendor, so it stands in for the built-in, and `gemini/<id>` names
+it. A backend registered under `google` itself wins over it."""
+
+
+def _standing_in(found: Mapping[str, Callable[..., Any]]) -> dict[str, Callable[..., Any]]:
+    """The backends with each `STANDS_IN` name under the built-in's."""
+    named = dict(found)
+    for old, new in STANDS_IN.items():
+        if old in named:
+            named.setdefault(new, named.pop(old))
+    return named
+
+
+def _stood_in(name: str) -> str:
+    return STANDS_IN.get(name, name)
+
+
 GOOGLE_HOST = "generativelanguage.googleapis.com"
 
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/webp")
@@ -648,7 +669,7 @@ class Musicgen:
         `register`, so a plugin enabled since is in and one disabled since is
         out. A backend registered under `google` stands in for it."""
         found: dict[str, Callable[..., Any]] = {"google": self._google}
-        found.update(self.ctx.extensions_in(POINT))
+        found.update(_standing_in(self.ctx.extensions_in(POINT)))
         return found
 
     def _vendors(self, provider: str = "", model: str = "") -> Iterator[Vendor]:
@@ -658,7 +679,7 @@ class Musicgen:
         other: an id means something only at its own vendor. A named vendor
         that is not here is passed over like one with no key."""
         builders = self.builders()
-        configured = str(self.ctx.setting("provider", "") or "").strip().lower()
+        configured = _stood_in(str(self.ctx.setting("provider", "") or "").strip().lower())
         if provider and provider not in builders:
             yield Vendor(provider, None, f"not here - the vendors are {', '.join(builders)}")
         order = [name for name in dict.fromkeys((provider, configured)) if name in builders]
@@ -990,6 +1011,7 @@ def _choice(checked: Mapping[str, Any]) -> tuple[str, str]:
     named = str(checked.get("model", "") or "").strip()
     provider, _, model = named.partition("/")
     provider = provider.strip().lower()
+    provider = STANDS_IN.get(provider, provider)
     if named and not VENDOR_NAME.fullmatch(provider):
         raise ToolError(f"model {named!r} is not provider/model - google/lyria-3-pro-preview, say")
     if model and (not MODEL_ID.fullmatch(model) or ".." in model or "//" in model):

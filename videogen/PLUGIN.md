@@ -1,10 +1,10 @@
 ---
 name: videogen
 title: Video Generation
-description: Make videos in the background with Google Veo or any vendor another plugin adds, saved in the workspace.
+description: Make videos in the background with Google Veo, OpenRouter, xAI, Together, or any vendor a plugin adds, saved in the workspace.
 categories: [media, video]
 logo: logo.svg
-version: "5.2.0"
+version: "5.2.1"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
@@ -69,6 +69,12 @@ from, as OpenClaw has it, and no last frame. A backend from before 4.0 still wor
 
 **From 2.x:** `generate_video` and `video_status` are now `video_generate`.
 
+**From 5.2.1:** xAI, OpenRouter and Together ship with Ultron now, beside its catalog
+providers, so they need a key, not a plugin. A job left waiting on one is collected as
+before. Ultron's own Gemini backend, which registers as `gemini` since the provider's rename
+from `google`, stands in for the built-in `google` rather than being tried as a second
+vendor; `gemini/<id>` names it, as `google/<id>` does.
+
 ## Keys
 
 On Ultron 1.45 and later, Google is Ultron's own `google` plugin's vendor, which it
@@ -79,7 +85,8 @@ used.
 Google uses the key Ultron already holds for its model provider - `ultron auth add google`,
 or `GEMINI_API_KEY` in `~/.ultron/.env` - read with `ctx.credential` (SDK 1.38), which is
 why this manifest declares it under `vendor_credentials`. Every other vendor is a backend
-(below) and reads its key itself, in its own plugin's name. A key is read when its vendor is
+(below) and reads its own key - Ultron's for the ones it ships, a plugin's for one a plugin
+adds. A key is read when its vendor is
 reached and again when a job is picked back up in a new session; each read is an `auth`
 record in the trail with a fingerprint, never the key.
 
@@ -135,28 +142,36 @@ One is built in, with OpenClaw's limits:
   1080P, a size read as its shape and resolution; one picture to start from, or one video to
   extend, never both; no audio switch.
 
-Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
-in this session, without a restart:
+These come with Ultron itself, beside its providers of the same names - **no plugin to
+install**. Each needs only that vendor's key or sign-in (`ultron auth add <vendor>`, or
+`ultron auth login openrouter`), read when the vendor is reached. The setting is
+`providers_settings.<vendor>.video_model`:
 
-| Plugin | Vendor | What it takes | Its setting |
-|---|---|---|---|
-| `openai` (ships with Ultron 1.45) | `sora-2` | 4, 8 or 12 seconds at 720x1280, 1280x720, 1024x1792 or 1792x1024; one picture to start from; an API key only | `video_model` |
-| `xai` | `grok-imagine-video` | up to 15 seconds, 7 shapes, 480P or 720P; a first frame or up to 7 reference pictures; a video by link to edit (up to 10 seconds) | `video_model` |
-| `xai` | `grok-imagine-video-1.5` | one first frame only, up to 1080P | `video_model` |
-| `openrouter` | `google/veo-3.1` | 4, 6 or 8 seconds, 16:9 or 9:16, 720P or 1080P, a size, the audio switch, up to 4 pictures, a `seed`; billed by OpenRouter | `video_model` |
-| `together` | `minimax/hailuo-02` | up to 10 seconds, sized in pixels; a picture to start from on `Wan-AI/Wan2.2-I2V-A14B` | `video_model` |
+| Vendor | Model | What it takes |
+|---|---|---|
+| `openai` | `sora-2` | 4, 8 or 12 seconds at 720x1280, 1280x720, 1024x1792 or 1792x1024; one picture to start from; an API key only |
+| `xai` | `grok-imagine-video` | up to 15 seconds, 7 shapes, 480P or 720P; a first frame or up to 7 reference pictures; a video by link to edit (up to 10 seconds) |
+| `xai` | `grok-imagine-video-1.5` | one first frame only, up to 1080P |
+| `openrouter` | `google/veo-3.1` | 4, 6 or 8 seconds, 16:9 or 9:16, 720P or 1080P, a size, the audio switch, up to 4 pictures, a `seed`; billed by OpenRouter |
+| `together` | `minimax/hailuo-02` | up to 10 seconds, sized in pixels; a picture to start from on `Wan-AI/Wan2.2-I2V-A14B` |
 
-`provider` picks which is asked first; then Google, and the backends in the order their
-plugins install. A vendor with no usable key, one that cannot take the request, or one that
+On an Ultron from before its providers moved into the core, `xai`, `openrouter` and
+`together` came from the marketplace plugins of those names, with the setting in that
+plugin's `video_model`. Those plugins still work, and one enabled replaces Ultron's own
+vendor of its name; on a current Ultron they add nothing. Any other vendor still comes from
+a plugin (below), in this session, without a restart.
+
+`provider` picks which is asked first; then Google, and the backends in the order they were
+registered. A vendor with no usable key, one that cannot take the request, or one that
 refuses the submission is passed over and named in the result. Once a vendor has taken a job
 it is that vendor's: a job that fails later is not sent anywhere else, because the first one
 may already have been billed.
 
 **From 1.x:** the three vendors above used to live here, read with this plugin's
 credential and set with `xai_model`, `openrouter_model` and `together_model`. Those
-settings are gone - `/plugins videogen` warns about any still set - and each vendor now
-needs its own plugin enabled, with its model in that plugin's `video_model`. A job a 1.x
-session left running is still collected, as long as its vendor's plugin is enabled.
+settings are gone - `/plugins videogen` warns about any still set - and each vendor's model
+is its `video_model` above. A job a 1.x session left running is still collected, as long as
+its vendor is still here.
 
 ## The model's choice
 

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import io
 import json
 from collections.abc import Callable
@@ -43,6 +44,14 @@ WAV = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 64
 GOOGLE = "https://generativelanguage.googleapis.com/v1beta"
 INTERACTIONS = f"{GOOGLE}/interactions"
 CHAT = "https://openrouter.ai/api/v1/chat/completions"
+
+
+NO_CORE: dict[str, Any] = (
+    {"core": False} if "core" in inspect.signature(discover_plugins).parameters else {}
+)
+"""Ultron's own vendors - OpenAI, Gemini and the catalog's - change with Ultron, and
+these tests are about this plugin, so a session here leaves them out where Ultron
+has them in its core. `test_ultron_s_own_vendors` puts them back."""
 
 
 def png_of(colour: tuple[int, int, int]) -> bytes:
@@ -233,6 +242,7 @@ def session(
     *enabled: str,
     keys: dict[str, dict[str, str]] | None = None,
     settings: dict[str, Any] | None = None,
+    core: bool = False,
 ) -> Installed:
     """musicgen and the named plugins, discovered and installed the way a
     session does - the only install `ctx.extensions_in` reads from. The
@@ -248,7 +258,9 @@ def session(
         plugins_dirs=[str(HERE.parent), str(tmp_path / "plugins")],
         plugins_settings={"musicgen": settings or {}},
     )
-    plugins = discover_plugins(config, workspace=workspace, entry_points=False, bundled=False)
+    plugins = discover_plugins(
+        config, workspace=workspace, entry_points=False, bundled=False, **({} if core else NO_CORE)
+    )
     auditor = MemoryAuditor()
     tools = ToolRegistry()
     report = plugins.install(
@@ -1236,4 +1248,24 @@ async def test_list_shows_the_vendors_and_status_the_jobs(tmp_path: Path, wire: 
         "- google/lyria-3.5: ready; also google/lyria-3-clip-preview, google/lyria-3-pro-preview"
     ]
     assert (await call(it.status)).content == "No music jobs in this session."
+    assert wire.sent == []
+
+
+# -- Ultron's own vendors -------------------------------------------------------
+
+
+async def test_ultron_s_own_vendors(tmp_path: Path, wire: Wire) -> None:
+    """With Ultron's core installed: its Gemini backend, registered as `gemini`,
+    is the `google` vendor - one vendor, not two - and `gemini/<id>` names it."""
+    if not NO_CORE:
+        pytest.skip("this Ultron has no core vendors of its own")
+    it = session(tmp_path, core=True, keys={})
+    vendors = list(it.runner.builders())
+    assert vendors[0] == "google"
+    assert "gemini" not in vendors and vendors.count("google") == 1
+    assert type(it.runner.builders()["google"]()).__module__.startswith("ultron.")
+    result = await call(it.generate, prompt="x", model="gemini/some-model")
+    assert result.is_error
+    assert "gemini: not here" not in result.content
+    assert "google: no gemini" in result.content
     assert wire.sent == []

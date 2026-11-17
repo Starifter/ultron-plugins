@@ -1,10 +1,10 @@
 ---
 name: musicgen
 title: Music Generation
-description: Make music in the background with Google Lyria or any vendor another plugin adds, saved in the workspace.
+description: Make music in the background with Google Lyria, OpenRouter, or any vendor a plugin adds, saved in the workspace.
 categories: [media, audio, music]
 logo: logo.svg
-version: "4.2.0"
+version: "4.2.1"
 requires_ultron_sdk: ">=1.43,<2"
 vendor_credentials: [google]
 wakes: true
@@ -60,6 +60,11 @@ it, so a length asked of Google is dropped and said. A backend from before 3.0 s
 
 **From 1.x:** `generate_music` and `music_status` are now `music_generate`.
 
+**From 4.2.1:** OpenRouter ships with Ultron now, beside its catalog provider, so it
+needs a key, not a plugin. Ultron's own Gemini backend, which registers as `gemini` since
+the provider's rename from `google`, stands in for the built-in `google` rather than being
+tried as a second vendor; `gemini/<id>` names it, as `google/<id>` does.
+
 ## Keys
 
 On Ultron 1.45 and later, Google is Ultron's own `google` plugin's vendor, which it
@@ -70,7 +75,7 @@ used.
 Google uses the key Ultron already holds for its model provider - `ultron auth add google`,
 or `GEMINI_API_KEY` in `~/.ultron/.env` - read with `ctx.credential` (SDK 1.38), which is
 why this manifest declares it under `vendor_credentials`. Every other vendor is a backend
-(below) and reads its key itself, in its own plugin's name. A key is read only when its
+(below) and reads its own key - Ultron's for OpenRouter, a plugin's for one a plugin adds. A key is read only when its
 vendor is reached, and each read is an `auth` record in the trail with a fingerprint, never
 the key.
 
@@ -106,15 +111,21 @@ One is built in, with OpenClaw's limits:
   said. `lyria-3-clip-preview` makes MP3 and `lyria-3-pro-preview` MP3 or WAV; any other Lyria
   model is sent the format and answers for it.
 
-Every other vendor comes from another plugin. Enable the plugin and its vendor is here -
-in this session, without a restart:
+OpenRouter comes with Ultron itself, beside its `openrouter` provider - **no plugin to
+install**. It needs only an OpenRouter key or sign-in (`ultron auth login openrouter`),
+read when it is reached:
 
-| Plugin | Vendor | What it takes | Its setting |
+| Vendor | Model | What it takes | Its setting |
 |---|---|---|---|
-| `openrouter` | `google/lyria-3-pro-preview` | lyrics, an instrumental, up to 180 seconds, MP3 or WAV (WAV when none is asked), one picture; billed by OpenRouter | `music_model` |
+| `openrouter` | `google/lyria-3-pro-preview` | lyrics, an instrumental, up to 180 seconds, MP3 or WAV (WAV when none is asked), one picture; billed by OpenRouter | `providers_settings.openrouter.music_model` |
 
-`provider` picks which is asked first; then Google, and the backends in the order their
-plugins install. A vendor with no usable key, or one that cannot take the pictures, is passed
+On an Ultron from before its providers moved into the core, it came from the `openrouter`
+marketplace plugin, with the setting in that plugin's `music_model`. That plugin still
+works, and enabled replaces Ultron's own; on a current Ultron it adds nothing. Any other
+vendor still comes from a plugin (below), in this session, without a restart.
+
+`provider` picks which is asked first; then Google, and the backends in the order they were
+registered. A vendor with no usable key, or one that cannot take the pictures, is passed
 over when the job starts and named in the result. One that fails while making the track is
 passed over too, and the next is asked - unless it timed out, because a vendor that timed out
 may still have made, and billed, the track.

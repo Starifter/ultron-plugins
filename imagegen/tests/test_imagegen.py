@@ -12,6 +12,7 @@ checked, a real media store - which a plugin itself must never do.
 from __future__ import annotations
 
 import base64
+import inspect
 import io
 import json
 from pathlib import Path
@@ -30,6 +31,14 @@ from ultron.sdk.runtime import ToolError
 from ultron.tools.registry import ToolRegistry
 
 HERE = Path(__file__).resolve().parent.parent
+
+
+NO_CORE: dict[str, Any] = (
+    {"core": False} if "core" in inspect.signature(discover_plugins).parameters else {}
+)
+"""Ultron's own vendors - OpenAI, Gemini and the catalog's - change with Ultron, and
+these tests are about this plugin, so a session here leaves them out where Ultron
+has them in its core. `test_ultron_s_own_vendors` puts them back."""
 
 
 MANIFEST = read_manifest(HERE / "PLUGIN.md", source="dir")
@@ -933,6 +942,7 @@ def session(
     *enabled: str,
     keys: dict[str, dict[str, str]] | None = None,
     settings: dict[str, Any] | None = None,
+    core: bool = False,
 ) -> tuple[Any, Any, MemoryAuditor, Path]:
     """imagegen and the named plugins, discovered and installed the way a
     session does - the only install `ctx.extensions_in` reads from. The
@@ -948,7 +958,9 @@ def session(
         plugins_dirs=[str(HERE.parent), str(tmp_path / "plugins")],
         plugins_settings={"imagegen": settings or {}},
     )
-    plugins = discover_plugins(config, workspace=workspace, entry_points=False, bundled=False)
+    plugins = discover_plugins(
+        config, workspace=workspace, entry_points=False, bundled=False, **({} if core else NO_CORE)
+    )
     auditor = MemoryAuditor()
     tools = ToolRegistry()
     report = plugins.install(
@@ -1249,3 +1261,29 @@ def test_list_needs_no_prompt(tmp_path: Path) -> None:
     assert tool.validate({"action": "list"}) == {"action": "list"}
     with pytest.raises(ToolError, match="needs a prompt"):
         tool.validate({})
+
+
+# -- Ultron's own vendors -------------------------------------------------------
+
+
+async def test_ultron_s_own_vendors(tmp_path: Path, wire: Wire) -> None:
+    """With Ultron's core installed: its Gemini backend, registered as `gemini`,
+    is the `google` vendor - one vendor, not two - and `gemini/<id>` names it.
+    The catalog's vendors are here without their plugins, where Ultron ships them."""
+    import importlib.util
+
+    if not NO_CORE:
+        pytest.skip("this Ultron has no core vendors of its own")
+    tool, _, _, _ = session(tmp_path, core=True)
+    described = tool.parameters["properties"]["model"]["description"]
+    vendors = described.split("The providers here: ", 1)[1].split(".", 1)[0].split(", ")
+    assert vendors[:2] == ["openai", "google"]
+    assert "gemini" not in vendors and vendors.count("google") == 1
+    checked = tool.validate({"prompt": "x", "model": "gemini/gemini-3-pro-image"})
+    assert (checked["provider"], checked["model"]) == ("google", "gemini-3-pro-image")
+    if importlib.util.find_spec("ultron.providers.companions"):
+        assert {"openrouter", "xai", "together", "fireworks"} <= set(vendors)
+    result = await call(tool, prompt="x", model="gemini/gemini-3-pro-image")
+    assert "gemini: not here" not in result.content
+    assert "google: no gemini credential" in result.content
+    assert wire.sent == []
