@@ -1,8 +1,8 @@
 ---
 name: together
 title: Together AI
-description: The Together AI model provider - open models, hosted at Together - and Together's image and video models for imagegen and videogen.
-version: "1.3.0"
+description: Superseded - Ultron ships Together built in. The Together AI model provider - open models, hosted at Together - and Together's image and video models for imagegen and videogen.
+version: "1.3.1"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -29,6 +29,12 @@ python_dependencies:
 ---
 
 # together
+
+**Superseded.** A current Ultron ships Together itself - its chat models and its image and video models - as a built-in
+catalog provider, so this plugin adds nothing there: you need only a Together key
+(`ultron auth add together`). Enabled anyway, it replaces Ultron's own,
+and `/plugins` says so. It stays for an Ultron from before its providers moved
+into the core, and its settings are still read there.
 
 Open models - DeepSeek, Qwen, Kimi, GLM, Llama, GPT-OSS - hosted at
 [Together AI](https://together.ai).

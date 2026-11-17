@@ -1,8 +1,8 @@
 ---
 name: groq
 title: Groq
-description: The Groq model provider - open models, served fast - and Whisper for voice notes.
-version: "1.1.0"
+description: Superseded - Ultron ships Groq built in. The Groq model provider - open models, served fast - and Whisper for voice notes.
+version: "1.1.1"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, audio]
 logo: logo.svg
@@ -26,6 +26,12 @@ python_dependencies:
 ---
 
 # groq
+
+**Superseded.** A current Ultron ships Groq itself - its chat models and Whisper for voice notes - as a built-in
+catalog provider, so this plugin adds nothing there: you need only a Groq key
+(`ultron auth add groq`). Enabled anyway, it replaces Ultron's own,
+and `/plugins` says so. It stays for an Ultron from before its providers moved
+into the core, and its settings are still read there.
 
 Open models - GPT-OSS, Qwen, Llama - on [Groq](https://groq.com)'s hardware, which is
 built to answer fast.

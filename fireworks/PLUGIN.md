@@ -1,8 +1,8 @@
 ---
 name: fireworks
 title: Fireworks AI
-description: The Fireworks AI model provider - open models, hosted at Fireworks - and FLUX pictures for imagegen.
-version: "1.3.0"
+description: Superseded - Ultron ships Fireworks built in. The Fireworks AI model provider - open models, hosted at Fireworks - and FLUX pictures for imagegen.
+version: "1.3.1"
 requires_ultron_sdk: ">=1.25,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -25,6 +25,12 @@ python_dependencies:
 ---
 
 # fireworks
+
+**Superseded.** A current Ultron ships Fireworks itself - its chat models and FLUX pictures - as a built-in
+catalog provider, so this plugin adds nothing there: you need only a Fireworks key
+(`ultron auth add fireworks`). Enabled anyway, it replaces Ultron's own,
+and `/plugins` says so. It stays for an Ultron from before its providers moved
+into the core, and its settings are still read there.
 
 Open models - Kimi, DeepSeek, Qwen, GLM, GPT-OSS - hosted at
 [Fireworks AI](https://fireworks.ai).

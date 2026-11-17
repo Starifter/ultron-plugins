@@ -1,8 +1,8 @@
 ---
 name: openrouter
 title: OpenRouter
-description: The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image, video and music models for imagegen, videogen and musicgen.
-version: "1.5.0"
+description: Superseded - Ultron ships OpenRouter built in. The OpenRouter model provider - one key, every model it routes to - and OpenRouter's image, video and music models for imagegen, videogen and musicgen.
+version: "1.5.1"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, media]
 logo: logo.svg
@@ -53,6 +53,12 @@ python_dependencies:
 ---
 
 # openrouter
+
+**Superseded.** A current Ultron ships OpenRouter itself - its chat models and its image, video and music models - as a built-in
+catalog provider, so this plugin adds nothing there: you need only a OpenRouter key
+(`ultron auth add openrouter`, or `ultron auth login openrouter`). Enabled anyway, it replaces Ultron's own,
+and `/plugins` says so. It stays for an Ultron from before its providers moved
+into the core, and its settings are still read there.
 
 One key, every model OpenRouter routes to: Claude, GPT, Gemini, DeepSeek, Qwen, Llama
 and the rest, by the ids OpenRouter lists them under - `anthropic/claude-sonnet-5`,

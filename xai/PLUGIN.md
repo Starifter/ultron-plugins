@@ -1,8 +1,8 @@
 ---
 name: xai
 title: xAI
-description: The xAI model provider - Grok, at xAI - with Grok speech-to-text for voice notes, and Grok Imagine for imagegen and videogen.
-version: "1.4.0"
+description: Superseded - Ultron ships xAI built in. The xAI model provider - Grok, at xAI - with Grok speech-to-text for voice notes, and Grok Imagine for imagegen and videogen.
+version: "1.4.1"
 requires_ultron_sdk: ">=1.23,<2"
 categories: [provider, models, audio, media]
 logo: logo.svg
@@ -34,6 +34,12 @@ python_dependencies:
 ---
 
 # xai
+
+**Superseded.** A current Ultron ships xAI itself - Grok chat, Grok speech-to-text and Grok Imagine - as a built-in
+catalog provider, so this plugin adds nothing there: you need only a xAI key
+(`ultron auth add xai`). Enabled anyway, it replaces Ultron's own,
+and `/plugins` says so. It stays for an Ultron from before its providers moved
+into the core, and its settings are still read there.
 
 Grok, at [xAI](https://x.ai).
 
